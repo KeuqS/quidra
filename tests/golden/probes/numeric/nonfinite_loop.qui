@@ -1,0 +1,13 @@
+// A range loop whose only checked operation is one addition tests a flag at
+// its exit; the failure names the addition, as a test in every iteration
+// would.
+real64 accumulate(real64 step, int32 count)
+    real64 total = 0.0
+    for 0 <= int32 i < count
+        total = total + step
+    return total
+
+print(accumulate(0.25, 8))
+print(NL)
+print(accumulate(1.0e307, 100))
+print(NL)

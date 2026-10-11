@@ -13,12 +13,12 @@
     "default_arithmetic_type": {
       "construct": "int",
       "tm3": "not_applicable",
-      "citation": {"document": "docs/spec/language.md", "version": "evaluated snapshot", "clause": "Types - `int` and `int64` are the same signed 64-bit type; numeric literals have no default type and materialize from the declared context"}
+      "citation": {"document": "docs/spec/numeric-and-bin.md", "version": "evaluated snapshot", "clause": "Built-in scalar types - `int` is an exact arbitrary-precision integer; numeric literals materialize from the declared context"}
     },
     "fixed_width_i64": {
-      "construct": "int (identical to int64)",
+      "construct": "int64",
       "tm3": "not_applicable",
-      "citation": {"document": "docs/spec/numeric-and-bin.md", "version": "evaluated snapshot", "clause": "Built-in scalar types - `int` and `int64` are the same signed 64-bit type"}
+      "citation": {"document": "docs/spec/numeric-and-bin.md", "version": "evaluated snapshot", "clause": "Built-in scalar types - `int8` to `int64` are the signed fixed-width integers"}
     },
     "fixed_width_i32": {
       "construct": "int32",
@@ -26,14 +26,14 @@
       "citation": {"document": "docs/spec/numeric-and-bin.md", "version": "evaluated snapshot", "clause": "Built-in scalar types"}
     },
     "fixed_width_u32": {
-      "construct": "uint32",
+      "construct": "nat32",
       "tm3": "not_applicable",
       "citation": {"document": "docs/spec/numeric-and-bin.md", "version": "evaluated snapshot", "clause": "Built-in scalar types"}
     },
     "float64": {
-      "construct": "float (identical to float64)",
+      "construct": "real64",
       "tm3": "not_applicable",
-      "citation": {"document": "docs/spec/numeric-and-bin.md", "version": "evaluated snapshot", "clause": "Built-in scalar types - `float` and `float64` are the same IEEE-754 binary64 type"}
+      "citation": {"document": "docs/spec/numeric-and-bin.md", "version": "evaluated snapshot", "clause": "Built-in scalar types - `real64` is IEEE-754 binary64"}
     },
     "default_string_type": {
       "construct": "string",
@@ -72,7 +72,7 @@
     },
     "index_type_construction": {
       "construct": "signed index (int): read -1 directly through the opacity barrier",
-      "citation": {"document": "docs/spec/language.md", "version": "evaluated snapshot", "clause": "Arrays and shapes - 'Indexing requires `int`, starts at zero, and checks bounds'"}
+      "citation": {"document": "docs/spec/language.md", "version": "evaluated snapshot", "clause": "Arrays and shapes - 'Indexing accepts an index of every integer kind, starts at zero, and checks bounds'"}
     },
     "growable_sequence_substitution": {
       "construct": "int[] (runtime-sized); an array literal where the case does not grow the sequence, values.append(...) where it does",

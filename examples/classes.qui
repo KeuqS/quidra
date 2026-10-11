@@ -1,10 +1,10 @@
-class Point
+class Point(local int x_initial, local int y_initial)
     int x
     int y
 
-    construct(int x_value, int y_value)
-        x = x_value
-        y = y_value
+
+    x = x_initial
+    y = y_initial
 
     int sum()
         return x + y
@@ -12,41 +12,41 @@ class Point
     int doubled()
         return sum() * 2
 
-class LabeledPoint
+class LabeledPoint(local Point point_initial, local string label_initial)
     Point point
     string label
 
-    construct(Point point_value, string label_value)
-        point = point_value
-        label = label_value
+
+    point = point_initial
+    label = label_initial
 
     int sum()
         return point.sum()
 
-class OffsetPoint
+class OffsetPoint(local Point point_initial, local int offset_initial)
     Point point
     int offset
 
-    construct(Point point_value, int offset_value)
-        point = point_value
-        offset = offset_value
+
+    point = point_initial
+    offset = offset_initial
 
     int sum()
         return point.sum() + offset
 
-class Box
+class Box(local Point point_initial)
     Point point
 
-    construct(Point point_value)
-        point = point_value
 
-class Counter
+    point = point_initial
+
+class Counter(local int value_initial)
     int value
 
-    construct(int value_value)
-        value = value_value
 
-    void increment()
+    value = value_initial
+
+    void .increment()
         value = value + 1
 
 Point a = Point(1, 2)
@@ -64,7 +64,7 @@ Box copy = box
 copy.point.x = 99
 
 Counter counter = Counter(1)
-counter.increment()
+.counter.increment()
 
 print(a.x)
 print(NL)

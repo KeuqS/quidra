@@ -1,9 +1,11 @@
 #include "quidra/source_tools.hpp"
 #include "quidra/lexer.hpp"
+#include "quidra/member_function_names.hpp"
 #include "quidra/parser.hpp"
 
+#include "platform/sha256.hpp"
+
 #include <algorithm>
-#include <array>
 #include <cstdint>
 #include <iomanip>
 #include <optional>
@@ -13,51 +15,6 @@
 
 namespace quidra {
 namespace {
-
-constexpr std::array<std::uint32_t, 64> kSha256 = {
-    0x428a2f98U, 0x71374491U, 0xb5c0fbcfU, 0xe9b5dba5U, 0x3956c25bU, 0x59f111f1U, 0x923f82a4U, 0xab1c5ed5U,
-    0xd807aa98U, 0x12835b01U, 0x243185beU, 0x550c7dc3U, 0x72be5d74U, 0x80deb1feU, 0x9bdc06a7U, 0xc19bf174U,
-    0xe49b69c1U, 0xefbe4786U, 0x0fc19dc6U, 0x240ca1ccU, 0x2de92c6fU, 0x4a7484aaU, 0x5cb0a9dcU, 0x76f988daU,
-    0x983e5152U, 0xa831c66dU, 0xb00327c8U, 0xbf597fc7U, 0xc6e00bf3U, 0xd5a79147U, 0x06ca6351U, 0x14292967U,
-    0x27b70a85U, 0x2e1b2138U, 0x4d2c6dfcU, 0x53380d13U, 0x650a7354U, 0x766a0abbU, 0x81c2c92eU, 0x92722c85U,
-    0xa2bfe8a1U, 0xa81a664bU, 0xc24b8b70U, 0xc76c51a3U, 0xd192e819U, 0xd6990624U, 0xf40e3585U, 0x106aa070U,
-    0x19a4c116U, 0x1e376c08U, 0x2748774cU, 0x34b0bcb5U, 0x391c0cb3U, 0x4ed8aa4aU, 0x5b9cca4fU, 0x682e6ff3U,
-    0x748f82eeU, 0x78a5636fU, 0x84c87814U, 0x8cc70208U, 0x90befffaU, 0xa4506cebU, 0xbef9a3f7U, 0xc67178f2U,
-};
-
-constexpr std::uint32_t rotr(std::uint32_t x, unsigned n) {
-    return (x >> n) | (x << (32U - n));
-}
-
-void sha256_compress(std::array<std::uint32_t, 8>& state, const std::uint8_t* block) {
-    std::array<std::uint32_t, 64> w{};
-    for (std::size_t i = 0; i < 16; ++i) {
-        w[i] = (static_cast<std::uint32_t>(block[i * 4]) << 24U) |
-               (static_cast<std::uint32_t>(block[i * 4 + 1]) << 16U) |
-               (static_cast<std::uint32_t>(block[i * 4 + 2]) << 8U) |
-               static_cast<std::uint32_t>(block[i * 4 + 3]);
-    }
-    for (std::size_t i = 16; i < 64; ++i) {
-        const auto s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >> 3U);
-        const auto s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >> 10U);
-        w[i] = w[i - 16] + s0 + w[i - 7] + s1;
-    }
-
-    auto a = state[0]; auto b = state[1]; auto c = state[2]; auto d = state[3];
-    auto e = state[4]; auto f = state[5]; auto g = state[6]; auto h = state[7];
-    for (std::size_t i = 0; i < 64; ++i) {
-        const auto s1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
-        const auto ch = (e & f) ^ ((~e) & g);
-        const auto temp1 = h + s1 + ch + kSha256[i] + w[i];
-        const auto s0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
-        const auto maj = (a & b) ^ (a & c) ^ (b & c);
-        const auto temp2 = s0 + maj;
-        h = g; g = f; f = e; e = d + temp1;
-        d = c; c = b; b = a; a = temp1 + temp2;
-    }
-    state[0] += a; state[1] += b; state[2] += c; state[3] += d;
-    state[4] += e; state[5] += f; state[6] += g; state[7] += h;
-}
 
 std::string json_escape(std::string_view text) {
     std::ostringstream out;
@@ -105,20 +62,26 @@ const char* expr_kind(const Expr& expr) {
     return std::visit([](const auto& node) -> const char* {
         using T = std::decay_t<decltype(node)>;
         if constexpr (std::is_same_v<T, IntegerExpr>) return "integer";
-        else if constexpr (std::is_same_v<T, FloatExpr>) return "float";
+        else if constexpr (std::is_same_v<T, RealLiteralExpr>) return "float";
+        else if constexpr (std::is_same_v<T, ImaginaryLiteralExpr>) return "imaginary";
+        else if constexpr (std::is_same_v<T, LiteralConstantExpr>) return "literal constant";
         else if constexpr (std::is_same_v<T, StringExpr>) return "string";
         else if constexpr (std::is_same_v<T, StringTemplateExpr>) return "string_template";
         else if constexpr (std::is_same_v<T, BoolExpr>) return "bool";
         else if constexpr (std::is_same_v<T, VoidExpr>) return "void";
         else if constexpr (std::is_same_v<T, NoneExpr>) return "none";
-        else if constexpr (std::is_same_v<T, ArrayExpr>) return "array";
+        else if constexpr (std::is_same_v<T,ArrayExpr>) return "array";
+        else if constexpr (std::is_same_v<T,ArrayComprehensionExpr>) return "array_comprehension";
+        else if constexpr (std::is_same_v<T,TupleExpr>) return "TupleExpr";
         else if constexpr (std::is_same_v<T, IndexExpr>) return "index";
         else if constexpr (std::is_same_v<T, MemberExpr>) return "member";
         else if constexpr (std::is_same_v<T, MethodCallExpr>) return "method_call";
         else if constexpr (std::is_same_v<T, TryExpr>) return "try";
+        else if constexpr (std::is_same_v<T, IfExpr>) return "if_expression";
         else if constexpr (std::is_same_v<T, NameExpr>) return "name";
         else if constexpr (std::is_same_v<T, UnaryExpr>) return "unary";
         else if constexpr (std::is_same_v<T, BinaryExpr>) return "binary";
+        else if constexpr (std::is_same_v<T, ComparisonChainExpr>) return "comparison_chain";
         else if constexpr (std::is_same_v<T, CallExpr>) return "call";
         else return "expression";
     }, expr.data);
@@ -128,15 +91,17 @@ const char* stmt_kind(const Stmt& stmt) {
     return std::visit([](const auto& node) -> const char* {
         using T = std::decay_t<decltype(node)>;
         if constexpr (std::is_same_v<T, BindingStmt>) {
-            return node.declared_type.name.rfind("$cli.", 0) == 0 ? "cli" : "binding";
-        } else if constexpr (std::is_same_v<T, AssignStmt>) return "assignment";
+            return node.pattern?"DestructuringDecl":node.declared_type.name.rfind("$cli.", 0) == 0 ? "cli" : "binding";
+        } else if constexpr (std::is_same_v<T, AssignStmt>) return node.pattern?"DestructuringAssign":"assignment";
+        else if constexpr (std::is_same_v<T, RebindStmt>) return "address_assignment";
         else if constexpr (std::is_same_v<T, ReturnStmt>) return "return";
         else if constexpr (std::is_same_v<T, LoopControlStmt>) return node.is_continue ? "continue" : "break";
         else if constexpr (std::is_same_v<T, ExprStmt>) return "expression_statement";
         else if constexpr (std::is_same_v<T, IfStmt>) return "if";
         else if constexpr (std::is_same_v<T, MainGuardStmt>) return "main_guard";
+        else if constexpr (std::is_same_v<T, ParallelStmt>) return "parallel";
         else if constexpr (std::is_same_v<T, WhileStmt>) return "while";
-        else if constexpr (std::is_same_v<T, ForStmt>) return "for";
+        else if constexpr (std::is_same_v<T, ForStmt>) return node.parallel?"ParallelFor":node.legacy?"for":node.range?"ForRange":"ForEach";
         else if constexpr (std::is_same_v<T, MatchStmt>) return "match";
         else return "statement";
     }, stmt.data);
@@ -161,17 +126,25 @@ struct NodeCollector {
         const auto start = std::min(span.start.offset, source.size());
         const auto end = std::min(span.end.offset, source.size());
         const auto fragment = source.substr(start, end >= start ? end - start : 0);
-        nodes.push_back(SourceNode{
-            node_id,
-            std::string(kind),
-            span,
-            sha256_hex(fragment),
-            inferred,
-            std::move(authority),
-            parents.empty() ? std::optional<std::string>{}
-                            : std::optional<std::string>{parents.back()},
-            parents.size()});
+        SourceNode node;
+        node.node_id = node_id;
+        node.kind = kind;
+        node.span = span;
+        node.source_hash = sha256_hex(fragment);
+        node.inferred_type = inferred;
+        node.authority = std::move(authority);
+        if (!parents.empty()) node.parent_id = parents.back();
+        node.depth = parents.size();
+        nodes.push_back(std::move(node));
         return node_id;
+    }
+
+    void pattern(const Pattern& value) {
+        const char* kind=value.kind==Pattern::Kind::Tuple?"TuplePattern":value.kind==Pattern::Kind::Declare?"PatternBinding":value.kind==Pattern::Kind::Discard?"DiscardPattern":value.kind==Pattern::Kind::TypeOnly?"TypePattern":"PlacePattern";
+        auto id=emit(kind,value.span);parents.push_back(id);
+        for(const auto& child:value.elements)pattern(child);
+        if(value.place)expr(*value.place);
+        parents.pop_back();
     }
 
     void expr(const Expr& expression) {
@@ -183,6 +156,15 @@ struct NodeCollector {
             }
         }
         const auto id = emit(expr_kind(expression), expression.span, type);
+        if (const auto* name = std::get_if<NameExpr>(&expression.data)) {
+            nodes.back().this_qualified = name->this_qualifier.has_value();
+            nodes.back().self_reference = name->self_reference;
+        }
+        if (const auto* call = std::get_if<CallExpr>(&expression.data); call && call->mutation_marker)
+            nodes.back().mutation_marker = true;
+        if (const auto* call = std::get_if<MethodCallExpr>(&expression.data);
+            call && call->mutation_marker)
+            nodes.back().mutation_marker = true;
         parents.push_back(id);
         std::visit([&](const auto& node) {
             using T = std::decay_t<decltype(node)>;
@@ -190,7 +172,20 @@ struct NodeCollector {
                 expr(*node.operand);
             } else if constexpr (std::is_same_v<T, TryExpr>) {
                 if(node.value) expr(*node.value);
-            } else if constexpr (std::is_same_v<T, ArrayExpr>) {
+            } else if constexpr (std::is_same_v<T, IfExpr>) {
+                for (std::size_t i = 0; i < node.conditions.size(); ++i) {
+                    expr(*node.conditions[i]);
+                    expr(*node.values[i]);
+                }
+                expr(*node.otherwise);
+            } else if constexpr (std::is_same_v<T,ArrayComprehensionExpr>) {
+                std::optional<Type> binding_type;
+                if (checked) if (const auto source_type = checked->expr_types.find(node.source.get());
+                                 source_type != checked->expr_types.end() && source_type->second.first)
+                    binding_type = *source_type->second.first;
+                emit("generation_binding", node.binding_span, binding_type);
+                visit_array_comprehension(node, [&](const Expr& child) { expr(child); });
+            } else if constexpr ((std::is_same_v<T,ArrayExpr> || std::is_same_v<T,TupleExpr>)) {
                 for (const auto& element : node.elements) expr(*element);
             } else if constexpr (std::is_same_v<T, IndexExpr>) {
                 expr(*node.base);
@@ -209,6 +204,8 @@ struct NodeCollector {
                 for (const auto& part : node.expressions) expr(*part);
             } else if constexpr (std::is_same_v<T, BinaryExpr>) {
                 expr(*node.left); expr(*node.right);
+            } else if constexpr (std::is_same_v<T, ComparisonChainExpr>) {
+                for (const auto& operand : node.operands) expr(*operand);
             } else if constexpr (std::is_same_v<T, CallExpr>) {
                 for (const auto& arg : node.args) expr(*arg.value);
             }
@@ -233,13 +230,26 @@ struct NodeCollector {
             }
         }
         const auto id = emit(stmt_kind(statement), statement.span, inferred, authority);
+        if (const auto* binding = std::get_if<BindingStmt>(&statement.data))
+            nodes.back().is_local = binding->is_local;
+        if(const auto* loop=std::get_if<ForStmt>(&statement.data);loop && loop->range) {
+            nodes.back().start_inclusive=loop->range->start_inclusive;
+            nodes.back().end_inclusive=loop->range->end_inclusive;
+        }
+        if(const auto* loop=std::get_if<ForStmt>(&statement.data);loop && !loop->collections.empty())
+            nodes.back().collection_count=1+loop->collections.size();
         parents.push_back(id);
         std::visit([&](const auto& node) {
             using T = std::decay_t<decltype(node)>;
             if constexpr (std::is_same_v<T, BindingStmt>) {
+                if(node.pattern)pattern(*node.pattern);
                 if (node.declared_type.name.rfind("$cli.", 0) != 0 && node.value) expr(*node.value);
             } else if constexpr (std::is_same_v<T, AssignStmt>) {
-                expr(*node.target); expr(*node.value);
+                if(node.pattern)pattern(*node.pattern);
+                if(!node.pattern && node.target_expr())expr(*node.target_expr());
+                expr(*node.value);
+            } else if constexpr (std::is_same_v<T, RebindStmt>) {
+                if(node.target)expr(*node.target);
             } else if constexpr (std::is_same_v<T, ReturnStmt>) {
                 if(node.value) expr(*node.value);
             } else if constexpr (std::is_same_v<T, ExprStmt>) {
@@ -248,17 +258,28 @@ struct NodeCollector {
                 expr(*node.condition);
                 for (const auto& child : node.then_body) stmt(*child);
                 for (const auto& child : node.else_body) stmt(*child);
-            } else if constexpr (std::is_same_v<T, MainGuardStmt>) {
+            } else if constexpr (std::is_same_v<T, MainGuardStmt> || std::is_same_v<T, ParallelStmt>) {
                 for (const auto& child : node.body) stmt(*child);
             } else if constexpr (std::is_same_v<T, WhileStmt>) {
                 expr(*node.condition);
                 for (const auto& child : node.body) stmt(*child);
             } else if constexpr (std::is_same_v<T, ForStmt>) {
-                expr(*node.iterable);
+                if(node.pattern)pattern(*node.pattern);
+                if(!node.range || !node.range->implicit_start_zero) expr(*node.iterable);
+                for(const auto& binding:node.collections) {
+                    const auto binding_id=emit("ForCollectionBinding",binding.span,std::nullopt,"value");
+                    parents.push_back(binding_id);
+                    expr(*binding.iterable);
+                    parents.pop_back();
+                }
+                if(node.range) {
+                    if(!node.range->implicit_end_zero) expr(*node.range->end);
+                    if(node.range->step) expr(*node.range->step);
+                }
                 for (const auto& child : node.body) stmt(*child);
             } else if constexpr (std::is_same_v<T, MatchStmt>) {
                 if(node.value) expr(*node.value);
-                for (const auto& c : node.cases) for (const auto& child : c.body) stmt(*child);
+                for (const auto& c : node.cases){if(c.pattern)pattern(*c.pattern);for(const auto& child:c.body)stmt(*child);}
             }
         }, statement.data);
         parents.pop_back();
@@ -273,6 +294,7 @@ struct NodeCollector {
             }
         }
         const auto id = emit("function", fn.span, result);
+        if (fn.mutation_marker) nodes.back().mutation_marker = true;
         parents.push_back(id);
         for (const auto& p : fn.parameters) if(p.default_value) expr(*p.default_value);
         for (const auto& statement : fn.body) stmt(*statement);
@@ -281,7 +303,9 @@ struct NodeCollector {
 
     void class_decl(const ClassDecl& declaration) {
         const auto id = emit("class", declaration.span, Type::class_type(declaration.name));
+        nodes.back().instance_name = declaration.self_name;
         parents.push_back(id);
+        if (declaration.self_span) emit("instance", *declaration.self_span, Type::class_type(declaration.name));
         const ClassTypeInfo* info = nullptr;
         if (checked) {
             if (const auto found = checked->classes.find(declaration.name);
@@ -310,10 +334,10 @@ struct NodeCollector {
         std::size_t constructors = 0;
         for (const auto& method : declaration.methods) {
             if (method.is_constructor) {
-                function(method, "$construct." + declaration.name + "." + std::to_string(constructors++));
+                function(method, member_function_name::constructor(declaration.name, constructors++));
                 continue;
             }
-            function(method, "$method." + declaration.name + "." + method.name);
+            function(method, member_function_name::method(declaration.name, method.name));
         }
         parents.pop_back();
     }
@@ -322,28 +346,7 @@ struct NodeCollector {
 } // namespace
 
 std::string sha256_hex(std::string_view text) {
-    std::array<std::uint32_t, 8> state = {
-        0x6a09e667U, 0xbb67ae85U, 0x3c6ef372U, 0xa54ff53aU,
-        0x510e527fU, 0x9b05688cU, 0x1f83d9abU, 0x5be0cd19U,
-    };
-
-    const auto size = text.size();
-    const auto total = ((size + 9 + 63) / 64) * 64;
-    std::string padded(text);
-    padded.resize(total, '\0');
-    padded[size] = static_cast<char>(0x80);
-    const auto bit_length = static_cast<std::uint64_t>(size) * 8U;
-    for (unsigned i = 0; i < 8; ++i) {
-        padded[total - 1 - i] = static_cast<char>((bit_length >> (i * 8U)) & 0xffU);
-    }
-    for (std::size_t offset = 0; offset < total; offset += 64) {
-        sha256_compress(state, reinterpret_cast<const std::uint8_t*>(padded.data() + offset));
-    }
-
-    std::ostringstream out;
-    out << std::hex << std::setfill('0');
-    for (auto word : state) out << std::setw(8) << word;
-    return out.str();
+    return platform::sha256_hex(text);
 }
 
 SourceInspection inspect_syntax_source(std::string_view source) {
@@ -390,7 +393,7 @@ std::string inspect_source_json(std::string_view source,
                                 InspectOptions options) {
     const auto inspection = inspect_source(source, checked);
     std::ostringstream out;
-    out << "{\"ok\":true,\"schema_version\":1,\"revision\":\"" << inspection.revision
+    out << "{\"ok\":true,\"schema_version\":1,\"schema_minor\":3,\"revision\":\"" << inspection.revision
         << "\",\"file\":\"" << json_escape(filename) << "\",\"nodes\":[";
     bool first = true;
     for (const auto& node : inspection.nodes) {
@@ -410,6 +413,9 @@ std::string inspect_source_json(std::string_view source,
             << ",\"line\":" << node.span.start.line << ",\"column\":" << node.span.start.column
             << "},\"end\":{\"offset\":" << node.span.end.offset << ",\"line\":" << node.span.end.line
             << ",\"column\":" << node.span.end.column << "}}";
+        if(node.start_inclusive) out << ",\"start_inclusive\":" << (*node.start_inclusive?"true":"false");
+        if(node.end_inclusive) out << ",\"end_inclusive\":" << (*node.end_inclusive?"true":"false");
+        if(node.collection_count) out << ",\"collection_count\":" << *node.collection_count;
         if (options.include_source) {
             out << ",\"source\":\"" << json_escape(fragment) << "\"";
         }
@@ -419,6 +425,11 @@ std::string inspect_source_json(std::string_view source,
         if (node.authority) {
             out << ",\"authority\":\"" << json_escape(*node.authority) << "\"";
         }
+        if (node.this_qualified) out << ",\"this\":true";
+        if (node.mutation_marker) out << ",\"mutation_marker\":true";
+        if (node.is_local) out << ",\"local\":true";
+        if (node.self_reference) out << ",\"self_reference\":true";
+        if (!node.instance_name.empty()) out << ",\"instance_name\":\"" << json_escape(node.instance_name) << "\"";
         out << '}';
     }
     out << "],\"effects\":[";

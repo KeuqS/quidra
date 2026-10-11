@@ -188,6 +188,71 @@ FORBIDDEN_WORKFLOW_DEPENDENCY_MARKERS = (
     "opencv",
 )
 
+# Fixed-width complex power is Core arithmetic, not a domain math API.
+# Recognize only its existing principal-branch implementation statements.
+COMPLEX_POWER_SIGNATURE = (
+    'extern "C" void quidra_complex_pow(double re, double im, double exponent_re, double exponent_im,\n'
+    '                                   int kind, double* out, unsigned long long line,\n'
+    '                                   unsigned long long column) {'
+)
+COMPLEX_POWER_STATEMENTS = (
+    "    const double log_modulus = std::log(std::hypot(re, im));",
+    "    const double scale = std::exp(x);",
+    "    out[0] = round_part(scale * std::cos(y), part);",
+    "    out[1] = round_part(scale * std::sin(y), part);",
+)
+FINITE_INTERFACE_COMMENT = (
+    "// Values that stay inside the package (a -inf mask inside a softmax) are"
+)
+
+
+def implementation_markers(relative: str, text: str) -> tuple[str, ...]:
+    if relative == "include/quidra/native_extension.h":
+        # This exact full-line comment illustrates package-private intermediates;
+        # it neither declares nor implements the operation named in the example.
+        lines = text.splitlines(keepends=True)
+        for index, line in enumerate(lines):
+            if line == FINITE_INTERFACE_COMMENT + "\n":
+                lines[index] = "\n"
+                break
+        text = "".join(lines)
+    if relative == "src/runtime_complex.cpp":
+        start = text.find("\n" + COMPLEX_POWER_SIGNATURE)
+        if start >= 0:
+            start += 1
+            end = text.find("\n}\n", start)
+            if end >= 0:
+                body = text[start:end + 1]
+                if all(body.count("\n" + statement + "\n") == 1
+                       for statement in COMPLEX_POWER_STATEMENTS):
+                    for statement in COMPLEX_POWER_STATEMENTS:
+                        body = body.replace("\n" + statement + "\n", "\n", 1)
+                    text = text[:start] + body + text[end + 1:]
+    folded = text.casefold()
+    return tuple(marker for marker in FORBIDDEN_IMPLEMENTATION_MARKERS
+                 if marker.casefold() in folded)
+
+
+def check_implementation_marker_scope() -> None:
+    power = "\n" + COMPLEX_POWER_SIGNATURE + "\n" + "\n".join(COMPLEX_POWER_STATEMENTS) + "\n}\n"
+    cases = (
+        ("src/runtime_complex.cpp", power, ()),
+        ("src/runtime_complex.cpp", power + "std::sin(extra);\n", ("std::sin(",)),
+        ("src/runtime_complex.cpp", power.replace("\n}\n", "\n    std::cos(extra);\n}\n"), ("std::cos(",)),
+        ("src/runtime_complex.cpp", power.replace("quidra_complex_pow", "domain_power"),
+         ("std::sin(", "std::cos(", "std::log(", "std::exp(")),
+        ("src/runtime_complex.cpp", power + "void softmax();\n", ("softmax",)),
+        ("include/quidra/native_extension.h", FINITE_INTERFACE_COMMENT + "\n", ()),
+        ("include/quidra/native_extension.h", FINITE_INTERFACE_COMMENT + "\nvoid softmax();\n", ("softmax",)),
+        ("src/other.cpp", FINITE_INTERFACE_COMMENT + "\n", ("softmax",)),
+    )
+    for relative, text, expected in cases:
+        if implementation_markers(relative, text) != expected:
+            raise RuntimeError("Core/domain implementation marker scope regression")
+
+
+check_implementation_marker_scope()
+
 failures: list[str] = []
 
 for relative in FORBIDDEN_PATHS:
@@ -204,9 +269,8 @@ for directory in ("include", "src"):
 for path in implementation_files:
     text = path.read_text(encoding="utf-8")
     relative = path.relative_to(ROOT)
-    for marker in FORBIDDEN_IMPLEMENTATION_MARKERS:
-        if marker.casefold() in text.casefold():
-            failures.append(f"{relative}: forbidden domain marker {marker!r}")
+    for marker in implementation_markers(relative.as_posix(), text):
+        failures.append(f"{relative}: forbidden domain marker {marker!r}")
 
 cmake = (ROOT / "CMakeLists.txt").read_text(encoding="utf-8")
 for marker in FORBIDDEN_CMAKE_MARKERS:

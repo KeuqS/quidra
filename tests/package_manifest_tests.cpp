@@ -1,3 +1,6 @@
+#ifdef NDEBUG
+#undef NDEBUG
+#endif
 #include "quidra/package_manifest.hpp"
 
 #include <cassert>

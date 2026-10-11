@@ -1,0 +1,402 @@
+[
+  {
+    "source": "matrix-cpu-real16-real16.qui",
+    "expected": {
+      "rc": 0,
+      "stdout": "true\ntrue\ntrue\n"
+    },
+    "saved_modes": [
+      "cow"
+    ]
+  },
+  {
+    "source": "matrix-cpu-real16-real16b.qui",
+    "expected": {
+      "rc": 0,
+      "stdout": "true\ntrue\ntrue\n"
+    },
+    "saved_modes": [
+      "cow"
+    ]
+  },
+  {
+    "source": "matrix-cpu-real16-real32.qui",
+    "expected": {
+      "rc": 0,
+      "stdout": "true\ntrue\ntrue\n"
+    },
+    "saved_modes": [
+      "cow"
+    ]
+  },
+  {
+    "source": "matrix-cpu-real16-real64.qui",
+    "expected": {
+      "rc": 0,
+      "stdout": "true\ntrue\ntrue\n"
+    },
+    "saved_modes": [
+      "cow"
+    ]
+  },
+  {
+    "source": "matrix-cpu-real16b-real16.qui",
+    "expected": {
+      "rc": 0,
+      "stdout": "true\ntrue\ntrue\n"
+    },
+    "saved_modes": [
+      "cow"
+    ]
+  },
+  {
+    "source": "matrix-cpu-real16b-real16b.qui",
+    "expected": {
+      "rc": 0,
+      "stdout": "true\ntrue\ntrue\n"
+    },
+    "saved_modes": [
+      "cow"
+    ]
+  },
+  {
+    "source": "matrix-cpu-real16b-real32.qui",
+    "expected": {
+      "rc": 0,
+      "stdout": "true\ntrue\ntrue\n"
+    },
+    "saved_modes": [
+      "cow"
+    ]
+  },
+  {
+    "source": "matrix-cpu-real16b-real64.qui",
+    "expected": {
+      "rc": 0,
+      "stdout": "true\ntrue\ntrue\n"
+    },
+    "saved_modes": [
+      "cow"
+    ]
+  },
+  {
+    "source": "matrix-cpu-real32-real16.qui",
+    "expected": {
+      "rc": 0,
+      "stdout": "true\ntrue\ntrue\n"
+    },
+    "saved_modes": [
+      "cow"
+    ]
+  },
+  {
+    "source": "matrix-cpu-real32-real16b.qui",
+    "expected": {
+      "rc": 0,
+      "stdout": "true\ntrue\ntrue\n"
+    },
+    "saved_modes": [
+      "cow"
+    ]
+  },
+  {
+    "source": "matrix-cpu-real32-real32.qui",
+    "expected": {
+      "rc": 0,
+      "stdout": "true\ntrue\ntrue\n"
+    },
+    "saved_modes": [
+      "cow"
+    ]
+  },
+  {
+    "source": "matrix-cpu-real32-real64.qui",
+    "expected": {
+      "rc": 0,
+      "stdout": "true\ntrue\ntrue\n"
+    },
+    "saved_modes": [
+      "cow"
+    ]
+  },
+  {
+    "source": "matrix-cpu-real64-real16.qui",
+    "expected": {
+      "rc": 0,
+      "stdout": "true\ntrue\ntrue\n"
+    },
+    "saved_modes": [
+      "cow"
+    ]
+  },
+  {
+    "source": "matrix-cpu-real64-real16b.qui",
+    "expected": {
+      "rc": 0,
+      "stdout": "true\ntrue\ntrue\n"
+    },
+    "saved_modes": [
+      "cow"
+    ]
+  },
+  {
+    "source": "matrix-cpu-real64-real32.qui",
+    "expected": {
+      "rc": 0,
+      "stdout": "true\ntrue\ntrue\n"
+    },
+    "saved_modes": [
+      "cow"
+    ]
+  },
+  {
+    "source": "matrix-cpu-real64-real64.qui",
+    "expected": {
+      "rc": 0,
+      "stdout": "true\ntrue\ntrue\n"
+    },
+    "saved_modes": [
+      "cow"
+    ]
+  },
+  {
+    "source": "master-real16.qui",
+    "expected": {
+      "rc": 0,
+      "stdout": "true\ntrue\ntrue\n"
+    },
+    "saved_modes": [
+      "cow"
+    ]
+  },
+  {
+    "source": "reverse-tie-real16.qui",
+    "expected": {
+      "rc": 0,
+      "stdout": "true\n"
+    },
+    "saved_modes": [
+      "cow"
+    ]
+  },
+  {
+    "source": "master-real16b.qui",
+    "expected": {
+      "rc": 0,
+      "stdout": "true\ntrue\ntrue\n"
+    },
+    "saved_modes": [
+      "cow"
+    ]
+  },
+  {
+    "source": "reverse-tie-real16b.qui",
+    "expected": {
+      "rc": 0,
+      "stdout": "true\n"
+    },
+    "saved_modes": [
+      "cow"
+    ]
+  },
+  {
+    "source": "higher-real32-real64.qui",
+    "expected": {
+      "rc": 0,
+      "stdout": "true\ntrue\ntrue\n"
+    },
+    "saved_modes": [
+      "cow"
+    ]
+  },
+  {
+    "source": "higher-real64-real32.qui",
+    "expected": {
+      "rc": 0,
+      "stdout": "true\ntrue\ntrue\n"
+    },
+    "saved_modes": [
+      "cow"
+    ]
+  },
+  {
+    "source": "backward-real64-to-real32-tie.qui",
+    "expected": {
+      "rc": 0,
+      "stdout": "true\n"
+    },
+    "saved_modes": [
+      "cow"
+    ]
+  },
+  {
+    "source": "backward-real32-to-real64-exact.qui",
+    "expected": {
+      "rc": 0,
+      "stdout": "true\n"
+    },
+    "saved_modes": [
+      "cow"
+    ]
+  },
+  {
+    "source": "subnormal-gradient.qui",
+    "expected": {
+      "rc": 0,
+      "stdout": "true\n"
+    },
+    "saved_modes": [
+      "cow"
+    ]
+  },
+  {
+    "source": "mixed-branches.qui",
+    "expected": {
+      "rc": 0,
+      "stdout": "true\n"
+    },
+    "saved_modes": [
+      "cow"
+    ]
+  },
+  {
+    "source": "forward-atomic-range.qui",
+    "expected": {
+      "rc": 0,
+      "stdout": "true\ntrue\n"
+    },
+    "saved_modes": [
+      "cow"
+    ]
+  },
+  {
+    "source": "backward-range.qui",
+    "expected": {
+      "rc": 101,
+      "diagnostic_code": "NUMERIC_CONVERSION",
+      "message": "numeric conversion out of range: tensor element cannot be represented as real16"
+    },
+    "saved_modes": [
+      "cow"
+    ]
+  },
+  {
+    "source": "reject-tracked-int64.qui",
+    "expected": {
+      "rc": 101,
+      "diagnostic_code": "TENSOR",
+      "message": "tracked tensor cast requires floating source and destination types; call untrack() explicitly for other casts"
+    },
+    "saved_modes": [
+      "cow"
+    ]
+  },
+  {
+    "source": "reject-tracked-com32.qui",
+    "expected": {
+      "rc": 101,
+      "diagnostic_code": "TENSOR",
+      "message": "tracked tensor cast requires floating source and destination types; call untrack() explicitly for other casts"
+    },
+    "saved_modes": [
+      "cow"
+    ]
+  },
+  {
+    "source": "reject-bool.qui",
+    "expected": {
+      "phase": "check",
+      "rc": "nonzero",
+      "diagnostic_code": "TYPE_MISMATCH",
+      "message": "bool(value) accepts bin only."
+    },
+    "saved_modes": [
+      "cow"
+    ]
+  },
+  {
+    "source": "reject-complex-scalar.qui",
+    "expected": {
+      "phase": "check",
+      "rc": "nonzero",
+      "diagnostic_code": "NUMERIC_CAST",
+      "message": "A complex value has no direct real32 conversion: use z.real or math.abs(z)."
+    },
+    "saved_modes": [
+      "cow"
+    ]
+  },
+  {
+    "source": "reject-hidden-half-higher-real16.qui",
+    "expected": {
+      "rc": 101,
+      "diagnostic_code": "AUTOGRAD",
+      "message": "backward(track = true) is not available for real16 and real16b tensors"
+    },
+    "saved_modes": [
+      "cow"
+    ]
+  },
+  {
+    "source": "reject-hidden-half-higher-real16b.qui",
+    "expected": {
+      "rc": 101,
+      "diagnostic_code": "AUTOGRAD",
+      "message": "backward(track = true) is not available for real16 and real16b tensors"
+    },
+    "saved_modes": [
+      "cow"
+    ]
+  },
+  {
+    "source": "owned-target-real16.qui",
+    "expected": {
+      "rc": 0,
+      "stdout": "true\ntrue\ntrue\n"
+    },
+    "saved_modes": [
+      "cow"
+    ]
+  },
+  {
+    "source": "owned-target-real16b.qui",
+    "expected": {
+      "rc": 0,
+      "stdout": "true\ntrue\ntrue\n"
+    },
+    "saved_modes": [
+      "cow"
+    ]
+  },
+  {
+    "source": "shape-snapshot.qui",
+    "expected": {
+      "rc": 0,
+      "stdout": "true\ntrue\n"
+    },
+    "saved_modes": [
+      "copy",
+      "cow"
+    ]
+  },
+  {
+    "source": "ordinary-real32.qui",
+    "expected": {
+      "rc": 0,
+      "stdout": "true\n"
+    },
+    "saved_modes": [
+      "cow"
+    ]
+  },
+  {
+    "source": "ordinary-real64.qui",
+    "expected": {
+      "rc": 0,
+      "stdout": "true\n"
+    },
+    "saved_modes": [
+      "cow"
+    ]
+  }
+]

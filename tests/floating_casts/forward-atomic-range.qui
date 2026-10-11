@@ -1,0 +1,10 @@
+tensor<real32> x = (tensor.ones<real32>([2]) * real32(70000)).track()
+auto | error converted = real16(x)
+match converted
+    tensor<real16> value
+        print(false)
+    error problem
+        print(true)
+print(NL)
+print(x.is_tracked() and not x.has_grad())
+print(NL)

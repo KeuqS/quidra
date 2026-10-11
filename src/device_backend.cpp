@@ -1,9 +1,25 @@
 #include "device_backend.hpp"
+#include "deferred_node.hpp"
+#include "owned_native_fences.hpp"
+#include "node_failure.hpp"
+#include "platform/environment.hpp"
+#include "quidra/abi/dtype.hpp"
+#include "quidra/abi/half_format.hpp"
+#include "quidra/abi/complex_format.hpp"
+#include "quidra/abi/process_status.hpp"
+#include "quidra/abi/runtime_failure.hpp"
+#include "quidra/abi/tensor_codes.hpp"
+#include "runtime_counters.hpp"
 #include "quidra/project.hpp"
+#include "unified_storage.hpp"
 
 #include <algorithm>
 #include <atomic>
 #include <array>
+#include <bit>
+#include <chrono>
+#include <condition_variable>
+#include <deque>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -14,10 +30,12 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <type_traits>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 #ifdef _WIN32
@@ -38,16 +56,33 @@ namespace quidra::device {
 namespace {
 
 #ifdef __APPLE__
-bool synchronize_metal_backend(int backend_index, std::string& error);
+// `covered` receives the serial whose completion the synchronization waited
+// for (deferred checks queued up to it are readable).
+bool synchronize_metal_backend(int backend_index, std::string& error,
+                               std::uint64_t* covered = nullptr);
+std::uint64_t metal_deferred_check_serial(const Buffer* status);
 bool metal_copy_from_host(Buffer* raw, std::size_t offset, const void* source,
                           std::size_t bytes, std::string& error);
 bool metal_copy_to_host(const Buffer* raw, std::size_t offset, void* destination,
-                        std::size_t bytes, std::string& error);
+                        std::size_t bytes, std::uint64_t& covered,
+                        std::string& error);
 bool metal_copy_device_to_device(Buffer* destination, std::size_t destination_offset,
                                  const Buffer* source, std::size_t source_offset,
                                  std::size_t bytes, std::string& error);
 bool metal_zero(Buffer* raw, std::size_t offset, std::size_t bytes,
                 std::string& error);
+bool metal_clear_status_page(Buffer* page, std::size_t bytes, std::string& error);
+struct MetalStream;
+MetalStream* metal_stream_for(const Buffer* buffer);
+void metal_lend_to_package(MetalStream& stream, const Buffer* buffer);
+id<MTLBuffer> metal_acquire_buffer(int backend_index, std::size_t bytes,
+                                   bool require_idle, std::size_t& class_bytes,
+                                   std::uint64_t& busy_until, std::string& error);
+void metal_release_buffer(int backend_index, id<MTLBuffer> buffer,
+                          std::size_t class_bytes);
+bool metal_copy_to_host_if_idle(const Buffer* raw, std::size_t offset,
+                                void* destination, std::size_t bytes);
+bool metal_completions_pending(int backend_index);
 #endif
 
 class DynamicLibrary {
@@ -508,6 +543,14 @@ bool cuda_take_device_block(int backend_index,std::size_t bytes,
     return true;
 }
 
+[[noreturn]] void fail_unproved_cache_cleanup() {
+    const auto code=abi::spelling(abi::failure_reason_info(abi::FailureReason::deferred_check_failed).code);
+    std::fflush(stdout);
+    std::fprintf(stderr,"Quidra runtime error[%.*s]: operation owner unknown: GPU cache cleanup after allocation failure could not be proved\n",
+        static_cast<int>(code.size()),code.data());
+    std::fflush(stderr);std::_Exit(abi::failure_exit_status);
+}
+
 void cuda_return_device_block(int backend_index,std::size_t bytes,
                               CudaApi::CUdeviceptr pointer) {
     if(!pointer) return;
@@ -516,7 +559,9 @@ void cuda_return_device_block(int backend_index,std::size_t bytes,
     std::string ignored;
     CudaApi::CUevent event=nullptr;
     constexpr unsigned disable_timing=2;
-    const bool can_track=
+    bool can_track=false;
+    try {
+    can_track=
         api.current(backend_index,context,ignored)&&
         api.event_create&&api.event_record&&api.event_query&&api.event_destroy&&
         api.event_create(&event,disable_timing)==0&&event&&
@@ -531,13 +576,28 @@ void cuda_return_device_block(int backend_index,std::size_t bytes,
         state.pending_device_blocks.push_back(
             CudaResourceState::PendingDevice{backend_index,event,block});
     }else{
-        if(event&&api.event_destroy)(void)api.event_destroy(event);
+        if(event&&api.event_destroy)(void)api.event_destroy(std::exchange(event,nullptr));
         // No hidden wait on destruction. Without an event, explicit/final
         // synchronization is the earliest safe point at which this block can
         // re-enter the allocation pool.
         state.retired_device_blocks[static_cast<std::size_t>(backend_index)]
             .push_back(block);
     }
+    }catch(const std::bad_alloc&) {
+        if(!runtime::node_failure_active()&&!runtime_parallel::detail::current_deferred_node)throw;
+        // Cache metadata owns neither the pointer nor its event until the
+        // push succeeds. On OOM, prove completion before releasing both.
+        if(!context||!api.ctx_set_current||api.ctx_set_current(context)!=0)
+            fail_unproved_cache_cleanup();
+        const auto completed=can_track&&event&&api.event_synchronize
+            ?api.event_synchronize(event):(api.ctx_synchronize?api.ctx_synchronize():-1);
+        if(completed!=0)fail_unproved_cache_cleanup();
+        if(event&&(!api.event_destroy||api.event_destroy(std::exchange(event,nullptr))!=0))
+            fail_unproved_cache_cleanup();
+        if(!api.mem_free||api.mem_free(pointer)!=0)fail_unproved_cache_cleanup();
+        throw;
+    }
+
 }
 
 void cuda_retire_module(int backend_index,CudaApi::CUmodule module) {
@@ -992,7 +1052,9 @@ void hip_return_device_block(int backend_index,std::size_t bytes,void* pointer) 
     if(!pointer) return;
     auto& api=hip();
     HipApi::Event event=nullptr;
-    const bool can_track=
+    bool can_track=false;
+    try {
+    can_track=
         api.set_device&&api.set_device(backend_index)==0&&
         api.event_create&&api.event_record&&api.event_query&&api.event_destroy&&
         api.event_create(&event)==0&&event&&api.event_record(event,nullptr)==0;
@@ -1006,10 +1068,22 @@ void hip_return_device_block(int backend_index,std::size_t bytes,void* pointer) 
         state.pending_device_blocks.push_back(
             HipResourceState::PendingDevice{backend_index,event,block});
     }else{
-        if(event&&api.event_destroy)(void)api.event_destroy(event);
+        if(event&&api.event_destroy)(void)api.event_destroy(std::exchange(event,nullptr));
         state.retired_device_blocks[static_cast<std::size_t>(backend_index)]
             .push_back(block);
     }
+    }catch(const std::bad_alloc&) {
+        if(!runtime::node_failure_active()&&!runtime_parallel::detail::current_deferred_node)throw;
+        if(!api.set_device||api.set_device(backend_index)!=0)fail_unproved_cache_cleanup();
+        const auto completed=can_track&&event&&api.event_synchronize
+            ?api.event_synchronize(event):(api.device_synchronize?api.device_synchronize():-1);
+        if(completed!=0)fail_unproved_cache_cleanup();
+        if(event&&(!api.event_destroy||api.event_destroy(std::exchange(event,nullptr))!=0))
+            fail_unproved_cache_cleanup();
+        if(!api.free_fn||api.free_fn(pointer)!=0)fail_unproved_cache_cleanup();
+        throw;
+    }
+
 }
 
 void hip_retire_module(int backend_index,HipApi::Module module) {
@@ -1108,6 +1182,8 @@ bool hip_copy_from_host_async(HipApi& api,int backend_index,
     return true;
 }
 
+#include "device_owned_native_events.inc"
+
 constexpr std::size_t no_validation_page=static_cast<std::size_t>(-1);
 constexpr std::size_t validation_slots_per_page=4096;
 constexpr std::size_t validation_page_bytes=
@@ -1118,6 +1194,17 @@ struct BufferImpl {
     int global_index{-1};
     int backend_index{-1};
     std::size_t bytes{};
+    // Size of the backend allocation (Metal pool size class).
+    std::size_t physical_bytes{};
+    // Start of this buffer inside its backend allocation. Nonzero for Metal
+    // views (paged status words); every binding adds it.
+    std::size_t base_offset{};
+    // Metal: the buffer owning a view's allocation (null otherwise).
+    BufferImpl* owner{};
+    // Metal: serial of the last command buffer Core bound this buffer in
+    // (0: never), and whether package code received its native handle.
+    std::uint64_t last_use{};
+    bool exposed{};
     // Validation views borrow one uint32 slot from a page owned by the
     // deferred-validation arena. They never own the underlying device storage.
     std::size_t validation_page{no_validation_page};
@@ -1126,7 +1213,9 @@ struct BufferImpl {
     std::uint64_t cuda_pointer{};
     void* cuda_context{};
 #ifdef QUIDRA_ENABLE_TEST_GPU_BACKEND
-    std::vector<unsigned char> test_data;
+    // Host bytes of the fake device. They can adopt a wrapped host
+    // allocation when the fake backend emulates unified memory.
+    quidra::unified::HostBytes test_data;
 #endif
 #ifdef __APPLE__
     id<MTLBuffer> metal_buffer{nil};
@@ -1144,10 +1233,11 @@ struct ModuleImpl {
 std::vector<Info> enumerate_devices() {
     std::vector<Info> result;
 #ifdef QUIDRA_ENABLE_TEST_GPU_BACKEND
-    if (const char* configured = std::getenv("QUIDRA_TEST_FAKE_GPU_COUNT")) {
+    if (const auto configured = platform::environment_value("QUIDRA_TEST_FAKE_GPU_COUNT")) {
+        const char* text = configured->c_str();
         char* end = nullptr;
-        const long count = std::strtol(configured, &end, 10);
-        if (end == configured || (end && *end != '\0') || count < 0 || count > 16) {
+        const long count = std::strtol(text, &end, 10);
+        if (end == text || (end && *end != '\0') || count < 0 || count > 16) {
             return result;
         }
         for (long i = 0; i < count; ++i) {
@@ -1225,12 +1315,114 @@ std::atomic<int> execution_mode_value{static_cast<int>(ExecutionMode::Fast)};
 std::mutex gpu_usage_mutex;
 std::vector<int> used_gpu_indices;
 
+// Package warm-up functions (qcore_register_warmup). One Core thread
+// runs every (function, device) pair once, in order: for each device when
+// the program first allocates on it, and for a function registered later on
+// every device already in use. So a program that never uses a GPU runs
+// none, and the compilation they do overlaps the program's host work. The
+// thread starts with the first pair; process exit stops it after the
+// running call (std::atexit, registered when it starts, so objects created
+// before that outlive the call).
+using WarmupFunction = void (*)(long long);
+
+struct WarmupState {
+    std::mutex mutex;
+    std::condition_variable wake;
+    std::vector<WarmupFunction> functions;
+    std::vector<int> devices;
+    std::deque<std::pair<WarmupFunction, int>> queue;
+    bool started{};
+    bool stopping{};
+    std::thread worker;
+};
+
+WarmupState& warmup_state() {
+    static auto* state = new WarmupState; // never destroyed (exit races)
+    return *state;
+}
+
+void run_warmups() {
+    auto& state = warmup_state();
+    std::unique_lock lock(state.mutex);
+    for (;;) {
+        state.wake.wait(lock, [&] { return state.stopping || !state.queue.empty(); });
+        if (state.stopping) return;
+        const auto [function, device] = state.queue.front();
+        state.queue.pop_front();
+        lock.unlock();
+        // Package code outside any Quidra statement: a failure in it ends
+        // the process at once (exit_failed_program).
+        running_package_callback = true;
+        try {
+#ifdef __APPLE__
+            @autoreleasepool {
+                function(static_cast<long long>(device));
+            }
+#else
+            function(static_cast<long long>(device));
+#endif
+        } catch (...) {
+        }
+        check_package_hold_returned("a package warm-up function returned");
+        running_package_callback = false;
+        counters::add(counters::Id::PackageWarmups); // qcount
+        lock.lock();
+    }
+}
+
+void stop_warmups() {
+    // The warm-up thread may wait for a device stream that the exiting
+    // thread still holds for a package encode (a runtime failure that exits
+    // directly, in the statement whose extern call left the hold open), and
+    // this handler runs before the stream teardown's check: end that hold
+    // first, or the join below would wait for good.
+    check_package_hold_returned("the program exited");
+    auto& state = warmup_state();
+    {
+        std::lock_guard lock(state.mutex);
+        state.stopping = true;
+        state.queue.clear();
+    }
+    state.wake.notify_all();
+    // Exit may start on the warm-up thread itself (package code there
+    // called exit), which cannot join itself.
+    if (state.worker.joinable() &&
+        state.worker.get_id() != std::this_thread::get_id())
+        state.worker.join();
+}
+
+// Caller holds state.mutex.
+void queue_warmup_locked(WarmupState& state, WarmupFunction function, int device) {
+    if (state.stopping) return;
+    state.queue.emplace_back(function, device);
+    if (!state.started) {
+        state.started = true;
+        state.worker = std::thread(run_warmups);
+        std::atexit(stop_warmups);
+    }
+    state.wake.notify_one();
+}
+
+void warm_up_device(int index) {
+    auto& state = warmup_state();
+    std::lock_guard lock(state.mutex);
+    if (std::find(state.devices.begin(), state.devices.end(), index) !=
+        state.devices.end())
+        return;
+    state.devices.push_back(index);
+    for (const auto function : state.functions)
+        queue_warmup_locked(state, function, index);
+}
+
 void mark_gpu_used(int index) {
-    std::lock_guard lock(gpu_usage_mutex);
-    if (std::find(used_gpu_indices.begin(), used_gpu_indices.end(), index) ==
-        used_gpu_indices.end()) {
+    {
+        std::lock_guard lock(gpu_usage_mutex);
+        if (std::find(used_gpu_indices.begin(), used_gpu_indices.end(), index) !=
+            used_gpu_indices.end())
+            return;
         used_gpu_indices.push_back(index);
     }
+    warm_up_device(index);
 }
 
 std::vector<int> used_gpu_indices_snapshot() {
@@ -1247,6 +1439,8 @@ bool range_ok(const BufferImpl& buffer, std::size_t offset, std::size_t bytes) {
 struct Buffer : BufferImpl {};
 struct Module : ModuleImpl {};
 
+bool synchronize_device(int index, bool consume_checks, std::string& error);
+
 namespace {
 struct ValidationPage {
     int global_index{-1};
@@ -1254,6 +1448,7 @@ struct ValidationPage {
     std::size_t used{};
     std::size_t consumed{};
     std::size_t abandoned{};
+    bool recycling{};  // being cleared; no slot may be handed out
 };
 struct DeferredValidation {
     int global_index{-1};
@@ -1261,7 +1456,39 @@ struct DeferredValidation {
     std::size_t page{no_validation_page};
     std::size_t slot{};
     std::string message;
+    // The statement that queued the checked work. A failure surfaces at the
+    // next synchronization point, so the report names where it came from.
+    counters::SourceSite site{};
+    std::optional<runtime::ReportSite> raw_site{};
+    bool has_site{};
+    // Metal: serial of the command buffer whose completion makes the status
+    // word readable. A synchronization consumes only the checks its wait
+    // covered; checks of work still queued stay pending for a later one.
+    // 0 on the other backends, whose synchronization covers every check.
+    std::uint64_t serial{};
+    // When set, the message of a failed check from its nonzero status word
+    // (a real kernel's status bits name the failure); `message` otherwise.
+    std::function<std::string(std::uint32_t)> describe{};
+    runtime_parallel::detail::DeferredTicket ticket;
+    std::shared_ptr<runtime::OwnedNodeReport> native_trace;
+    std::string failure;
+    std::string drain_allocation_failure;
+    std::shared_ptr<runtime::OwnedNodeReport> drain_allocation_report;
+    int conversion_dtype{};
+    bool conversion_failed{};
+    bool consumed{};
 };
+
+// Covers every pending check (CUDA, HIP and the fake backend synchronize the
+// whole device, and so does the exit guard after the last work).
+constexpr std::uint64_t all_checks_covered=~std::uint64_t{0};
+
+std::string deferred_validation_message(const DeferredValidation& validation) {
+    const auto& message = validation.message;
+    if (!validation.has_site) return message;
+    return message + " (deferred GPU check from " +
+           counters::format_source_site(validation.site) + ")";
+}
 struct DeferredValidationState {
     std::mutex mutex;
     std::vector<DeferredValidation> pending;
@@ -1272,16 +1499,28 @@ DeferredValidationState& deferred_validation_state() {
     return *state;
 }
 
+// Zeroes a whole status page (new, or recycled once every slot was
+// consumed or abandoned). Never called with the validation-state lock held.
+bool clear_validation_page(Buffer* storage,std::string& error) {
+#ifdef __APPLE__
+    if(storage->backend==Backend::Metal)
+        return metal_clear_status_page(storage,validation_page_bytes,error);
+#endif
+    return zero(storage,0,validation_page_bytes,error);
+}
+
 Buffer* acquire_validation_status(int global_index,std::string& error) {
     const auto* info=find(global_index);
     if(!info){
         error="GPU validation requested an unavailable device";
         return nullptr;
     }
-    // Metal keeps its existing per-operation status buffer because MTLBuffer
-    // bindings do not expose a cheap portable sub-buffer view. CUDA/HIP use
-    // shared pages, which removes the allocation storm on long async runs.
-    if(info->backend!=Backend::Cuda&&info->backend!=Backend::Hip){
+    counters::add(counters::Id::ValidationSlots); // qcount
+    // Every backend sub-allocates status words from shared 4096-slot pages
+    // (Metal binds a word with its byte offset), so a checked operation no
+    // longer allocates and clears a status buffer of its own.
+#ifdef QUIDRA_ENABLE_TEST_GPU_BACKEND
+    if(info->backend==Backend::Test){
         auto* status=allocate(global_index,sizeof(std::uint32_t),error);
         if(!status) return nullptr;
         if(!zero(status,0,sizeof(std::uint32_t),error)){
@@ -1290,25 +1529,32 @@ Buffer* acquire_validation_status(int global_index,std::string& error) {
         }
         return status;
     }
+#endif
 
+    // A new page is allocated and cleared outside the state lock: a Metal
+    // clear may need the device stream, which a package encode hold on
+    // another thread keeps while it asks for a status slot (lock order:
+    // stream, then validation state).
     auto& state=deferred_validation_state();
-    std::lock_guard lock(state.mutex);
+    std::unique_lock lock(state.mutex);
     std::size_t page_index=no_validation_page;
     for(std::size_t i=0;i<state.pages.size();++i){
         const auto& page=state.pages[i];
-        if(page.global_index==global_index&&
+        if(page.global_index==global_index&&!page.recycling&&
            page.used<validation_slots_per_page){
             page_index=i;
             break;
         }
     }
     if(page_index==no_validation_page){
-        auto* storage=allocate(global_index,validation_page_bytes,error);
+        lock.unlock();
+        auto* storage=allocate_buffer(global_index,validation_page_bytes,true,error);
         if(!storage) return nullptr;
-        if(!zero(storage,0,validation_page_bytes,error)){
+        if(!clear_validation_page(storage,error)){
             release(storage);
             return nullptr;
         }
+        lock.lock();
         page_index=state.pages.size();
         state.pages.push_back(ValidationPage{global_index,storage,0,0,0});
     }
@@ -1325,6 +1571,14 @@ Buffer* acquire_validation_status(int global_index,std::string& error) {
     view->cuda_context=page.storage->cuda_context;
     if(view->backend==Backend::Cuda)
         view->cuda_pointer=page.storage->cuda_pointer+offset;
+#ifdef __APPLE__
+    else if(view->backend==Backend::Metal){
+        // Borrowed: the page owns the Metal buffer.
+        view->metal_buffer=page.storage->metal_buffer;
+        view->base_offset=page.storage->base_offset+offset;
+        view->owner=page.storage;
+    }
+#endif
     else
         view->pointer=
             static_cast<unsigned char*>(page.storage->pointer)+offset;
@@ -1339,12 +1593,29 @@ void abandon_validation_view(const Buffer& view) {
         ++state.pages[view.validation_page].abandoned;
 }
 
-bool raw_validation_synchronize(Buffer* status,std::string& error) {
+bool has_owned_deferred_validations(int index) {
+    auto& state=deferred_validation_state();
+    std::lock_guard lock(state.mutex);
+    for(const auto& validation:state.pending)
+        if(validation.global_index==index&&validation.ticket) return true;
+    return false;
+}
+
+bool raw_validation_synchronize(Buffer* status,std::uint64_t& covered,
+                                std::string& error) {
+    covered=all_checks_covered;
     if(!status) return true;
 #ifdef QUIDRA_ENABLE_TEST_GPU_BACKEND
     if(status->backend==Backend::Test) return true;
 #endif
     if(status->backend==Backend::Cuda){
+        seal_native_package_epochs();
+        if(owned_native_fences().has_pending(status->global_index)||
+           has_owned_deferred_validations(status->global_index)) {
+            covered=owned_native_fences().boundary(status->global_index);
+            drain_native_fences(status->global_index,covered);
+            return true;
+        }
         auto& api=cuda();
         CudaApi::CUcontext context=nullptr;
         if(!api.current(status->backend_index,context,error)) return false;
@@ -1357,6 +1628,13 @@ bool raw_validation_synchronize(Buffer* status,std::string& error) {
         return true;
     }
     if(status->backend==Backend::Hip){
+        seal_native_package_epochs();
+        if(owned_native_fences().has_pending(status->global_index)||
+           has_owned_deferred_validations(status->global_index)) {
+            covered=owned_native_fences().boundary(status->global_index);
+            drain_native_fences(status->global_index,covered);
+            return true;
+        }
         auto& api=hip();
         if(!api.device_synchronize||!api.set_device||
            api.set_device(status->backend_index)!=0||
@@ -1370,7 +1648,7 @@ bool raw_validation_synchronize(Buffer* status,std::string& error) {
     }
 #ifdef __APPLE__
     if(status->backend==Backend::Metal)
-        return synchronize_metal_backend(status->backend_index,error);
+        return synchronize_metal_backend(status->backend_index,error,&covered);
 #endif
     error="GPU validation synchronization is unavailable";
     return false;
@@ -1410,26 +1688,114 @@ bool raw_validation_copy_bytes(const Buffer* status,void* destination,
     }
 #ifdef __APPLE__
     if(status->backend==Backend::Metal){
-        std::memcpy(destination,[status->metal_buffer contents],bytes);
+        std::memcpy(destination,
+                    static_cast<const unsigned char*>([status->metal_buffer contents])+
+                        status->base_offset,
+                    bytes);
         return true;
     }
 #endif
     error="GPU validation status read is unavailable";
     return false;
 }
-bool consume_deferred_validations(int global_index,std::string& error) {
+// Reads and reports the deferred checks of the device whose work completed
+// by serial `covered` (the synchronization just waited for it). Checks that
+// other threads queued after that synchronization started stay pending: their
+// status words may not be written yet.
+bool consume_deferred_validations(int global_index,std::uint64_t covered,
+                                  std::string& error) {
+    auto retire_allocation_failure=[](DeferredValidation& validation) {
+        runtime_parallel::detail::DeferredNodeScope cleanup_owner(validation.ticket.owner());
+        if(validation.status) {
+            auto* status=std::exchange(validation.status,nullptr);
+            try {release(status);}catch(const std::bad_alloc&) {}
+        }
+        {
+            auto& state=deferred_validation_state();
+            std::lock_guard lock(state.mutex);
+            if(!validation.consumed&&validation.page!=no_validation_page&&validation.page<state.pages.size()) {
+                ++state.pages[validation.page].consumed;validation.consumed=true;
+            }
+        }
+        if(validation.ticket) {
+            std::shared_ptr<runtime::OwnedNodeReport> report;
+            if(validation.failure.empty()) {
+                validation.failure=std::move(validation.drain_allocation_failure);
+                report=std::move(validation.drain_allocation_report);
+            }
+            validation.ticket.complete(runtime_parallel::detail::DeferredFailure{
+                std::move(validation.failure),validation.site,validation.has_site,std::move(report),{},validation.raw_site});
+        }
+    };
     std::vector<DeferredValidation> local;
-    {
+    try {
         auto& state=deferred_validation_state();
         std::lock_guard lock(state.mutex);
+        // Reserve before moving anything out of shared pending storage.
+        const auto count=std::count_if(state.pending.begin(),state.pending.end(),[&](const auto& item) {
+            return item.global_index==global_index&&item.serial<=covered;
+        });
+        local.reserve(static_cast<std::size_t>(count));
         auto out=state.pending.begin();
         for(auto it=state.pending.begin();it!=state.pending.end();++it){
-            if(it->global_index==global_index) local.push_back(std::move(*it));
-            else *out++=std::move(*it);
+            if(it->global_index==global_index&&it->serial<=covered){
+                local.push_back(std::move(*it));
+            }else{
+                if(out!=it) *out=std::move(*it);
+                ++out;
+            }
         }
         state.pending.erase(out,state.pending.end());
+        pending_deferred_validations.store(state.pending.size(),std::memory_order_relaxed);
+    }catch(const std::bad_alloc&) {
+        // reserve failed before the first move. Retire covered records one
+        // at a time, preserving their actual owners with no new batch buffer.
+        for(;;) {
+            std::optional<DeferredValidation> validation;
+            {
+                auto& state=deferred_validation_state();
+                std::lock_guard lock(state.mutex);
+                const auto found=std::find_if(state.pending.begin(),state.pending.end(),[&](const auto& item) {
+                    return item.global_index==global_index&&item.serial<=covered;
+                });
+                if(found==state.pending.end())break;
+                validation.emplace(std::move(*found));state.pending.erase(found);
+                pending_deferred_validations.store(state.pending.size(),std::memory_order_relaxed);
+            }
+            retire_allocation_failure(*validation);
+        }
+        throw;
     }
 
+    std::vector<std::size_t> recycle;
+    std::string unknown_native_read;
+    auto copy_status=[&](Buffer* storage,void* destination,std::size_t bytes,std::string& read_error) {
+        try {return raw_validation_copy_bytes(storage,destination,bytes,read_error);}
+        catch(const std::bad_alloc&) {
+            if(storage&&(storage->backend==Backend::Cuda||storage->backend==Backend::Hip)) {
+                for(const auto& validation:local)
+                    if(validation.ticket && (validation.status==storage ||
+                       (validation.page!=no_validation_page&&validation.page==storage->validation_page)))
+                        fail_unattributed_native(validation.drain_allocation_failure);
+                // Arena storage itself has no view page index: inspect the
+                // page owner while the stable page storage is still retained.
+                auto& state=deferred_validation_state();
+                bool owned=false;
+                {
+                    std::lock_guard lock(state.mutex);
+                    for(const auto& validation:local)
+                        if(validation.ticket&&validation.page<state.pages.size()&&
+                           state.pages[validation.page].storage==storage) {owned=true;break;}
+                }
+                if(owned) {
+                    for(const auto& validation:local)if(validation.ticket)
+                        fail_unattributed_native(validation.drain_allocation_failure);
+                }
+            }
+            throw;
+        }
+    };
+    try {
     std::unordered_map<std::size_t,std::size_t> page_max_slot;
     for(const auto& validation:local)
         if(validation.page!=no_validation_page){
@@ -1439,7 +1805,10 @@ bool consume_deferred_validations(int global_index,std::string& error) {
         }
 
     std::unordered_map<std::size_t,std::vector<std::uint32_t>> page_values;
+    std::unordered_map<std::size_t,std::string> page_errors;
     std::string first_error;
+    int first_conversion_dtype = 0;
+    std::optional<runtime::ReportSite> first_conversion_site;
     for(const auto& [page_index,max_slot]:page_max_slot){
         Buffer* storage=nullptr;
         {
@@ -1449,77 +1818,209 @@ bool consume_deferred_validations(int global_index,std::string& error) {
                 storage=state.pages[page_index].storage;
         }
         if(!storage){
-            if(first_error.empty())
-                first_error="missing deferred GPU validation page";
+            page_errors[page_index]="missing deferred GPU validation page";
             continue;
         }
         auto& values=page_values[page_index];
         values.resize(max_slot+1);
         std::string read_error;
-        if(!raw_validation_copy_bytes(
+        if(!copy_status(
                storage,values.data(),values.size()*sizeof(std::uint32_t),
-               read_error)&&first_error.empty())
-            first_error=std::move(read_error);
+               read_error))
+        {
+            if(storage->backend==Backend::Cuda||storage->backend==Backend::Hip) {
+                for(const auto& validation:local)
+                    if(validation.page==page_index&&validation.ticket) {unknown_native_read=std::move(read_error);break;}
+            }
+            page_errors[page_index]=std::move(read_error);
+        }
     }
 
     for(auto& validation:local){
         std::uint32_t failed=0;
         std::string read_error;
         if(validation.page!=no_validation_page){
+            const auto page_error=page_errors.find(validation.page);
+            if (page_error!=page_errors.end()) validation.failure=page_error->second;
             const auto found=page_values.find(validation.page);
             if(found==page_values.end()||validation.slot>=found->second.size()){
-                if(first_error.empty())
-                    first_error="missing deferred GPU validation slot";
+                if(validation.failure.empty())
+                    validation.failure="missing deferred GPU validation slot";
             }else{
                 failed=found->second[validation.slot];
             }
-        }else if(!raw_validation_copy_bytes(
+        }else if(!copy_status(
                     validation.status,&failed,sizeof(failed),read_error)){
-            if(first_error.empty()) first_error=std::move(read_error);
+            if(validation.ticket&&validation.status&&
+                (validation.status->backend==Backend::Cuda||validation.status->backend==Backend::Hip))
+                unknown_native_read=std::move(read_error);
+            validation.failure=std::move(read_error);
         }
-        if(failed!=0&&first_error.empty())
-            first_error=validation.message;
+        if(failed!=0&&validation.failure.empty()) {
+            validation.failure=validation.describe?validation.describe(failed):validation.message;
+            validation.conversion_failed=validation.conversion_dtype!=0;
+        }
         if(validation.page==no_validation_page){
-            release(validation.status);
-            validation.status=nullptr;
+            std::optional<runtime_parallel::detail::DeferredNodeScope> cleanup_owner;
+            if(validation.ticket)cleanup_owner.emplace(validation.ticket.owner());
+            release(std::exchange(validation.status,nullptr));
         }
     }
 
     // Mark consumed arena slots and recycle a whole page only when every
     // acquired slot is either consumed or was abandoned by a failed launch.
-    // The state lock stays held while zeroing so a new submit cannot acquire a
-    // recycled slot before the clearing operation has been enqueued.
+    // A recycling page hands out no slot until its clearing operation has
+    // been enqueued. The clear runs outside the state lock, because a Metal
+    // clear may need the device stream, which a package encode hold on
+    // another thread can keep while it acquires a status slot.
     {
         auto& state=deferred_validation_state();
         std::lock_guard lock(state.mutex);
-        for(const auto& validation:local)
+        recycle.reserve(state.pages.size());
+        for(auto& validation:local)
             if(validation.page!=no_validation_page&&
-               validation.page<state.pages.size())
-                ++state.pages[validation.page].consumed;
-        for(auto& page:state.pages){
-            if(page.global_index!=global_index||page.used==0||
+               validation.page<state.pages.size()) {
+                ++state.pages[validation.page].consumed;validation.consumed=true;
+            }
+        for(std::size_t i=0;i<state.pages.size();++i){
+            auto& page=state.pages[i];
+            if(page.global_index!=global_index||page.used==0||page.recycling||
                page.used!=page.consumed+page.abandoned)
                 continue;
-            std::string zero_error;
-            if(!zero(page.storage,0,validation_page_bytes,zero_error)){
-                if(first_error.empty()) first_error=std::move(zero_error);
-                continue;
-            }
+            page.recycling=true;
+            recycle.push_back(i);
+        }
+    }
+    for(auto& index:recycle){
+        Buffer* storage=nullptr;
+        {
+            auto& state=deferred_validation_state();
+            std::lock_guard lock(state.mutex);
+            storage=state.pages[index].storage;
+        }
+        std::string zero_error;
+        std::shared_ptr<runtime_parallel::detail::DeferredNode> cleanup_owner;
+        for(const auto& validation:local)
+            if(validation.page==index&&validation.ticket) {cleanup_owner=validation.ticket.owner();break;}
+        runtime_parallel::detail::DeferredFactoryScope no_foreign_factory(nullptr);
+        runtime_parallel::detail::DeferredNodeScope cleanup_scope(cleanup_owner);
+        const bool cleared=clear_validation_page(storage,zero_error);
+        if(storage&&(storage->backend==Backend::Cuda||storage->backend==Backend::Hip)&&cleanup_owner)
+            drain_native_fences(storage->global_index,owned_native_fences().boundary(storage->global_index));
+        if(!cleared) {
+            for (auto& validation:local)
+                if(validation.page==index && validation.failure.empty()) validation.failure=zero_error;
+        }
+        auto& state=deferred_validation_state();
+        std::lock_guard lock(state.mutex);
+        auto& page=state.pages[index];
+        if(cleared){
             page.used=0;
             page.consumed=0;
             page.abandoned=0;
         }
+        page.recycling=false;index=no_validation_page;
     }
 
+    if(!unknown_native_read.empty()) fail_unattributed_native(unknown_native_read);
+
+    // Keep owner tickets live through slot cleanup: a foreign consumer's
+    // local batch still belongs to the node that enqueued each operation.
+    for(auto& validation:local) {
+        if(validation.ticket) {
+            std::shared_ptr<runtime::OwnedNodeReport> report;
+            if(validation.native_trace&&!validation.failure.empty()) {
+                const auto reason=validation.conversion_failed
+                    ? abi::FailureReason::conversion_out_of_range
+                    : abi::FailureReason::deferred_check_failed;
+                runtime::ReportData data;data.reason=&reason;data.args.message=validation.failure;
+                if(validation.conversion_failed) {
+                    data.args.type=abi::conversion_type_name(validation.conversion_dtype);
+                    data.args.subject=abi::ConversionSubject::tensor_element;
+                }
+                data.path=&validation.native_trace->path();data.provenance=validation.raw_site->statement;
+                const auto text=abi::format(reason,data.args);
+                const runtime::ReportHead head{runtime::ReportKind::coded,
+                    abi::spelling(abi::failure_reason_info(reason).code)};
+                report=std::make_shared<runtime::OwnedNodeReport>(head,
+                    runtime::locate_report_site(*validation.raw_site),text,data,validation.raw_site);
+            }
+            validation.ticket.complete(runtime_parallel::detail::DeferredFailure{
+                std::move(validation.failure),validation.site,validation.has_site,std::move(report),{},validation.raw_site});
+        } else if(!validation.failure.empty() && first_error.empty()) {
+            validation.message=std::move(validation.failure);
+            first_error=deferred_validation_message(validation);
+            if(validation.conversion_failed) {
+                first_conversion_dtype=validation.conversion_dtype;
+                first_conversion_site=validation.raw_site;
+            }
+        }
+    }
+    if(auto owner=runtime_parallel::detail::current_deferred_node) {
+        owner->wait_covered(global_index,covered,runtime_parallel::detail::current_callback_device==global_index);
+        if(auto failure=owner->covered_failure(global_index,covered); failure && first_error.empty()) {
+            if(owner->raise_failure) owner->raise_failure(*failure);
+            first_error=std::move(failure->message);
+            if(failure->has_site) first_error+=" (deferred GPU check from "+
+                counters::format_source_site(failure->site)+")";
+        }
+    }
+    if(first_conversion_site) {
+        // Every slot and owner ticket above has been retired before raising.
+        // Restore the producer's source table rather than the consumer's.
+        runtime::ReportSourceScope source(first_conversion_site->table);
+        runtime::report_at_statement(abi::FailureReason::conversion_out_of_range,
+            abi::FailureArgs{.type=abi::conversion_type_name(first_conversion_dtype),
+                             .subject=abi::ConversionSubject::tensor_element},
+            first_conversion_site->statement, {.provenance=true});
+    }
     if(!first_error.empty()){
         error=std::move(first_error);
         return false;
     }
     return true;
+    }catch(const std::bad_alloc&) {
+        if(!unknown_native_read.empty())fail_unattributed_native(unknown_native_read);
+        // Release cleanup claims before retiring owner tickets. Consumed
+        // flags avoid double-accounting if failure followed a partial clear.
+        {
+            auto& state=deferred_validation_state();
+            std::lock_guard lock(state.mutex);
+            for(const auto index:recycle)if(index!=no_validation_page)state.pages[index].recycling=false;
+        }
+        for(auto& validation:local)retire_allocation_failure(validation);
+        throw;
+    }
 }
-struct DeferredValidationExitGuard {
-    ~DeferredValidationExitGuard() {
-        std::vector<int> indices;
+
+// Teardown reports every deferred checked-GPU failure (language.md). Work the
+// exit guard waits for can still queue checks: a package completion callback
+// may encode a checked kernel and defer its status. Each pass therefore
+// synchronizes every device with pending checks or pending completion
+// callbacks (a Metal synchronization also waits for the callbacks of the
+// work it covered) and consumes what it covered, until nothing is left. The
+// pass limit stops callbacks that keep re-arming themselves.
+constexpr int exit_guard_max_passes=64;
+
+// Synchronizes and consumes until no deferred check is pending: the exit
+// guard's passes, also run where an exported function returns to C
+// (drain_deferred_validations). `first_error` receives the first failure.
+void drain_pending_validations(std::string& first_error) {
+    for(int pass=0;pass<exit_guard_max_passes&&first_error.empty();++pass){
+        seal_native_package_epochs();
+        std::vector<int> indices=owned_native_fences().pending_devices();
+        // Pending callbacks first, then pending checks: a callback defers
+        // its check before its batch stops counting as pending (acquire
+        // here pairs with that release), so a callback that finished
+        // after this read left its check for the scan below. Scanning
+        // checks first could miss a check deferred between the two reads.
+#ifdef __APPLE__
+        for(const auto& info:devices())
+            if(info.backend==Backend::Metal&&
+               metal_completions_pending(info.backend_index)&&
+               std::find(indices.begin(),indices.end(),info.index)==indices.end())
+                indices.push_back(info.index);
+#endif
         {
             auto& state=deferred_validation_state();
             std::lock_guard lock(state.mutex);
@@ -1527,34 +2028,69 @@ struct DeferredValidationExitGuard {
                 if(std::find(indices.begin(),indices.end(),validation.global_index)==indices.end())
                     indices.push_back(validation.global_index);
         }
-        std::string first_error;
+        if(indices.empty()) break;
         for(int index:indices){
-            Buffer* sample=nullptr;
+            const bool native_pending=owned_native_fences().has_pending(index);
+            const auto native_covered=owned_native_fences().boundary(index);
+            if(native_pending) drain_native_fences(index,native_covered);
+            std::string sync_error;
+            std::uint64_t covered=native_pending?native_covered:all_checks_covered;
+#ifdef __APPLE__
+            const auto* info=find(index);
+            if(info&&info->backend==Backend::Metal){
+                if(!synchronize_metal_backend(info->backend_index,sync_error,&covered)){
+                    if(first_error.empty()) first_error=std::move(sync_error);
+                    continue;
+                }
+            }else
+#endif
             {
-                auto& state=deferred_validation_state();
-                std::lock_guard lock(state.mutex);
-                for(const auto& validation:state.pending){
-                    if(validation.global_index!=index) continue;
-                    sample=validation.page==no_validation_page
-                        ?validation.status
-                        :(validation.page<state.pages.size()
-                            ?state.pages[validation.page].storage:nullptr);
-                    break;
+                Buffer* sample=nullptr;
+                {
+                    auto& state=deferred_validation_state();
+                    std::lock_guard lock(state.mutex);
+                    for(const auto& validation:state.pending){
+                        if(validation.global_index!=index) continue;
+                        sample=validation.page==no_validation_page
+                            ?validation.status
+                            :(validation.page<state.pages.size()
+                                ?state.pages[validation.page].storage:nullptr);
+                        break;
+                    }
+                }
+                if(sample&&!native_pending&&!raw_validation_synchronize(sample,covered,sync_error)){
+                    if(first_error.empty()) first_error=std::move(sync_error);
+                    continue;
                 }
             }
-            std::string sync_error;
-            if(sample&&!raw_validation_synchronize(sample,sync_error)){
-                if(first_error.empty()) first_error=std::move(sync_error);
-                continue;
-            }
             std::string validation_error;
-            if(!consume_deferred_validations(index,validation_error)&&first_error.empty())
+            if(!consume_deferred_validations(index,covered,validation_error)&&
+               first_error.empty())
                 first_error=std::move(validation_error);
         }
+    }
+}
+
+struct DeferredValidationExitGuard {
+    DeferredValidationExitGuard() {
+        // The drain reads this registry even for non-node checked work.
+        // Construct it before registering this guard for destruction so the
+        // registry and its mutex remain alive throughout the exit drain.
+        (void)owned_native_fences();
+    }
+    ~DeferredValidationExitGuard() {
+        // A package encode hold the exiting thread still has would refuse
+        // the synchronizations below.
+        check_package_hold_returned("the program exited");
+        std::string first_error;
+        drain_pending_validations(first_error);
         if(!first_error.empty()){
-            std::fprintf(stderr,"Quidra runtime error[GPU_ASYNC]: %s\n",first_error.c_str());
-            std::fflush(stderr);
-            std::_Exit(101);
+            // The guard runs among the exit handlers, before exit flushes
+            // the C streams, and _Exit skips that flush: the program's
+            // output is flushed here, ahead of the report.
+            std::fflush(stdout);
+            counters::report_unlocated_failure(abi::FailureReason::deferred_check_failed,
+                                               first_error,true);
         }
 
         std::vector<Buffer*> pages;
@@ -1568,35 +2104,99 @@ struct DeferredValidationExitGuard {
         for(auto* page:pages) release(page);
     }
 };
-void defer_validation(Buffer* status,std::string message) {
-    if(!status) return;
+// Constructed before the first check is deferred, or before package code
+// that may defer one later (a status slot or a completion callback) runs, so
+// the guard exists before exit starts and is destroyed before the Metal
+// streams' silent teardown.
+void arm_deferred_validation_exit_guard() {
     static DeferredValidationExitGuard exit_guard;
     (void)exit_guard;
+}
+void defer_validation(Buffer* status,std::string message,
+                      std::function<std::string(std::uint32_t)> describe={},
+                      int conversion_dtype=0) {
+    if(!status) return;
+    arm_deferred_validation_exit_guard();
+    DeferredValidation validation;
+    validation.global_index=status->global_index;
+    validation.message=std::move(message);
+    validation.describe=std::move(describe);
+    validation.conversion_dtype=conversion_dtype;
+    if(conversion_dtype)
+        validation.raw_site=runtime::report_site(0,0,runtime::current_user_statement(),true);
+    validation.has_site=counters::current_user_source_site(validation.site);
+#ifdef __APPLE__
+    // Taken before the state lock (it takes the device stream).
+    if(status->backend==Backend::Metal)
+        validation.serial=metal_deferred_check_serial(status);
+#endif
+    if(status->backend==Backend::Cuda||status->backend==Backend::Hip) {
+        seal_native_package_epochs();
+        if(runtime_parallel::detail::deferred_node()) {
+            std::string fence_error;
+            auto marker=prepare_native_fence(status->backend,status->global_index,status->backend_index,fence_error);
+            if(!marker) fail_unattributed_native(fence_error);
+            marker->publish();
+            validation.serial=owned_native_fences().boundary(status->global_index);
+        }
+    }
+    if(auto owner=runtime_parallel::detail::deferred_node()) {
+        validation.drain_allocation_failure="allocation failed while draining a deferred GPU validation";
+        validation.raw_site=runtime::report_site(0,0,runtime::current_user_statement(),true);
+        runtime::ReportData allocation_data;allocation_data.provenance=validation.raw_site->statement;
+        validation.drain_allocation_report=std::make_shared<runtime::OwnedNodeReport>(
+            runtime::ReportHead{runtime::ReportKind::uncoded,{}},runtime::locate_report_site(*validation.raw_site),
+            "allocation failed",allocation_data,validation.raw_site);
+        if(conversion_dtype||status->backend==Backend::Cuda||status->backend==Backend::Hip) {
+            const auto reason=abi::FailureReason::deferred_check_failed;
+            runtime::ReportData data;data.reason=&reason;data.provenance=validation.raw_site->statement;
+            const runtime::ReportHead head{runtime::ReportKind::coded,
+                abi::spelling(abi::failure_reason_info(reason).code)};
+            validation.native_trace=std::make_shared<runtime::OwnedNodeReport>(head,
+                runtime::locate_report_site(*validation.raw_site),std::string_view{},data,validation.raw_site);
+        }
+        validation.ticket=owner->enqueue(validation.global_index,validation.serial);
+    }
     auto& state=deferred_validation_state();
     if(status->validation_page!=no_validation_page){
-        const auto page=status->validation_page;
-        const auto slot=status->validation_slot;
-        const auto global_index=status->global_index;
+        validation.page=status->validation_page;
+        validation.slot=status->validation_slot;
         {
             std::lock_guard lock(state.mutex);
-            state.pending.push_back(
-                DeferredValidation{
-                    global_index,nullptr,page,slot,std::move(message)});
+            state.pending.push_back(std::move(validation));
+            pending_deferred_validations.store(state.pending.size(),std::memory_order_relaxed);
         }
         // The tiny Buffer is only a non-owning view into the page.
         delete status;
         return;
     }
+    validation.status=status;
     std::lock_guard lock(state.mutex);
-    state.pending.push_back(
-        DeferredValidation{
-            status->global_index,status,no_validation_page,0,std::move(message)});
+    state.pending.push_back(std::move(validation));
+    pending_deferred_validations.store(state.pending.size(),std::memory_order_relaxed);
 }
+#ifdef __APPLE__
+bool has_deferred_validations(int global_index) {
+    auto& state=deferred_validation_state();
+    std::lock_guard lock(state.mutex);
+    for(const auto& validation:state.pending)
+        if(validation.global_index==global_index) return true;
+    return false;
+}
+#endif
 } // namespace
 
 const std::vector<Info>& devices() {
     static const std::vector<Info> value = enumerate_devices();
     return value;
+}
+
+bool drain_deferred_validations(std::string& error) {
+    std::string first_error;
+    drain_pending_validations(first_error);
+    if(first_error.empty()) return true;
+    error=std::move(first_error);
+    return false;
 }
 
 const Info* find(int index) {
@@ -1605,32 +2205,65 @@ const Info* find(int index) {
     return &all[static_cast<std::size_t>(index)];
 }
 
+void seal_native_package_work() {seal_native_package_epochs();}
+bool has_owned_native_work() {return !owned_native_fences().pending_devices().empty();}
+
 bool synchronize(int index, std::string& error) {
+    return synchronize_device(index, true, error);
+}
+
+// Waits for all work queued on the device. With `consume_checks` it also
+// reports the deferred checks the wait covered (synchronize()); without, the
+// checks stay pending for the next synchronization point (wait_idle(), which
+// serves package waits and must not take another operation's failure).
+bool synchronize_device(int index, bool consume_checks, std::string& error) {
     const auto* info = find(index);
     if (!info) {
         error = "gpu(" + std::to_string(index) + ") is not available";
         return false;
     }
+    counters::add(counters::Id::Synchronizations); // qcount
 #ifdef QUIDRA_ENABLE_TEST_GPU_BACKEND
     if (info->backend == Backend::Test) {
-        if (std::getenv("QUIDRA_TEST_FAKE_GPU_SYNC_FAIL")) {
+        if (platform::environment_has("QUIDRA_TEST_FAKE_GPU_SYNC_FAIL")) {
+            // The test backend executes synchronously. Retire checks of
+            // its completed work even when its synchronization hook fails.
+            if(consume_checks) {
+                std::string ignored;
+                (void)consume_deferred_validations(index,all_checks_covered,ignored);
+            }
             error = "test-only fake GPU synchronization failure";
             return false;
         }
-        if (const char* configured =
-                std::getenv("QUIDRA_TEST_FAKE_GPU_SYNC_FAIL_INDEX")) {
+        if (const auto configured =
+                platform::environment_value("QUIDRA_TEST_FAKE_GPU_SYNC_FAIL_INDEX")) {
+            const char* text = configured->c_str();
             char* end = nullptr;
-            const long fail_index = std::strtol(configured, &end, 10);
-            if (end != configured && end && *end == '\0' && fail_index == index) {
+            const long fail_index = std::strtol(text, &end, 10);
+            if (end != text && end && *end == '\0' && fail_index == index) {
+                if(consume_checks) {
+                    std::string ignored;
+                    (void)consume_deferred_validations(index,all_checks_covered,ignored);
+                }
                 error = "test-only fake GPU synchronization failure";
                 return false;
             }
         }
-        return consume_deferred_validations(index, error);
+        return !consume_checks ||
+               consume_deferred_validations(index, all_checks_covered, error);
     }
 #endif
     if (info->backend == Backend::Cuda) {
+        seal_native_package_epochs();
+        const bool native_pending=owned_native_fences().has_pending(index);
+        const auto native_covered=owned_native_fences().boundary(index);
+        if(native_pending) drain_native_fences(index,native_covered);
         auto& api = cuda();
+        if(native_pending||has_owned_deferred_validations(index)) {
+            cuda_reap_uploads(api,info->backend_index,false);
+            cuda_reap_device_blocks(api,info->backend_index,false);
+            return !consume_checks||consume_deferred_validations(index,native_covered,error);
+        }
         CudaApi::CUcontext context = nullptr;
         bool exists=false;
         if (!api.current_if_created(info->backend_index,context,exists,error))
@@ -1652,16 +2285,28 @@ bool synchronize(int index, std::string& error) {
         if(!synchronized){
             if (!api.ctx_synchronize || api.ctx_synchronize() != 0) {
                 error = "failed to synchronize NVIDIA GPU";
+                if(runtime_parallel::detail::current_deferred_node) fail_unattributed_native(error);
                 return false;
             }
         }
         cuda_reap_uploads(api,info->backend_index,true);
         cuda_reap_device_blocks(api,info->backend_index,true);
-        if(!consume_deferred_validations(index,error)) return false;
+        if(consume_checks&&
+           !consume_deferred_validations(index,all_checks_covered,error))
+            return false;
         return true;
     }
     if (info->backend == Backend::Hip) {
+        seal_native_package_epochs();
+        const bool native_pending=owned_native_fences().has_pending(index);
+        const auto native_covered=owned_native_fences().boundary(index);
+        if(native_pending) drain_native_fences(index,native_covered);
         auto& api = hip();
+        if(native_pending||has_owned_deferred_validations(index)) {
+            hip_reap_uploads(api,info->backend_index,false);
+            hip_reap_device_blocks(api,info->backend_index,false);
+            return !consume_checks||consume_deferred_validations(index,native_covered,error);
+        }
         if (!api.is_active(info->backend_index)) return true;
         if(!api.set_device||api.set_device(info->backend_index)!=0){
             error = "failed to synchronize AMD GPU";
@@ -1682,22 +2327,119 @@ bool synchronize(int index, std::string& error) {
         if(!synchronized){
             if (!api.device_synchronize || api.device_synchronize() != 0) {
                 error = "failed to synchronize AMD GPU";
+                if(runtime_parallel::detail::current_deferred_node) fail_unattributed_native(error);
                 return false;
             }
         }
         hip_reap_uploads(api,info->backend_index,true);
         hip_reap_device_blocks(api,info->backend_index,true);
-        if(!consume_deferred_validations(index,error)) return false;
+        if(consume_checks&&
+           !consume_deferred_validations(index,all_checks_covered,error))
+            return false;
         return true;
     }
 #ifdef __APPLE__
     if (info->backend == Backend::Metal) {
-        if(!synchronize_metal_backend(info->backend_index,error)) return false;
-        return consume_deferred_validations(index,error);
+        std::uint64_t covered=0;
+        if(!synchronize_metal_backend(info->backend_index,error,&covered))
+            return false;
+        return !consume_checks||consume_deferred_validations(index,covered,error);
     }
 #endif
     error = "GPU synchronization is unavailable";
     return false;
+}
+
+// Device status words for checked package kernels. A kernel sets its word
+// to a nonzero value on failure; the package then either defers the check to
+// the next synchronization point (reported with the statement that queued
+// it) or waits for it now.
+bool status_slot(int index, std::uint64_t& handle, std::uint64_t& offset_bytes,
+                 std::uint64_t& slot, std::string& error) {
+    auto* status = acquire_validation_status(index, error);
+    if (!status) return false;
+    // The package may defer this check from a completion callback that runs
+    // during exit; the guard must exist before then (and after the device
+    // state the acquisition created, so it is destroyed first).
+    arm_deferred_validation_exit_guard();
+    std::uint64_t native = 0;
+#ifdef __APPLE__
+    if (status->backend == Backend::Metal) {
+        // Not a lend: nothing of Core's has to be committed first (a status
+        // page is cleared on the host, or by a kernel committed at once), and
+        // the host reads the word only after the synchronization that covers
+        // the deferred check or the status wait.
+        native = reinterpret_cast<std::uint64_t>(
+            (__bridge void*)status->metal_buffer);
+    } else
+#endif
+    {
+        native = buffer_native_handle(status);
+    }
+    if (native == 0 && status->backend != Backend::Cuda) {
+        release(status);
+        error = "GPU status words have no native handle on this device";
+        return false;
+    }
+    handle = native;
+    offset_bytes = buffer_base_offset(status);
+    slot = reinterpret_cast<std::uint64_t>(status);
+    return true;
+}
+
+namespace {
+Buffer* status_from_slot(int index, std::uint64_t slot, std::string& error) {
+    auto* status = reinterpret_cast<Buffer*>(static_cast<std::uintptr_t>(slot));
+    if (!status || status->global_index != index) {
+        error = "invalid GPU status slot";
+        return nullptr;
+    }
+    return status;
+}
+} // namespace
+
+bool defer_status(int index, std::uint64_t slot, const char* message,
+                  std::string& error) {
+    auto* status = status_from_slot(index, slot, error);
+    if (!status) return false;
+    counters::add(counters::Id::PackageDeferredChecks); // qcount
+    defer_validation(status, message && *message
+        ? std::string(message) : std::string("package GPU check failed"));
+    return true;
+}
+
+bool defer_conversion_status(int index, std::uint64_t slot, int target_dtype,
+                             std::string& error) {
+    if(!abi::real_dtype_code(target_dtype)) {
+        error="invalid checked conversion target dtype";
+        return false;
+    }
+    auto* status=status_from_slot(index,slot,error);
+    if(!status) return false;
+    counters::add(counters::Id::PackageDeferredChecks); // qcount
+    defer_validation(status,abi::format(abi::FailureReason::conversion_out_of_range,
+        abi::FailureArgs{.type=abi::conversion_type_name(target_dtype),
+                         .subject=abi::ConversionSubject::tensor_element}),{},target_dtype);
+    return true;
+}
+
+bool status_wait(int index, std::uint64_t slot, std::uint32_t& value,
+                 std::string& error) {
+    auto* status = status_from_slot(index, slot, error);
+    if (!status) return false;
+    value = 0;
+    const bool ok = wait_idle(index, error) &&
+        raw_validation_copy_bytes(status, &value, sizeof(value), error);
+    const bool owned_native_failure=!ok&&runtime_parallel::detail::current_deferred_node&&
+        (status->backend==Backend::Cuda||status->backend==Backend::Hip);
+    release(status);
+    if(owned_native_failure) fail_unattributed_native(error);
+    return ok;
+}
+
+void status_release(int index, std::uint64_t slot) {
+    std::string ignored;
+    if (auto* status = status_from_slot(index, slot, ignored)) release(status);
 }
 
 bool synchronize_all(std::string& error) {
@@ -1730,11 +2472,19 @@ std::string backend_display_name(Backend backend) {
 }
 
 Buffer* allocate(int index, std::size_t bytes, std::string& error) {
+    return allocate_buffer(index, bytes, false, error);
+}
+
+Buffer* allocate_buffer(int index, std::size_t bytes, bool require_idle,
+                        std::string& error) {
+    (void)require_idle; // Metal only
     const auto* info = find(index);
     if (!info) {
         error = "gpu(" + std::to_string(index) + ") is not available";
         return nullptr;
     }
+    counters::add(counters::Id::Allocations); // qcount
+    counters::add(counters::Id::AllocationBytes, bytes); // qcount
     auto buffer = std::make_unique<Buffer>();
     buffer->backend = info->backend;
     buffer->global_index = index;
@@ -1801,28 +2551,17 @@ Buffer* allocate(int index, std::size_t bytes, std::string& error) {
 
 #ifdef __APPLE__
     if (info->backend == Backend::Metal) {
-        @autoreleasepool {
-            NSArray<id<MTLDevice>>* metal_devices = MTLCopyAllDevices();
-            if (info->backend_index < 0 ||
-                static_cast<NSUInteger>(info->backend_index) >= [metal_devices count]) {
-                [metal_devices release];
-                error = "Metal GPU index is unavailable";
-                return nullptr;
-            }
-            id<MTLDevice> dev =
-                [metal_devices objectAtIndex:static_cast<NSUInteger>(info->backend_index)];
-            id<MTLBuffer> metal =
-                [dev newBufferWithLength:physical_bytes
-                                 options:MTLResourceStorageModeShared];
-            [metal_devices release];
-            if (!metal) {
-                error = "Metal GPU memory allocation failed";
-                return nullptr;
-            }
-            buffer->metal_buffer = metal;
-            mark_gpu_used(index);
-            return buffer.release();
-        }
+        std::uint64_t busy_until = 0;
+        id<MTLBuffer> metal = metal_acquire_buffer(
+            info->backend_index, physical_bytes, require_idle,
+            buffer->physical_bytes, busy_until, error);
+        if (!metal) return nullptr;
+        buffer->metal_buffer = metal;
+        // A pooled buffer that queued work may still use: host access waits
+        // for that work (metal_buffer_idle_locked), device work is ordered.
+        buffer->last_use = busy_until;
+        mark_gpu_used(index);
+        return buffer.release();
     }
 #endif
 
@@ -1845,7 +2584,8 @@ void release(Buffer* raw) {
                                 buffer->pointer);
 #ifdef __APPLE__
     } else if (buffer->backend == Backend::Metal && buffer->metal_buffer) {
-        [buffer->metal_buffer release];
+        metal_release_buffer(buffer->backend_index, buffer->metal_buffer,
+                             buffer->physical_bytes);
         buffer->metal_buffer = nil;
 #endif
     }
@@ -1858,6 +2598,8 @@ bool copy_from_host(Buffer* raw, std::size_t offset, const void* source,
         return false;
     }
     if (bytes == 0) return true;
+    counters::add(counters::Id::Uploads); // qcount
+    counters::add(counters::Id::UploadBytes, bytes); // qcount
 #ifdef QUIDRA_ENABLE_TEST_GPU_BACKEND
     if (raw->backend == Backend::Test) {
         std::memcpy(raw->test_data.data() + offset, source, bytes);
@@ -1865,6 +2607,8 @@ bool copy_from_host(Buffer* raw, std::size_t offset, const void* source,
     }
 #endif
     if (raw->backend == Backend::Cuda) {
+        auto owned_fence=prepare_native_fence(Backend::Cuda,raw->global_index,raw->backend_index,error);
+        if(!owned_fence) return false;
         auto& api = cuda();
         CudaApi::CUcontext context = nullptr;
         if (!api.current(raw->backend_index, context, error)) return false;
@@ -1872,6 +2616,8 @@ bool copy_from_host(Buffer* raw, std::size_t offset, const void* source,
             api,raw->backend_index,raw->cuda_pointer+offset,source,bytes,error);
     }
     if (raw->backend == Backend::Hip) {
+        auto owned_fence=prepare_native_fence(Backend::Hip,raw->global_index,raw->backend_index,error);
+        if(!owned_fence) return false;
         auto& api = hip();
         if (!api.ready || api.set_device(raw->backend_index) != 0) {
             error = "failed to select AMD GPU";
@@ -1897,10 +2643,15 @@ bool copy_to_host(const Buffer* raw, std::size_t offset, void* destination,
         return false;
     }
     if (bytes == 0) return true;
+    counters::add(counters::Id::Readbacks); // qcount
+    counters::add(counters::Id::ReadbackBytes, bytes); // qcount
 #ifdef QUIDRA_ENABLE_TEST_GPU_BACKEND
+    // A host read is a synchronization point on the fake device as on the
+    // others: it reports the deferred checks of earlier work on the device,
+    // all of which the fake device has finished.
     if (raw->backend == Backend::Test) {
         std::memcpy(destination, raw->test_data.data() + offset, bytes);
-        return true;
+        return consume_deferred_validations(raw->global_index, all_checks_covered, error);
     }
 #endif
     if (raw->backend == Backend::Cuda) {
@@ -1925,8 +2676,20 @@ bool copy_to_host(const Buffer* raw, std::size_t offset, void* destination,
         return true;
     }
 #ifdef __APPLE__
-    if (raw->backend == Backend::Metal)
-        return metal_copy_to_host(raw, offset, destination, bytes, error);
+    // A host read is a synchronization point: like CUDA/HIP, it reports
+    // the deferred checks of earlier GPU work on the device.
+    if (raw->backend == Backend::Metal) {
+        // Bytes that no queued GPU work can write are read without a wait,
+        // unless a deferred check of the device is pending.
+        if (!runtime_parallel::detail::current_deferred_node &&
+            !has_deferred_validations(raw->global_index) &&
+            metal_copy_to_host_if_idle(raw, offset, destination, bytes))
+            return true;
+        std::uint64_t covered = 0;
+        return metal_copy_to_host(raw, offset, destination, bytes, covered,
+                                  error) &&
+               consume_deferred_validations(raw->global_index, covered, error);
+    }
 #endif
     error = "GPU backend download is unavailable";
     return false;
@@ -1948,6 +2711,8 @@ bool copy_device_to_device(
         error = "direct GPU device copy requires the same gpu(n); cross-device transfers are staged explicitly";
         return false;
     }
+    counters::add(counters::Id::DeviceCopies); // qcount
+    counters::add(counters::Id::DeviceCopyBytes, bytes); // qcount
 
 #ifdef QUIDRA_ENABLE_TEST_GPU_BACKEND
     if (destination->backend == Backend::Test) {
@@ -1958,6 +2723,8 @@ bool copy_device_to_device(
 #endif
 
     if (destination->backend == Backend::Cuda) {
+        auto owned_fence=prepare_native_fence(Backend::Cuda,destination->global_index,destination->backend_index,error);
+        if(!owned_fence) return false;
         auto& api = cuda();
         CudaApi::CUcontext context = nullptr;
         if (!api.copy_d2d ||
@@ -1978,6 +2745,8 @@ bool copy_device_to_device(
         return true;
     }
     if (destination->backend == Backend::Hip) {
+        auto owned_fence=prepare_native_fence(Backend::Hip,destination->global_index,destination->backend_index,error);
+        if(!owned_fence) return false;
         auto& api = hip();
         if (!api.ready || api.set_device(destination->backend_index) != 0) {
             error = "failed to select AMD GPU";
@@ -2012,6 +2781,8 @@ bool zero(Buffer* raw, std::size_t offset, std::size_t bytes,
         return false;
     }
     if (bytes == 0) return true;
+    counters::add(counters::Id::Fills); // qcount
+    counters::add(counters::Id::FillBytes, bytes); // qcount
 #ifdef QUIDRA_ENABLE_TEST_GPU_BACKEND
     if (raw->backend == Backend::Test) {
         std::memset(raw->test_data.data() + offset, 0, bytes);
@@ -2019,6 +2790,8 @@ bool zero(Buffer* raw, std::size_t offset, std::size_t bytes,
     }
 #endif
     if (raw->backend == Backend::Cuda) {
+        auto owned_fence=prepare_native_fence(Backend::Cuda,raw->global_index,raw->backend_index,error);
+        if(!owned_fence) return false;
         auto& api = cuda();
         CudaApi::CUcontext context = nullptr;
         if (!api.current(raw->backend_index, context, error)) return false;
@@ -2033,6 +2806,8 @@ bool zero(Buffer* raw, std::size_t offset, std::size_t bytes,
         return true;
     }
     if (raw->backend == Backend::Hip) {
+        auto owned_fence=prepare_native_fence(Backend::Hip,raw->global_index,raw->backend_index,error);
+        if(!owned_fence) return false;
         auto& api = hip();
         if (!api.ready || api.set_device(raw->backend_index) != 0) {
             error = "failed to select AMD GPU";
@@ -2057,6 +2832,34 @@ bool zero(Buffer* raw, std::size_t offset, std::size_t bytes,
     return false;
 }
 
+void register_warmup(void (*function)(long long device)) {
+    if (!function) return;
+    auto& state = warmup_state();
+    std::lock_guard lock(state.mutex);
+    if (std::find(state.functions.begin(), state.functions.end(), function) !=
+        state.functions.end())
+        return;
+    state.functions.push_back(function);
+    for (const int device : state.devices)
+        queue_warmup_locked(state, function, device);
+}
+
+bool written_outputs_skip_fill(int index) {
+    static const bool always_fill =
+        platform::environment_value("QUIDRA_GPU_ZERO_FILL").value_or("") == "always";
+    if (always_fill) return false;
+    const auto* info = find(index);
+    if (!info) return false;
+#ifdef QUIDRA_ENABLE_TEST_GPU_BACKEND
+    if (info->backend == Backend::Test) return true;
+#endif
+    return info->backend == Backend::Metal;
+}
+
+std::size_t buffer_base_offset(const Buffer* buffer) {
+    return buffer ? buffer->base_offset : 0;
+}
+
 int buffer_device(const Buffer* buffer) {
     return buffer ? buffer->global_index : -1;
 }
@@ -2074,12 +2877,22 @@ std::uint64_t buffer_native_handle(const Buffer* buffer) {
             const_cast<unsigned char*>(buffer->test_data.data()));
     }
 #endif
-    if (buffer->backend == Backend::Cuda) return buffer->cuda_pointer;
-    if (buffer->backend == Backend::Hip)
+    if (buffer->backend == Backend::Cuda) {
+        lend_native_package_work(buffer->backend,buffer->global_index,buffer->backend_index);
+        return buffer->cuda_pointer;
+    }
+    if (buffer->backend == Backend::Hip) {
+        lend_native_package_work(buffer->backend,buffer->global_index,buffer->backend_index);
         return reinterpret_cast<std::uint64_t>(buffer->pointer);
+    }
 #ifdef __APPLE__
-    if (buffer->backend == Backend::Metal)
+    if (buffer->backend == Backend::Metal) {
+        // Native handles go only to package code, which may bind the buffer
+        // in a command buffer of its own.
+        if (auto* stream = metal_stream_for(buffer))
+            metal_lend_to_package(*stream, buffer);
         return reinterpret_cast<std::uint64_t>((__bridge void*)buffer->metal_buffer);
+    }
 #endif
     return 0;
 }
@@ -2095,7 +2908,9 @@ bool activate(int index, std::string& error) {
 #endif
     if (info->backend == Backend::Cuda) {
         CudaApi::CUcontext context = nullptr;
-        return cuda().current(info->backend_index, context, error);
+        if(!cuda().current(info->backend_index, context, error)) return false;
+        lend_native_package_work(info->backend,index,info->backend_index);
+        return true;
     }
     if (info->backend == Backend::Hip) {
         auto& api = hip();
@@ -2104,6 +2919,7 @@ bool activate(int index, std::string& error) {
             error = "failed to select AMD GPU";
             return false;
         }
+        lend_native_package_work(info->backend,index,info->backend_index);
         return true;
     }
 #ifdef __APPLE__
@@ -2263,6 +3079,8 @@ bool launch(Module* module, const char* kernel,
         CudaApi::CUcontext context = nullptr;
         if (!api.current(module->backend_index, context, error)) return false;
 
+        auto owned_fence=prepare_native_fence(Backend::Cuda,module->global_index,module->backend_index,error);
+        if(!owned_fence) return false;
         CudaApi::CUfunction function = nullptr;
         if (api.module_get_function(
                 &function, static_cast<CudaApi::CUmodule>(module->cuda_module),
@@ -2277,6 +3095,7 @@ bool launch(Module* module, const char* kernel,
             error = std::string("NVIDIA kernel launch failed: ") + kernel;
             return false;
         }
+        if(*owned_fence) owned_fence->publish();
         // Default-stream ordering preserves GPU dependencies. Host-visible reads and
         // explicit transfers are the synchronization boundaries; blocking here would
         // serialize every queued tensor kernel in a compute chain.
@@ -2293,6 +3112,8 @@ bool launch(Module* module, const char* kernel,
             error = "AMD HIP runtime compilation/launch API is unavailable";
             return false;
         }
+        auto owned_fence=prepare_native_fence(Backend::Hip,module->global_index,module->backend_index,error);
+        if(!owned_fence) return false;
         HipApi::Function function = nullptr;
         if (api.module_get_function(
                 &function, static_cast<HipApi::Module>(module->hip_module),
@@ -2307,6 +3128,7 @@ bool launch(Module* module, const char* kernel,
             error = std::string("AMD HIP kernel launch failed: ") + kernel;
             return false;
         }
+        if(*owned_fence) owned_fence->publish();
         // Keep native HIP launches asynchronous for the same reason as CUDA:
         // same-device work is ordered by the default stream and host transfers wait.
         return true;
@@ -2320,5 +3142,6 @@ bool launch(Module* module, const char* kernel,
 #include "device_integer_compute.inc"
 #include "device_compute.inc"
 #include "device_autograd_compute.inc"
+#include "device_unified.inc"
 
 } // namespace quidra::device

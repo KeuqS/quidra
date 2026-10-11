@@ -1,0 +1,15 @@
+// The finite checks of one expression merge into the check of its last
+// operation; the first non-finite operation in evaluation order is reported.
+real64 polynomial(real64 x, real64 a, real64 b, real64 c)
+    return a * x * x + b * x + c
+
+real32 ratio(real32 p, real32 q, real32 r)
+    return (p + q) / r - p * q
+
+print(polynomial(2.0, 1.0, -3.0, 2.0))
+print(NL)
+print(ratio(1.5, 0.5, 4.0))
+print(NL)
+real64 big = 1.0e200
+print(polynomial(big, 1.0, 1.0, 1.0))
+print(NL)

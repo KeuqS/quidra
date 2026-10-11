@@ -71,20 +71,23 @@ const char* token_name(TokenKind kind) {
         case TokenKind::Indent: return "indent"; case TokenKind::Dedent: return "dedent"; case TokenKind::Pipe: return "|"; case TokenKind::Ampersand: return "&";
         case TokenKind::Eof: return "end of file"; case TokenKind::Newline: return "newline";
         case TokenKind::Identifier: return "identifier"; case TokenKind::Integer: return "integer";
-        case TokenKind::Float: return "float"; case TokenKind::String: return "string";
-        case TokenKind::KwClass: return "class"; case TokenKind::KwEnum: return "enum"; case TokenKind::KwPrivate: return "private"; case TokenKind::KwPublic: return "public"; case TokenKind::KwImport: return "import"; case TokenKind::KwConst: return "const";
-        case TokenKind::KwReturn: return "return"; case TokenKind::KwIf: return "if";
+        case TokenKind::RealLiteral: return "real"; case TokenKind::ImaginaryLiteral: return "imaginary"; case TokenKind::String: return "string";
+        case TokenKind::KwClass: return "class"; case TokenKind::KwEnum: return "enum"; case TokenKind::KwPrivate: return "private"; case TokenKind::KwPublic: return "public"; case TokenKind::KwImport: return "import"; case TokenKind::KwConst: return "const"; case TokenKind::KwLocal: return "local";
+        case TokenKind::KwReturn: return "return"; case TokenKind::KwIf: return "if"; case TokenKind::KwThen: return "then";
         case TokenKind::KwElif: return "elif"; case TokenKind::KwElse: return "else";
+        case TokenKind::KwParallel: return "parallel";
         case TokenKind::KwWhile: return "while"; case TokenKind::KwFor: return "for";
-        case TokenKind::KwIn: return "in"; case TokenKind::KwMatch: return "match";
+        case TokenKind::KwMatch: return "match";
         case TokenKind::KwTry: return "try"; case TokenKind::KwBreak: return "break";
-        case TokenKind::KwContinue: return "continue"; case TokenKind::KwTrue: return "true";
+        case TokenKind::KwContinue: return "continue"; case TokenKind::KwThis: return "this";
+        case TokenKind::KwTrue: return "true";
         case TokenKind::KwFalse: return "false"; case TokenKind::KwNot: return "not";
         case TokenKind::KwAnd: return "and"; case TokenKind::KwOr: return "or";
         case TokenKind::KwBitNot: return "NOT"; case TokenKind::KwBitAnd: return "AND";
         case TokenKind::KwBitOr: return "OR"; case TokenKind::KwBitXor: return "XOR";
         case TokenKind::LParen: return "("; case TokenKind::RParen: return ")";
         case TokenKind::LBracket: return "["; case TokenKind::RBracket: return "]";
+        case TokenKind::LBrace: return "{"; case TokenKind::RBrace: return "}";
         case TokenKind::Colon: return ":"; case TokenKind::Comma: return ","; case TokenKind::Semicolon: return ";"; case TokenKind::Dot: return ".";
         case TokenKind::Assign: return "=";
         case TokenKind::PlusAssign: return "+="; case TokenKind::MinusAssign: return "-=";
@@ -149,10 +152,10 @@ Token Lexer::identifier() {
     while (!eof() && (std::isalnum(static_cast<unsigned char>(peek())) || peek() == '_')) advance();
     const auto text = std::string(source_.substr(start_index, index_ - start_index));
     static const std::unordered_map<std::string, TokenKind> keywords = {
-        {"class", TokenKind::KwClass}, {"enum", TokenKind::KwEnum}, {"private", TokenKind::KwPrivate}, {"public", TokenKind::KwPublic}, {"import", TokenKind::KwImport}, {"const", TokenKind::KwConst},
-        {"return", TokenKind::KwReturn}, {"if", TokenKind::KwIf}, {"elif", TokenKind::KwElif}, {"else", TokenKind::KwElse},
-        {"while", TokenKind::KwWhile}, {"for", TokenKind::KwFor},
-        {"in", TokenKind::KwIn}, {"match", TokenKind::KwMatch}, {"try", TokenKind::KwTry},
+        {"class", TokenKind::KwClass}, {"enum", TokenKind::KwEnum}, {"private", TokenKind::KwPrivate}, {"public", TokenKind::KwPublic}, {"import", TokenKind::KwImport}, {"const", TokenKind::KwConst}, {"local", TokenKind::KwLocal},
+        {"return", TokenKind::KwReturn}, {"if", TokenKind::KwIf}, {"then", TokenKind::KwThen}, {"elif", TokenKind::KwElif}, {"else", TokenKind::KwElse},
+        {"parallel", TokenKind::KwParallel}, {"while", TokenKind::KwWhile}, {"for", TokenKind::KwFor},
+        {"match", TokenKind::KwMatch}, {"try", TokenKind::KwTry},
         {"break", TokenKind::KwBreak}, {"continue", TokenKind::KwContinue},
         {"true", TokenKind::KwTrue}, {"false", TokenKind::KwFalse}, {"not", TokenKind::KwNot},
         {"and", TokenKind::KwAnd}, {"or", TokenKind::KwOr},
@@ -193,11 +196,20 @@ Token Lexer::number() {
         advance();
         if (!eof() && (peek() == '+' || peek() == '-')) advance();
         if (eof() || !std::isdigit(static_cast<unsigned char>(peek()))) {
-            error("LEX_ERROR", "Malformed float exponent.", start);
+            error("LEX_ERROR", "Malformed real literal exponent.", start);
         }
         while (!eof() && std::isdigit(static_cast<unsigned char>(peek()))) advance();
     }
-    return make(floating ? TokenKind::Float : TokenKind::Integer, start_index, start);
+    // An imaginary literal: a number immediately followed by `i` that does
+    // not start an identifier (`2.0i`, `1.0e-3i`; `2.0in` is `2.0` then
+    // `in`). The integer form `2i` is lexed too, so that the checker can
+    // ask for the real form.
+    if (!eof() && peek() == 'i' &&
+        !(std::isalnum(static_cast<unsigned char>(peek(1))) || peek(1) == '_')) {
+        advance();
+        return make(TokenKind::ImaginaryLiteral, start_index, start);
+    }
+    return make(floating ? TokenKind::RealLiteral : TokenKind::Integer, start_index, start);
 }
 
 Token Lexer::string() {
@@ -297,6 +309,10 @@ std::vector<Token> Lexer::scan() {
             case ')': tokens.push_back(make(TokenKind::RParen, start_index, start)); break;
             case '[': tokens.push_back(make(TokenKind::LBracket, start_index, start)); break;
             case ']': tokens.push_back(make(TokenKind::RBracket, start_index, start)); break;
+            // Outside string literals, braces appear only in tensor shapes
+            // (tensor<real32>{2, 3}); the parser reports them anywhere else.
+            case '{': tokens.push_back(make(TokenKind::LBrace, start_index, start)); break;
+            case '}': tokens.push_back(make(TokenKind::RBrace, start_index, start)); break;
             case ':': tokens.push_back(make(TokenKind::Colon, start_index, start)); break;
             case ',': tokens.push_back(make(TokenKind::Comma, start_index, start)); break;
             case ';': tokens.push_back(make(TokenKind::Semicolon, start_index, start)); break;
@@ -340,8 +356,9 @@ std::vector<Token> Lexer::scan() {
             } else while(indent<indents.back()) { indents.pop_back(); logical.push_back(Token{TokenKind::Dedent,"",t.span}); }
             line_start=false;
         }
-        if(t.kind==TokenKind::LParen || t.kind==TokenKind::LBracket) ++nesting;
-        if(t.kind==TokenKind::RParen || t.kind==TokenKind::RBracket) --nesting;
+        // A brace shape continues the logical line as (...) and [...] do.
+        if(t.kind==TokenKind::LParen || t.kind==TokenKind::LBracket || t.kind==TokenKind::LBrace) ++nesting;
+        if(t.kind==TokenKind::RParen || t.kind==TokenKind::RBracket || t.kind==TokenKind::RBrace) --nesting;
         logical.push_back(t);
     }
     return logical;

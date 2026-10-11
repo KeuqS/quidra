@@ -6,16 +6,17 @@ namespace quidra {
 
 enum class TokenKind {
     Eof, Newline, Indent, Dedent, Pipe, Ampersand,
-    Identifier, Integer, Float, String,
+    Identifier, Integer, RealLiteral, ImaginaryLiteral, String,
     KwClass, KwEnum, KwPrivate, KwPublic, KwImport, KwConst,
-    KwReturn, KwIf, KwElif, KwElse, KwWhile, KwFor, KwIn, KwMatch, KwTry,
-    KwBreak, KwContinue,
+    KwReturn, KwIf, KwThen, KwElif, KwElse, KwWhile, KwFor, KwMatch, KwTry,
+    KwBreak, KwContinue, KwThis, KwParallel,
     KwTrue, KwFalse, KwNot, KwAnd, KwOr,
     KwBitNot, KwBitAnd, KwBitOr, KwBitXor,
-    LParen, RParen, LBracket, RBracket, Colon, Comma, Semicolon, Dot,
+    LParen, RParen, LBracket, RBracket, LBrace, RBrace, Colon, Comma, Semicolon, Dot,
     Assign, PlusAssign, MinusAssign, StarAssign, SlashAssign, PercentAssign,
     Plus, Minus, Star, Slash, Percent, Caret,
-    EqEq, NotEq, Less, LessEq, Greater, GreaterEq
+    EqEq, NotEq, Less, LessEq, Greater, GreaterEq,
+    KwLocal
 };
 
 struct Token {

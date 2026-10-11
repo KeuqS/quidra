@@ -495,6 +495,7 @@ void consider_statement(const Stmt& statement,std::size_t offset,const Expr*& be
     if(!contains_offset(statement.span,offset)) return;
     std::visit([&](const auto& node) {
         using T=std::decay_t<decltype(node)>;
+        if constexpr(requires{node.pattern;})if(node.pattern)visit_pattern(*node.pattern,[&](const Pattern& p){if(p.place)consider_expression(*p.place,offset,best);});
         if constexpr(std::is_same_v<T,BindingStmt>) {
             if(node.value) consider_expression(*node.value,offset,best);
         } else if constexpr(std::is_same_v<T,AssignStmt>) {
@@ -508,13 +509,13 @@ void consider_statement(const Stmt& statement,std::size_t offset,const Expr*& be
             consider_expression(*node.condition,offset,best);
             for(const auto& child:node.then_body) consider_statement(*child,offset,best);
             for(const auto& child:node.else_body) consider_statement(*child,offset,best);
-        } else if constexpr(std::is_same_v<T,MainGuardStmt>) {
+        } else if constexpr(std::is_same_v<T,MainGuardStmt> || std::is_same_v<T,ParallelStmt>) {
             for(const auto& child:node.body) consider_statement(*child,offset,best);
         } else if constexpr(std::is_same_v<T,WhileStmt>) {
             consider_expression(*node.condition,offset,best);
             for(const auto& child:node.body) consider_statement(*child,offset,best);
         } else if constexpr(std::is_same_v<T,ForStmt>) {
-            consider_expression(*node.iterable,offset,best);
+            visit_for_header(node,[&](const Expr& operand) { consider_expression(operand,offset,best); });
             for(const auto& child:node.body) consider_statement(*child,offset,best);
         } else if constexpr(std::is_same_v<T,MatchStmt>) {
             consider_expression(*node.value,offset,best);
@@ -537,7 +538,13 @@ void consider_expression(const Expr& expression,std::size_t offset,const Expr*& 
             consider_expression(*node.operand,offset,best);
         } else if constexpr(std::is_same_v<T,TryExpr>) {
             consider_expression(*node.value,offset,best);
-        } else if constexpr(std::is_same_v<T,ArrayExpr>) {
+        } else if constexpr(std::is_same_v<T,IfExpr>) {
+            for(const auto& condition:node.conditions) consider_expression(*condition,offset,best);
+            for(const auto& value:node.values) consider_expression(*value,offset,best);
+            consider_expression(*node.otherwise,offset,best);
+        } else if constexpr(std::is_same_v<T,ArrayComprehensionExpr>) {
+            visit_array_comprehension(node, [&](const Expr& child) { consider_expression(child,offset,best); });
+        } else if constexpr((std::is_same_v<T,ArrayExpr> || std::is_same_v<T,TupleExpr>)) {
             for(const auto& element:node.elements) consider_expression(*element,offset,best);
         } else if constexpr(std::is_same_v<T,IndexExpr>) {
             consider_expression(*node.base,offset,best);
@@ -557,6 +564,8 @@ void consider_expression(const Expr& expression,std::size_t offset,const Expr*& 
         } else if constexpr(std::is_same_v<T,BinaryExpr>) {
             consider_expression(*node.left,offset,best);
             consider_expression(*node.right,offset,best);
+        } else if constexpr(std::is_same_v<T,ComparisonChainExpr>) {
+            for(const auto& operand:node.operands) consider_expression(*operand,offset,best);
         } else if constexpr(std::is_same_v<T,CallExpr>) {
             for(const auto& arg:node.args) consider_expression(*arg.value,offset,best);
         }
@@ -598,7 +607,13 @@ void consider_call(const Expr& expression,std::size_t offset,const Expr*& best) 
         using T=std::decay_t<decltype(node)>;
         if constexpr(std::is_same_v<T,UnaryExpr>) consider_call(*node.operand,offset,best);
         else if constexpr(std::is_same_v<T,TryExpr>) consider_call(*node.value,offset,best);
-        else if constexpr(std::is_same_v<T,ArrayExpr>) {
+        else if constexpr(std::is_same_v<T,IfExpr>) {
+            for(const auto& condition:node.conditions) consider_call(*condition,offset,best);
+            for(const auto& value:node.values) consider_call(*value,offset,best);
+            consider_call(*node.otherwise,offset,best);
+        } else if constexpr(std::is_same_v<T,ArrayComprehensionExpr>) {
+            visit_array_comprehension(node, [&](const Expr& child) { consider_call(child,offset,best); });
+        } else if constexpr((std::is_same_v<T,ArrayExpr> || std::is_same_v<T,TupleExpr>)) {
             for(const auto& element:node.elements) consider_call(*element,offset,best);
         } else if constexpr(std::is_same_v<T,IndexExpr>) {
             consider_call(*node.base,offset,best);
@@ -617,6 +632,8 @@ void consider_call(const Expr& expression,std::size_t offset,const Expr*& best) 
         } else if constexpr(std::is_same_v<T,BinaryExpr>) {
             consider_call(*node.left,offset,best);
             consider_call(*node.right,offset,best);
+        } else if constexpr(std::is_same_v<T,ComparisonChainExpr>) {
+            for(const auto& operand:node.operands) consider_call(*operand,offset,best);
         } else if constexpr(std::is_same_v<T,CallExpr>) {
             for(const auto& arg:node.args) consider_call(*arg.value,offset,best);
         }
@@ -627,6 +644,7 @@ void consider_call_statement(const Stmt& statement,std::size_t offset,const Expr
     if(!contains_offset(statement.span,offset)) return;
     std::visit([&](const auto& node) {
         using T=std::decay_t<decltype(node)>;
+        if constexpr(requires{node.pattern;})if(node.pattern)visit_pattern(*node.pattern,[&](const Pattern& p){if(p.place)consider_call(*p.place,offset,best);});
         if constexpr(std::is_same_v<T,BindingStmt>) {
             if(node.value) consider_call(*node.value,offset,best);
         } else if constexpr(std::is_same_v<T,AssignStmt>) {
@@ -638,13 +656,13 @@ void consider_call_statement(const Stmt& statement,std::size_t offset,const Expr
             consider_call(*node.condition,offset,best);
             for(const auto& child:node.then_body) consider_call_statement(*child,offset,best);
             for(const auto& child:node.else_body) consider_call_statement(*child,offset,best);
-        } else if constexpr(std::is_same_v<T,MainGuardStmt>) {
+        } else if constexpr(std::is_same_v<T,MainGuardStmt> || std::is_same_v<T,ParallelStmt>) {
             for(const auto& child:node.body) consider_call_statement(*child,offset,best);
         } else if constexpr(std::is_same_v<T,WhileStmt>) {
             consider_call(*node.condition,offset,best);
             for(const auto& child:node.body) consider_call_statement(*child,offset,best);
         } else if constexpr(std::is_same_v<T,ForStmt>) {
-            consider_call(*node.iterable,offset,best);
+            visit_for_header(node,[&](const Expr& operand) { consider_call(operand,offset,best); });
             for(const auto& child:node.body) consider_call_statement(*child,offset,best);
         } else if constexpr(std::is_same_v<T,MatchStmt>) {
             consider_call(*node.value,offset,best);
@@ -700,6 +718,7 @@ std::optional<SourceSpan> local_definition(
         if(statement->span.start.offset>offset) break;
         std::visit([&](const auto& node) {
             using T=std::decay_t<decltype(node)>;
+            if constexpr(std::is_same_v<T,BindingStmt>)if(node.pattern)visit_pattern(*node.pattern,[&](const Pattern& p){if(p.kind==Pattern::Kind::Declare && p.name==name)if(auto found=identifier_span(tokens,p.span,name);found && found->start.offset<=offset)result=found;});
             if constexpr(std::is_same_v<T,BindingStmt>) {
                 if(node.name==name) {
                     const auto found=identifier_span(
@@ -712,7 +731,7 @@ std::optional<SourceSpan> local_definition(
                 } else if(body_contains(node.else_body,offset)) {
                     if(auto nested=local_definition(node.else_body,name,offset,tokens)) result=nested;
                 }
-            } else if constexpr(std::is_same_v<T,MainGuardStmt>) {
+            } else if constexpr(std::is_same_v<T,MainGuardStmt> || std::is_same_v<T,ParallelStmt>) {
                 if(body_contains(node.body,offset))
                     if(auto nested=local_definition(node.body,name,offset,tokens)) result=nested;
             } else if constexpr(std::is_same_v<T,WhileStmt>) {
@@ -720,15 +739,20 @@ std::optional<SourceSpan> local_definition(
                     if(auto nested=local_definition(node.body,name,offset,tokens)) result=nested;
             } else if constexpr(std::is_same_v<T,ForStmt>) {
                 if(body_contains(node.body,offset)) {
+                    if(node.pattern)visit_pattern(*node.pattern,[&](const Pattern& p){if(p.kind==Pattern::Kind::Declare && p.name==name)if(auto found=identifier_span(tokens,p.span,name))result=found;});
                     if(node.name==name) {
                         if(auto found=identifier_span(tokens,statement->span,name))
                             result=found;
                     }
+                    for(const auto& binding:node.collections)
+                        if(binding.name==name)
+                            if(auto found=identifier_span(tokens,binding.span,name)) result=found;
                     if(auto nested=local_definition(node.body,name,offset,tokens)) result=nested;
                 }
             } else if constexpr(std::is_same_v<T,MatchStmt>) {
                 for(const auto& current:node.cases) {
                     if(!body_contains(current.body,offset)) continue;
+                    if(current.pattern)visit_pattern(*current.pattern,[&](const Pattern& p){if(p.kind==Pattern::Kind::Declare && p.name==name)if(auto found=identifier_span(tokens,p.span,name))result=found;});
                     if(current.binder&&*current.binder==name) {
                         if(auto found=identifier_span(tokens,current.span,name)) result=found;
                     }
@@ -745,32 +769,39 @@ Program root_program(std::string_view source) {
     return Parser(Lexer(source).scan()).parse();
 }
 
+const FunctionDecl* class_callable_at(const ClassDecl& declaration,std::size_t offset) {
+    const FunctionDecl* initializer=nullptr;
+    for(const auto& method:declaration.methods) {
+        if(!contains_offset(method.span,offset)) continue;
+        if(!method.is_constructor) return &method;
+        initializer=&method;
+    }
+    return initializer;
+}
+
 std::optional<SourceSpan> definition_span(
     const Program& program,std::string_view name,std::size_t offset,
     const std::vector<Token>& tokens) {
     for(const auto& declaration:program.classes) {
         if(!contains_offset(declaration.span,offset)) continue;
+        if(declaration.self_name==name&&declaration.self_span) return declaration.self_span;
         for(const auto& field:declaration.fields) {
             if(field.name==name&&contains_offset(field.span,offset)) {
                 if(auto found=identifier_span(tokens,field.span,name)) return found;
             }
         }
+        const auto* active=class_callable_at(declaration,offset);
         for(const auto& method:declaration.methods) {
             if(method.name==name&&contains_offset(method.span,offset)) {
                 if(auto found=identifier_span(
                        tokens,method.span,name,method.return_type.span.end.offset))
                     return found;
             }
-            if(!contains_offset(method.span,offset)) continue;
+            if(&method!=active) continue;
             for(const auto& parameter:method.parameters) {
                 if(parameter.name==name&&parameter.span.start.offset<=offset) return parameter.span;
             }
             if(auto local=local_definition(method.body,name,offset,tokens)) return local;
-            for(const auto& field:declaration.fields) {
-                if(field.name==name) {
-                    if(auto found=identifier_span(tokens,field.span,name)) return found;
-                }
-            }
         }
     }
 
@@ -812,7 +843,8 @@ void add_local_completions(
         std::visit([&](const auto& node) {
             using T=std::decay_t<decltype(node)>;
             if constexpr(std::is_same_v<T,BindingStmt>) {
-                out.push_back({node.name,6,source_type_name(node.declared_type,source)});
+                if(node.pattern)visit_pattern(*node.pattern,[&](const Pattern& p){if(p.kind==Pattern::Kind::Declare)out.push_back({p.name,6,p.type?source_type_name(*p.type,source):"pattern binding"});});
+                else out.push_back({node.name,6,source_type_name(node.declared_type,source)});
             } else if constexpr(std::is_same_v<T,IfStmt>) {
                 if(body_contains(node.then_body,offset))
                     add_local_completions(out,node.then_body,offset,source);
@@ -823,12 +855,16 @@ void add_local_completions(
                     add_local_completions(out,node.body,offset,source);
             } else if constexpr(std::is_same_v<T,ForStmt>) {
                 if(body_contains(node.body,offset)) {
-                    out.push_back({node.name,6,"loop binding"});
+                    if(node.pattern)visit_pattern(*node.pattern,[&](const Pattern& p){if(p.kind==Pattern::Kind::Declare)out.push_back({p.name,6,p.type?source_type_name(*p.type,source):"loop binding"});});
+                    else out.push_back({node.name,6,"loop binding"});
+                    for(const auto& binding:node.collections)
+                        if(binding.name!="_") out.push_back({binding.name,6,"loop binding"});
                     add_local_completions(out,node.body,offset,source);
                 }
             } else if constexpr(std::is_same_v<T,MatchStmt>) {
                 for(const auto& current:node.cases) {
                     if(!body_contains(current.body,offset)) continue;
+                    if(current.pattern)visit_pattern(*current.pattern,[&](const Pattern& p){if(p.kind==Pattern::Kind::Declare)out.push_back({p.name,6,p.type?source_type_name(*p.type,source):"match binding"});});
                     if(current.binder) out.push_back({*current.binder,6,"match binding"});
                     add_local_completions(out,current.body,offset,source);
                     break;
@@ -889,6 +925,36 @@ std::vector<CompletionSymbol> member_completions_at(
     return result;
 }
 
+// An explicit instance-name prefix is resolved from its class header.
+std::vector<CompletionSymbol> instance_member_completions(
+    const Program& program,std::string_view source,std::size_t offset,std::string_view receiver) {
+    std::vector<CompletionSymbol> result;
+    for(const auto& declaration:program.classes) {
+        if(!contains_offset(declaration.span,offset)||declaration.self_name!=receiver) continue;
+        for(const auto& field:declaration.fields)
+            result.push_back({field.name,5,source_type_name(field.type,source)});
+        for(const auto& method:declaration.methods)
+            if(!method.is_constructor) result.push_back({method.name,2,source_type_name(method.return_type,source)});
+    }
+    std::sort(result.begin(),result.end(),[](const auto& left,const auto& right) {
+        return left.name<right.name;
+    });
+    return result;
+}
+
+std::string_view completion_receiver_before(std::string_view source,std::size_t offset) {
+    if(offset==0||source[offset-1]!='.') return {};
+    const auto end=offset-1;
+    auto start=end;
+    while(start>0) {
+        const auto ch=static_cast<unsigned char>(source[start-1]);
+        if(!std::isalnum(ch)&&ch!='_') break;
+        --start;
+    }
+    if(start>0&&source[start-1]=='.') return {};
+    return source.substr(start,end-start);
+}
+
 std::vector<CompletionSymbol> completions_at(
     const Program& program,std::string_view source,std::size_t offset) {
     std::vector<CompletionSymbol> result;
@@ -904,14 +970,16 @@ std::vector<CompletionSymbol> completions_at(
     bool inside_callable=false;
     for(const auto& declaration:program.classes) {
         if(!contains_offset(declaration.span,offset)) continue;
-        for(const auto& method:declaration.methods) {
-            if(!contains_offset(method.span,offset)) continue;
+        for(const auto& field:declaration.fields)
+            result.push_back({field.name,5,source_type_name(field.type,source)});
+        if(!declaration.self_name.empty()) result.push_back({declaration.self_name,6,declaration.name});
+        for(const auto& method:declaration.methods)
+            if(!method.is_constructor) result.push_back({method.name,2,source_type_name(method.return_type,source)});
+        if(const auto* active=class_callable_at(declaration,offset)) {
             inside_callable=true;
-            for(const auto& field:declaration.fields)
-                result.push_back({field.name,5,source_type_name(field.type,source)});
-            for(const auto& parameter:method.parameters)
+            for(const auto& parameter:active->parameters)
                 result.push_back({parameter.name,6,source_type_name(parameter.type,source)});
-            add_local_completions(result,method.body,offset,source);
+            add_local_completions(result,active->body,offset,source);
         }
     }
     if(!inside_callable) {
@@ -1067,6 +1135,7 @@ bool valid_rename_identifier(std::string_view name) {
 }
 
 bool is_keyword_token(TokenKind kind) {
+    if(kind==TokenKind::KwLocal) return true;
     const auto value=static_cast<int>(kind);
     return value>=static_cast<int>(TokenKind::KwClass)&&
            value<=static_cast<int>(TokenKind::KwBitXor);
@@ -1180,7 +1249,7 @@ std::string semantic_tokens_json(const Program& program,std::string_view source)
         std::optional<int> type;
         if(is_keyword_token(token.kind)) type=8;
         else if(token.kind==TokenKind::String) type=9;
-        else if(token.kind==TokenKind::Integer||token.kind==TokenKind::Float) type=10;
+        else if(token.kind==TokenKind::Integer||token.kind==TokenKind::RealLiteral||token.kind==TokenKind::ImaginaryLiteral) type=10;
         else if(is_operator_token(token.kind)) type=11;
         else if(token.kind==TokenKind::Identifier)
             type=identifier_semantic_type(program,token,tokens);
@@ -1458,9 +1527,13 @@ private:
             std::vector<CompletionSymbol> items;
             if(offset>0&&source[offset-1]=='.') {
                 std::string probe(source);
-                probe.erase(offset-1,1);
-                const auto checked=semantic_check(uri,probe);
-                items=member_completions_at(checked,offset-1);
+                probe[offset-1]=' ';
+                const auto program=root_program(probe);
+                items=instance_member_completions(program,probe,offset,completion_receiver_before(source,offset));
+                if(items.empty()) {
+                    const auto checked=semantic_check(uri,probe);
+                    items=member_completions_at(checked,offset-1);
+                }
             } else {
                 const auto program=root_program(source);
                 items=completions_at(program,source,offset);

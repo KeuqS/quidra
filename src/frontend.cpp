@@ -1,22 +1,28 @@
+#include "quidra/pattern_selection.hpp"
 #include "quidra/frontend.hpp"
 
+#include "quidra/abi/symbols.hpp"
+#include "quidra/compile_inputs.hpp"
 #include "quidra/diagnostic.hpp"
 #include "quidra/import_path.hpp"
 #include "quidra/language.hpp"
 #include "quidra/lexer.hpp"
+#include "quidra/member_function_names.hpp"
+#include "quidra/numeric_types.hpp"
 #include "quidra/parser.hpp"
 #include "quidra/package_lock.hpp"
 #include "quidra/package_manifest.hpp"
 #include "quidra/project.hpp"
 #include "quidra/toml_subset.hpp"
+#include "quidra/standard_classes.hpp"
 
 #include "nesting_budget.hpp"
+#include "shape_relations.hpp"
 
 #include <algorithm>
 #include <array>
 #include <cctype>
 #include <cstdint>
-#include <fstream>
 #include <functional>
 #include <iomanip>
 #include <limits>
@@ -35,18 +41,45 @@
 namespace quidra {
 namespace {
 
+// The numeric type a type name spells (an alias such as int64 included), or
+// nullptr (quidra/numeric_types.hpp).
+const NumericKindInfo* numeric_type_name(std::string_view name) {
+    const auto canonical = canonical_builtin_type_name(name);
+    return canonical ? numeric_kind_info(*canonical) : nullptr;
+}
+
+// A type name with a built-in type's alias replaced by its canonical
+// spelling.
+std::string_view canonical_type_name(std::string_view name) {
+    return canonical_builtin_type_name(name).value_or(name);
+}
+
+// Whether a type name spells the element type of a tensor shape (int or
+// nat).
+bool names_shape_element(std::string_view name) {
+    const auto* numeric = numeric_type_name(name);
+    return numeric && (numeric->kind == TypeKind::Int || numeric->kind == TypeKind::Nat);
+}
+
+// The runtime handle classes that the equality constraint excludes. It lists
+// four of the five (standard_class::is_runtime_handle): autograd.Target is
+// missing, a known defect that a separate fix corrects; until then the set
+// keeps its contents.
+bool is_unequatable_handle_without_autograd_target(std::string_view name) {
+    return name == standard_class::json_value || name == standard_class::http_response ||
+           name == standard_class::file_handle;
+}
+
 namespace fs = std::filesystem;
 
 [[noreturn]] void frontend_error(std::string code, std::string message, SourceSpan span = {}) {
     throw CompileError(Diagnostic{std::move(code), std::move(message), span});
 }
 
-std::string read_text(const fs::path& path) {
-    std::ifstream in(path, std::ios::binary);
-    if (!in) throw std::runtime_error("cannot read Quidra source: " + path.string());
-    std::ostringstream out;
-    out << in.rdbuf();
-    return out.str();
+std::string read_text(const fs::path& path, InputFileKind kind, CompileInputs* inputs) {
+    auto text = read_input_file(path, kind, inputs);
+    if (!text) throw std::runtime_error("cannot read Quidra source: " + path.string());
+    return std::move(*text);
 }
 
 std::string qualify(const std::string& ns, const std::string& name) {
@@ -64,6 +97,7 @@ std::string suffix_after_first(const std::string& name) {
 }
 
 struct Exports {
+    std::unordered_map<std::string,std::string> pseudo_types;
     std::unordered_map<std::string, std::string> classes;
     std::unordered_map<std::string, std::string> enums;
     std::unordered_map<std::string, std::string> functions;
@@ -75,7 +109,126 @@ struct Exports {
     // `public import alias = ...` re-exports the target under `alias`, so an
     // importer reaches its declarations as `module.alias.name`.
     std::unordered_map<std::string, std::shared_ptr<Exports>> namespaces;
+    // The module's `private` declarations (L3), by name. They are not
+    // exported, so no lookup finds them; a qualified use of one names the
+    // rule (PRIVATE_DECLARATION) instead of reporting an unknown member.
+    std::unordered_set<std::string> private_names;
 };
+
+// The contextual constants visible where the frontend renames an
+// expression: one map per enclosing block, innermost last, from a name to
+// the declaration's (renamed) initializer. Uses become LiteralConstantExpr.
+thread_local std::vector<std::unordered_map<std::string, const Expr*>> literal_constant_scopes;
+struct LiteralConstantScope {
+    LiteralConstantScope() { literal_constant_scopes.emplace_back(); }
+    ~LiteralConstantScope() { literal_constant_scopes.pop_back(); }
+    LiteralConstantScope(const LiteralConstantScope&) = delete;
+    LiteralConstantScope& operator=(const LiteralConstantScope&) = delete;
+};
+const Expr* visible_literal_constant(const std::string& name) {
+    for (auto scope = literal_constant_scopes.rbegin(); scope != literal_constant_scopes.rend();
+         ++scope) {
+        if (const auto found = scope->find(name); found != scope->end()) return found->second;
+    }
+    return nullptr;
+}
+
+[[noreturn]] void literal_constant_error(SourceSpan span) {
+    frontend_error("LITERAL_CONSTANT",
+                   "A literal constant has type real or com and a constant exact initializer.",
+                   span);
+}
+
+bool exact_intrinsic(std::string_view name) {
+    return name == "$std.real.atom" || name == "$std.real.unary" || name == "$std.real.op";
+}
+
+// A copy of a contextual constant's initializer for one use: literals,
+// arithmetic, numeric conversions of them, the exact intrinsics with their
+// literal provider and opcode, and other contextual constants. Anything
+// else is not a constant exact initializer.
+ExprPtr clone_literal_initializer(const Expr& source, SourceSpan use_span) {
+    auto result = std::make_unique<Expr>();
+    result->span = use_span;
+    if (const auto* value = std::get_if<IntegerExpr>(&source.data)) {
+        result->data = *value;
+        return result;
+    }
+    if (const auto* value = std::get_if<RealLiteralExpr>(&source.data)) {
+        result->data = *value;
+        return result;
+    }
+    if (const auto* value = std::get_if<StringExpr>(&source.data)) {
+        result->data = *value;
+        return result;
+    }
+    if (const auto* unary = std::get_if<UnaryExpr>(&source.data); unary && unary->op == "-") {
+        result->data = UnaryExpr{unary->op, clone_literal_initializer(*unary->operand, use_span)};
+        return result;
+    }
+    if (const auto* binary = std::get_if<BinaryExpr>(&source.data);
+        binary && (binary->op == "+" || binary->op == "-" || binary->op == "*" ||
+                   binary->op == "/" || binary->op == "^")) {
+        result->data = BinaryExpr{binary->op, clone_literal_initializer(*binary->left, use_span),
+                                  clone_literal_initializer(*binary->right, use_span)};
+        return result;
+    }
+    if (const auto* constant = std::get_if<LiteralConstantExpr>(&source.data)) {
+        result->data = LiteralConstantExpr{constant->name,
+                                           clone_literal_initializer(*constant->value, use_span),
+                                           constant->origin};
+        return result;
+    }
+    const auto clone_args = [&](const std::vector<CallArg>& args) {
+        std::vector<CallArg> out;
+        out.reserve(args.size());
+        for (const auto& argument : args) {
+            if (argument.writable) literal_constant_error(source.span);
+            out.push_back(CallArg{argument.name, false,
+                                  clone_literal_initializer(*argument.value, use_span), use_span});
+        }
+        return out;
+    };
+    if (const auto* call = std::get_if<CallExpr>(&source.data);
+        call && call->type_arguments.empty() &&
+        (exact_intrinsic(call->callee) ||
+         (numeric_type_name(call->callee) != nullptr && call->args.size() == 1))) {
+        result->data = CallExpr{call->callee, clone_args(call->args), {}};
+        return result;
+    }
+    if (const auto* call = std::get_if<MethodCallExpr>(&source.data)) {
+        const auto* receiver = std::get_if<NameExpr>(&call->receiver->data);
+        if (receiver && !receiver->this_qualifier && receiver->name == "real" &&
+            (call->method == "atom" || call->method == "unary" || call->method == "op") &&
+            call->type_arguments.empty()) {
+            auto cloned_receiver = std::make_unique<Expr>();
+            cloned_receiver->span = use_span;
+            cloned_receiver->data = NameExpr{receiver->name};
+            result->data = MethodCallExpr{std::move(cloned_receiver), call->method,
+                                          clone_args(call->args), {}};
+            return result;
+        }
+    }
+    literal_constant_error(source.span);
+}
+
+// A use of a contextual constant: the name as written and a fresh copy of
+// its initializer.
+ExprPtr literal_constant_use(std::string name, const Expr& initializer, SourceSpan use_span) {
+    auto result = std::make_unique<Expr>();
+    result->span = use_span;
+    result->data = LiteralConstantExpr{std::move(name),
+                                       clone_literal_initializer(initializer, use_span),
+                                       &initializer};
+    return result;
+}
+
+// A qualified use of a private declaration of another module.
+[[noreturn]] void private_declaration_error(
+    const std::string& name, const std::string& module, SourceSpan span) {
+    frontend_error("PRIVATE_DECLARATION",
+                   "'" + name + "' is private to module '" + module + "'.", span);
+}
 
 ExprPtr clone_package_constant_expression(const Expr& source, SourceSpan use_span) {
     auto result = std::make_unique<Expr>();
@@ -85,7 +238,7 @@ ExprPtr clone_package_constant_expression(const Expr& source, SourceSpan use_spa
         result->data = *value;
         return result;
     }
-    if (const auto* value = std::get_if<FloatExpr>(&source.data)) {
+    if (const auto* value = std::get_if<RealLiteralExpr>(&source.data)) {
         result->data = *value;
         return result;
     }
@@ -101,6 +254,12 @@ ExprPtr clone_package_constant_expression(const Expr& source, SourceSpan use_spa
         result->data = NoneExpr{};
         return result;
     }
+    if (const auto* constant = std::get_if<LiteralConstantExpr>(&source.data)) {
+        result->data = LiteralConstantExpr{constant->name,
+                                           clone_literal_initializer(*constant->value, use_span),
+                                           constant->origin};
+        return result;
+    }
     if (const auto* unary = std::get_if<UnaryExpr>(&source.data)) {
         result->data = UnaryExpr{
             unary->op,
@@ -111,17 +270,21 @@ ExprPtr clone_package_constant_expression(const Expr& source, SourceSpan use_spa
         result->data = BinaryExpr{
             binary->op,
             clone_package_constant_expression(*binary->left, use_span),
-            clone_package_constant_expression(*binary->right, use_span)};
+            clone_package_constant_expression(*binary->right, use_span),
+            use_span};
+        return result;
+    }
+    if (const auto* chain = std::get_if<ComparisonChainExpr>(&source.data)) {
+        ComparisonChainExpr copy;
+        for (const auto& operand : chain->operands)
+            copy.operands.push_back(clone_package_constant_expression(*operand, use_span));
+        copy.ops = chain->ops;
+        copy.op_spans.assign(chain->op_spans.size(), use_span);
+        result->data = std::move(copy);
         return result;
     }
     if (const auto* call = std::get_if<CallExpr>(&source.data)) {
-        static constexpr std::array<std::string_view, 13> numeric_casts{{
-            "int8", "int16", "int32", "int", "int64",
-            "uint8", "uint16", "uint32", "uint64", "bigint",
-            "float32", "float", "bigreal"}};
-        const bool scalar_numeric_cast =
-            std::find(numeric_casts.begin(), numeric_casts.end(), call->callee) !=
-            numeric_casts.end();
+        const bool scalar_numeric_cast = numeric_type_name(call->callee) != nullptr;
         if (scalar_numeric_cast && call->type_arguments.empty() &&
             call->args.size() == 1 && !call->args[0].writable) {
             std::vector<CallArg> args;
@@ -136,12 +299,13 @@ ExprPtr clone_package_constant_expression(const Expr& source, SourceSpan use_spa
     }
     if (const auto* call = std::get_if<MethodCallExpr>(&source.data)) {
         const auto* receiver = std::get_if<NameExpr>(&call->receiver->data);
-        if (receiver && receiver->name == "exact" && call->method == "atom" &&
+        if (receiver && !receiver->this_qualifier && receiver->name == "real" &&
+            call->method == "atom" &&
             call->type_arguments.empty() && call->args.size() == 2 &&
             !call->args[0].writable && !call->args[1].writable) {
             auto cloned_receiver = std::make_unique<Expr>();
             cloned_receiver->span = use_span;
-            cloned_receiver->data = NameExpr{"exact"};
+            cloned_receiver->data = NameExpr{receiver->name};
             std::vector<CallArg> args;
             args.reserve(2);
             for (const auto& argument : call->args) {
@@ -221,7 +385,7 @@ Exports standard_exports(const std::string& module, SourceSpan span) {
     }
     Exports exports;
     if (module == "file") {
-        exports.classes.emplace("Handle", "$std.file.Handle");
+        exports.classes.emplace("Handle", standard_class::file_handle);
         for (const char* name : {"open", "create", "append", "read", "write", "read_bin", "write_bin", "exists", "is_directory", "remove", "copy", "move", "mkdir", "list"}) {
             exports.functions.emplace(name, std::string(*standard_function_target(module, name)));
         }
@@ -234,51 +398,42 @@ Exports standard_exports(const std::string& module, SourceSpan span) {
             exports.functions.emplace(name, std::string(*standard_function_target(module, name)));
         }
     } else if (module == "time") {
-        exports.classes.emplace("Instant", "$std.time.Instant");
-        exports.classes.emplace("Duration", "$std.time.Duration");
+        exports.classes.emplace("Instant", standard_class::time_instant);
+        exports.classes.emplace("Duration", standard_class::time_duration);
         for (const char* name : {"now", "since", "seconds", "sleep"}) {
             exports.functions.emplace(name, std::string(*standard_function_target(module, name)));
         }
     } else if (module == "gpu") {
         exports.functions.emplace("sync", std::string(*standard_function_target(module, "sync")));
-    } else if (module == "task") {
-        exports.functions.emplace("all", std::string(*standard_function_target(module, "all")));
-    } else if (module == "atomic") {
-        exports.classes.emplace("Counter", "$std.atomic.Counter");
-        exports.functions.emplace("counter", std::string(*standard_function_target(module, "counter")));
     } else if (module == "autograd") {
-        exports.classes.emplace("Target", "$std.autograd.Target");
+        exports.classes.emplace("Target", standard_class::autograd_target);
         exports.functions.emplace("target", std::string(*standard_function_target(module, "target")));
-    } else if (module == "ref") {
-        exports.classes.emplace("Cell", "$std.ref.Cell");
     } else if (module == "reflect") {
-        for (const char* name : {"collect", "paths", "type_name"}) {
+        exports.pseudo_types.emplace("Each","$std.reflect.Each");
+        for (const char* name : {"collect", "paths", "type_name", "each", "each_paths"}) {
             exports.functions.emplace(name, std::string(*standard_function_target(module, name)));
         }
     } else if (module == "random") {
-        exports.classes.emplace("Generator", "$std.random.Generator");
+        exports.classes.emplace("Generator", standard_class::random_generator);
         exports.functions.emplace("generator", std::string(*standard_function_target(module, "generator")));
     } else if (module == "process") {
-        exports.classes.emplace("Result", "$std.process.Result");
+        exports.classes.emplace("Result", standard_class::process_result);
         for (const char* name : {"run", "shell", "exit"}) {
             exports.functions.emplace(name, std::string(*standard_function_target(module, name)));
         }
     } else if (module == "map") {
-        exports.classes.emplace("Map", "$std.map.Map");
+        exports.classes.emplace("Map", standard_class::map);
     } else if (module == "set") {
-        exports.classes.emplace("Set", "$std.set.Set");
+        exports.classes.emplace("Set", standard_class::set);
     } else if (module == "json") {
-        exports.classes.emplace("Value", "$std.json.Value");
+        exports.classes.emplace("Value", standard_class::json_value);
         exports.functions.emplace("parse", std::string(*standard_function_target(module, "parse")));
     } else if (module == "http") {
-        exports.classes.emplace("Response", "$std.http.Response");
+        exports.classes.emplace("Response", standard_class::http_response);
         exports.functions.emplace("get", std::string(*standard_function_target(module, "get")));
     } else if (module == "tensor") {
         exports.functions.emplace("zeros", std::string(*standard_function_target(module, "zeros")));
         exports.functions.emplace("ones", std::string(*standard_function_target(module, "ones")));
-    } else if (module == "exact") {
-        exports.functions.emplace("atom", std::string(*standard_function_target(module, "atom")));
-        exports.functions.emplace("unary", std::string(*standard_function_target(module, "unary")));
     }
     return exports;
 }
@@ -305,24 +460,10 @@ ExprPtr standard_name(std::string name) {
     return expression;
 }
 
-ExprPtr standard_member(ExprPtr base, std::string name) {
-    auto expression = std::make_unique<Expr>();
-    expression->span = standard_span();
-    expression->data = MemberExpr{std::move(base), std::move(name)};
-    return expression;
-}
-
-ExprPtr standard_unary(std::string op, ExprPtr operand) {
-    auto expression = std::make_unique<Expr>();
-    expression->span = standard_span();
-    expression->data = UnaryExpr{std::move(op), std::move(operand)};
-    return expression;
-}
-
-ExprPtr standard_binary(std::string op, ExprPtr left, ExprPtr right) {
-    auto expression = std::make_unique<Expr>();
-    expression->span = standard_span();
-    expression->data = BinaryExpr{std::move(op), std::move(left), std::move(right)};
+// `this.NAME` in a compiler-built member body.
+ExprPtr standard_this_field(std::string name) {
+    auto expression = standard_name(std::move(name));
+    std::get<NameExpr>(expression->data).this_qualifier = standard_span();
     return expression;
 }
 
@@ -387,73 +528,37 @@ FieldDecl standard_field(std::string name, std::string type) {
 
 std::vector<ClassDecl> standard_declarations(const std::string& module) {
     std::vector<ClassDecl> declarations;
-    if (module == "atomic") {
-        ClassDecl counter;
-        counter.name = "$std.atomic.Counter";
-        counter.span = standard_span();
-        counter.fields.push_back(standard_field("$handle", "uint64"));
-        declarations.push_back(std::move(counter));
-    } else if (module == "autograd") {
+    if (module == "autograd") {
         ClassDecl target;
-        target.name = "$std.autograd.Target";
+        target.name = standard_class::autograd_target;
         target.span = standard_span();
-        target.fields.push_back(standard_field("$handle", "uint64"));
+        target.fields.push_back(standard_field("$handle", "nat64"));
         declarations.push_back(std::move(target));
-    } else if (module == "ref") {
-        TypeName generic_t = standard_type("T");
-        TypeName cell_t = standard_type("$std.ref.Cell");
-        cell_t.arguments.push_back(generic_t);
-
-        ClassDecl cell;
-        cell.name = "$std.ref.Cell";
-        cell.span = standard_span();
-        cell.type_parameters.push_back("T");
-
-        FieldDecl value;
-        value.name = "value";
-        value.type = generic_t;
-        value.span = standard_span();
-        cell.fields.push_back(std::move(value));
-
-        Parameter other;
-        other.name = "other";
-        other.type = cell_t;
-        other.span = standard_span();
-
-        auto receiver_address = standard_unary("&", standard_name("value"));
-        auto other_address = standard_unary(
-            "&", standard_member(standard_name("other"), "value"));
-        std::vector<Parameter> same_parameters;
-        same_parameters.push_back(std::move(other));
-        cell.methods.push_back(standard_method(
-            "same", std::move(same_parameters), "bool",
-            standard_binary("==", std::move(receiver_address), std::move(other_address))));
-        declarations.push_back(std::move(cell));
     } else if (module == "file") {
         ClassDecl handle;
-        handle.name = "$std.file.Handle";
+        handle.name = standard_class::file_handle;
         handle.span = standard_span();
-        handle.fields.push_back(standard_field("$handle", "uint64"));
+        handle.fields.push_back(standard_field("$handle", "nat64"));
         declarations.push_back(std::move(handle));
     } else if (module == "time") {
         ClassDecl instant;
-        instant.name = "$std.time.Instant";
+        instant.name = standard_class::time_instant;
         instant.span = standard_span();
-        instant.fields.push_back(standard_field("$seconds", "float"));
+        instant.fields.push_back(standard_field("$seconds", "real64"));
         declarations.push_back(std::move(instant));
 
         ClassDecl duration;
-        duration.name = "$std.time.Duration";
+        duration.name = standard_class::time_duration;
         duration.span = standard_span();
-        duration.fields.push_back(standard_field("$seconds", "float"));
+        duration.fields.push_back(standard_field("$seconds", "real64"));
         duration.methods.push_back(standard_method(
-            "seconds", std::vector<Parameter>{}, "float", standard_name("$seconds")));
+            "seconds", std::vector<Parameter>{}, "real64", standard_this_field("$seconds")));
         declarations.push_back(std::move(duration));
     } else if (module == "random") {
         ClassDecl generator;
-        generator.name = "$std.random.Generator";
+        generator.name = standard_class::random_generator;
         generator.span = standard_span();
-        generator.fields.push_back(standard_field("$state", "uint64"));
+        generator.fields.push_back(standard_field("$state", "nat64"));
 
         std::vector<Parameter> int_parameters;
         int_parameters.push_back(standard_parameter("start", "int"));
@@ -466,13 +571,15 @@ std::vector<ClassDecl> standard_declarations(const std::string& module) {
             standard_call("$std.random.int", std::move(int_arguments))));
 
         generator.methods.push_back(standard_method(
-            "float", std::vector<Parameter>{}, "float", standard_call("$std.random.float")));
+            "real64", std::vector<Parameter>{}, "real64", standard_call("$std.random.real64")));
         generator.methods.push_back(standard_method(
             "bool", std::vector<Parameter>{}, "bool", standard_call("$std.random.bool")));
+        // Each draw advances the generator's state: `.generator.int(1, 6)`.
+        for (auto& method : generator.methods) method.mutation_marker = true;
         declarations.push_back(std::move(generator));
     } else if (module == "process") {
         ClassDecl result;
-        result.name = "$std.process.Result";
+        result.name = standard_class::process_result;
         result.span = standard_span();
         result.fields.push_back(standard_field("status", "int"));
         result.fields.push_back(standard_field("output", "string"));
@@ -480,36 +587,38 @@ std::vector<ClassDecl> standard_declarations(const std::string& module) {
         result.fields.push_back(standard_field("started", "bool"));
         declarations.push_back(std::move(result));
     } else if (module == "map") {
-        constexpr std::string_view source = R"QUI(class Map<K, V>
+        constexpr std::string_view source = R"QUI(class Map<K, V>()
     K[] __keys = []
     V[] __values = []
-    int[] __hashes = []
+    int64[] __hashes = []
     bool[] __active = []
-    int[] __slots = array(8, fill = -1)
-    int __size = 0
-    int __tombstones = 0
-    int __empty_slot = -1
-    int __last_index = -1
-    int __last_hash = -1
-    int __last_slot = -1
+    int64[] __slots = array(8, fill = -1)
+    int64 __size = 0
+    int64 __tombstones = 0
+    int64 __empty_slot = -1
+    int64 __last_index = -1
+    int64 __last_hash = -1
+    int64 __last_slot = -1
     K[] __last_key = []
-    int __version = 0
-    int __last_version = -1
+    int64 __version = 0
+    int64 __last_version = -1
 
-    int __hash(K key)
+    int64 __hash(K key)
         int[] __encoded = key.string().codepoints()
-        int __result = 0
-        for __unit in __encoded
-            __result = (__result * 131 + __unit) % 2147483647
+        int64 __result = 0
+        for auto __unit = __encoded[]
+            int64 __unit64 = int64(__unit)
+            __result = (__result * 131 + __unit64) % 2147483647
         return __result
 
-    int __slot_of(K key, int hash)
-        int __capacity = len(__slots)
-        int __slot = hash AND (__capacity - 1)
-        int __scanned = 0
-        int __first_tombstone = -1
+    int64 __slot_of(K key, int64 hash)
+        int64 __capacity = int64(len(__slots))
+        int64 __mask = __capacity - 1
+        int64 __slot = hash AND __mask
+        int64 __scanned = 0
+        int64 __first_tombstone = -1
         while __scanned < __capacity
-            int __index = __slots[__slot]
+            int64 __index = __slots[__slot]
             if __index == -1
                 if __first_tombstone >= 0
                     __empty_slot = __first_tombstone
@@ -520,39 +629,40 @@ std::vector<ClassDecl> standard_declarations(const std::string& module) {
                 __first_tombstone = __slot
             if __index >= 0 and __hashes[__index] == hash and __keys[__index] == key
                 return __slot
-            __slot = (__slot + 1) AND (__capacity - 1)
+            __slot = (__slot + 1) AND __mask
             __scanned += 1
         __empty_slot = __first_tombstone
         return -1
 
-    int __find(K key, int hash)
-        int __slot = __slot_of(key, hash)
+    int64 __find(K key, int64 hash)
+        int64 __slot = __slot_of(key, hash)
         if __slot < 0
             return -1
         return __slots[__slot]
 
-    void __place(int index)
-        int __capacity = len(__slots)
-        int __slot = __hashes[index] AND (__capacity - 1)
+    void __place(int64 index)
+        int64 __capacity = int64(len(__slots))
+        int64 __mask = __capacity - 1
+        int64 __slot = __hashes[index] AND __mask
         while __slots[__slot] >= 0
-            __slot = (__slot + 1) AND (__capacity - 1)
+            __slot = (__slot + 1) AND __mask
         __slots[__slot] = index
 
-    void __rehash(int capacity)
-        __slots = array(capacity, fill = -1)
-        for __index in range(len(__keys))
+    void __rehash(int64 capacity)
+        __slots = array(nat(capacity), fill = -1)
+        for 0 <= nat __index < len(__keys)
             if __active[__index]
-                __place(__index)
+                __place(int64(__index))
         __tombstones = 0
         return void
 
     void __compact()
-        K[] __new_keys = array(__size)
-        V[] __new_values = array(__size)
-        int[] __new_hashes = array(__size, fill = 0)
-        bool[] __new_active = array(__size, fill = false)
-        int __write = 0
-        for __index in range(len(__keys))
+        K[] __new_keys = array(nat(__size))
+        V[] __new_values = array(nat(__size))
+        int64[] __new_hashes = array(nat(__size), fill = 0)
+        bool[] __new_active = array(nat(__size), fill = false)
+        int64 __write = 0
+        for 0 <= nat __index < len(__keys)
             if __active[__index]
                 __new_keys[__write] = __keys[__index]
                 __new_values[__write] = __values[__index]
@@ -563,18 +673,18 @@ std::vector<ClassDecl> standard_declarations(const std::string& module) {
         __values = __new_values
         __hashes = __new_hashes
         __active = __new_active
-        __rehash(len(__slots))
+        __rehash(int64(len(__slots)))
         __version += 1
         __last_version = -1
         return void
 
     bool has(K key)
-        int __hash_value = __hash(key)
+        int64 __hash_value = __hash(key)
         return __find(key, __hash_value) >= 0
 
     V | none get(K key)
-        int __hash_value = __hash(key)
-        int __index = __find(key, __hash_value)
+        int64 __hash_value = __hash(key)
+        int64 __index = __find(key, __hash_value)
         __last_hash = __hash_value
         __last_index = __index
         __last_slot = __empty_slot
@@ -587,10 +697,10 @@ std::vector<ClassDecl> standard_declarations(const std::string& module) {
             __last_key[0] = key
         return none
 
-    void set(K key, V value)
-        int __hash_value = -1
+    void .set(K key, V value)
+        int64 __hash_value = -1
         if __last_version == __version and __last_index >= 0
-            int __cached = __last_index
+            int64 __cached = __last_index
             if __keys[__cached] == key
                 __values[__cached] = value
                 return void
@@ -601,8 +711,8 @@ std::vector<ClassDecl> standard_declarations(const std::string& module) {
                 __reuse_missing = true
                 __hash_value = __last_hash
 
-        int __index = -1
-        int __insert_slot = -1
+        int64 __index = -1
+        int64 __insert_slot = -1
         if __reuse_missing
             __insert_slot = __last_slot
         else
@@ -617,15 +727,16 @@ std::vector<ClassDecl> standard_declarations(const std::string& module) {
             __last_version = __version
             return void
 
-        int __new_index = len(__keys)
+        int64 __new_index = int64(len(__keys))
         __keys = __keys.append(key)
         __values = __values.append(value)
         __hashes = __hashes.append(__hash_value)
         __active = __active.append(true)
         __size += 1
 
-        if __size > len(__slots) - len(__slots) / 4
-            __rehash(len(__slots) * 2)
+        int64 __slot_count = int64(len(__slots))
+        if __size > __slot_count - __slot_count / 4
+            __rehash(__slot_count * 2)
         else
             if __slots[__insert_slot] == -2
                 __tombstones -= 1
@@ -634,35 +745,39 @@ std::vector<ClassDecl> standard_declarations(const std::string& module) {
         __last_version = -1
         return void
 
-    bool remove(K key)
-        int __hash_value = __hash(key)
-        int __slot = __slot_of(key, __hash_value)
+    bool .remove(K key)
+        int64 __hash_value = __hash(key)
+        int64 __slot = __slot_of(key, __hash_value)
         if __slot < 0
             return false
 
-        int __removed_index = __slots[__slot]
+        int64 __removed_index = __slots[__slot]
         __active[__removed_index] = false
         __slots[__slot] = -2
         __size -= 1
         __tombstones += 1
         __version += 1
         __last_version = -1
-        if len(__keys) > 64 and __size * 2 <= len(__keys)
+        int64 __key_count = int64(len(__keys))
+        int64 __slot_count = int64(len(__slots))
+        if __key_count > 64 and __size * 2 <= __key_count
             __compact()
-        elif __tombstones > len(__slots) / 4
-            __rehash(len(__slots))
+        elif __tombstones > __slot_count / 4
+            __rehash(__slot_count)
         return true
 
-    int size()
-        return __size
+    nat size()
+        return nat(__size)
 
     K[] keys()
-        if __size != len(__keys)
+        int64 __count = int64(len(__keys))
+        if __size != __count
             __compact()
         return __keys
 
     V[] values()
-        if __size != len(__values)
+        int64 __count = int64(len(__values))
+        if __size != __count
             __compact()
         return __values
 )QUI";
@@ -672,16 +787,17 @@ std::vector<ClassDecl> standard_declarations(const std::string& module) {
             throw std::logic_error("invalid built-in map declaration");
         }
         auto map = std::move(program.classes.front());
-        map.name = "$std.map.Map";
+        map.name = standard_class::map;
+        map.methods.front().return_type.name = map.name;
         map.span = standard_span();
         declarations.push_back(std::move(map));
     } else if (module == "http") {
         ClassDecl response;
-        response.name = "$std.http.Response";
+        response.name = standard_class::http_response;
         response.span = standard_span();
         response.fields.push_back(standard_field("status", "int"));
         response.fields.push_back(standard_field("body", "bin"));
-        response.fields.push_back(standard_field("$headers", "uint64"));
+        response.fields.push_back(standard_field("$headers", "nat64"));
 
         std::vector<Parameter> header_parameters;
         header_parameters.push_back(standard_parameter("name", "string"));
@@ -694,15 +810,15 @@ std::vector<ClassDecl> standard_declarations(const std::string& module) {
         declarations.push_back(std::move(response));
     } else if (module == "json") {
         ClassDecl value;
-        value.name = "$std.json.Value";
+        value.name = standard_class::json_value;
         value.span = standard_span();
-        value.fields.push_back(standard_field("$handle", "uint64"));
+        value.fields.push_back(standard_field("$handle", "nat64"));
 
         value.methods.push_back(standard_method(
             "kind", std::vector<Parameter>{}, "string", standard_call("$std.json.kind")));
         value.methods.push_back(standard_method(
             "size", std::vector<Parameter>{},
-            standard_union_type({"int", "error"}), standard_call("$std.json.size")));
+            standard_union_type({"nat", "error"}), standard_call("$std.json.size")));
 
         std::vector<Parameter> get_parameters;
         get_parameters.push_back(standard_parameter("key", "string"));
@@ -710,16 +826,16 @@ std::vector<ClassDecl> standard_declarations(const std::string& module) {
         get_arguments.push_back(standard_arg(standard_name("key")));
         value.methods.push_back(standard_method(
             "get", std::move(get_parameters),
-            standard_union_type({"$std.json.Value", "none", "error"}),
+            standard_union_type({standard_class::json_value, "none", "error"}),
             standard_call("$std.json.get", std::move(get_arguments))));
 
         std::vector<Parameter> at_parameters;
-        at_parameters.push_back(standard_parameter("index", "int"));
+        at_parameters.push_back(standard_parameter("index", "nat"));
         std::vector<CallArg> at_arguments;
         at_arguments.push_back(standard_arg(standard_name("index")));
         value.methods.push_back(standard_method(
             "at", std::move(at_parameters),
-            standard_union_type({"$std.json.Value", "none", "error"}),
+            standard_union_type({standard_class::json_value, "none", "error"}),
             standard_call("$std.json.at", std::move(at_arguments))));
 
         value.methods.push_back(standard_method(
@@ -730,13 +846,10 @@ std::vector<ClassDecl> standard_declarations(const std::string& module) {
             standard_union_type({"int", "error"}), standard_call("$std.json.integer")));
         value.methods.push_back(standard_method(
             "number", std::vector<Parameter>{},
-            standard_union_type({"float", "error"}), standard_call("$std.json.number")));
+            standard_union_type({"real64", "error"}), standard_call("$std.json.number")));
         value.methods.push_back(standard_method(
-            "bigint", std::vector<Parameter>{},
-            standard_union_type({"bigint", "error"}), standard_call("$std.json.bigint")));
-        value.methods.push_back(standard_method(
-            "bigreal", std::vector<Parameter>{},
-            standard_union_type({"bigreal", "error"}), standard_call("$std.json.bigreal")));
+            "real", std::vector<Parameter>{},
+            standard_union_type({"real", "error"}), standard_call("$std.json.real")));
         value.methods.push_back(standard_method(
             "boolean", std::vector<Parameter>{},
             standard_union_type({"bool", "error"}), standard_call("$std.json.boolean")));
@@ -744,7 +857,7 @@ std::vector<ClassDecl> standard_declarations(const std::string& module) {
             "encode", std::vector<Parameter>{}, "string", standard_call("$std.json.encode")));
 
         std::vector<Parameter> equal_parameters;
-        equal_parameters.push_back(standard_parameter("other", "$std.json.Value"));
+        equal_parameters.push_back(standard_parameter("other", standard_class::json_value));
         std::vector<CallArg> equal_arguments;
         equal_arguments.push_back(standard_arg(standard_name("other")));
         value.methods.push_back(standard_method(
@@ -752,29 +865,31 @@ std::vector<ClassDecl> standard_declarations(const std::string& module) {
             standard_call("$std.json.equal", std::move(equal_arguments))));
         declarations.push_back(std::move(value));
     } else if (module == "set") {
-        constexpr std::string_view source = R"QUI(class Set<T>
+        constexpr std::string_view source = R"QUI(class Set<T>()
     T[] __values = []
-    int[] __hashes = []
+    int64[] __hashes = []
     bool[] __active = []
-    int[] __slots = array(8, fill = -1)
-    int __size = 0
-    int __tombstones = 0
-    int __empty_slot = -1
+    int64[] __slots = array(8, fill = -1)
+    int64 __size = 0
+    int64 __tombstones = 0
+    int64 __empty_slot = -1
 
-    int __hash(T value)
+    int64 __hash(T value)
         int[] __encoded = value.string().codepoints()
-        int __result = 0
-        for __unit in __encoded
-            __result = (__result * 131 + __unit) % 2147483647
+        int64 __result = 0
+        for auto __unit = __encoded[]
+            int64 __unit64 = int64(__unit)
+            __result = (__result * 131 + __unit64) % 2147483647
         return __result
 
-    int __slot_of(T value, int hash)
-        int __capacity = len(__slots)
-        int __slot = hash AND (__capacity - 1)
-        int __scanned = 0
-        int __first_tombstone = -1
+    int64 __slot_of(T value, int64 hash)
+        int64 __capacity = int64(len(__slots))
+        int64 __mask = __capacity - 1
+        int64 __slot = hash AND __mask
+        int64 __scanned = 0
+        int64 __first_tombstone = -1
         while __scanned < __capacity
-            int __index = __slots[__slot]
+            int64 __index = __slots[__slot]
             if __index == -1
                 if __first_tombstone >= 0
                     __empty_slot = __first_tombstone
@@ -785,38 +900,39 @@ std::vector<ClassDecl> standard_declarations(const std::string& module) {
                 __first_tombstone = __slot
             if __index >= 0 and __hashes[__index] == hash and __values[__index] == value
                 return __slot
-            __slot = (__slot + 1) AND (__capacity - 1)
+            __slot = (__slot + 1) AND __mask
             __scanned += 1
         __empty_slot = __first_tombstone
         return -1
 
-    int __find(T value, int hash)
-        int __slot = __slot_of(value, hash)
+    int64 __find(T value, int64 hash)
+        int64 __slot = __slot_of(value, hash)
         if __slot < 0
             return -1
         return __slots[__slot]
 
-    void __place(int index)
-        int __capacity = len(__slots)
-        int __slot = __hashes[index] AND (__capacity - 1)
+    void __place(int64 index)
+        int64 __capacity = int64(len(__slots))
+        int64 __mask = __capacity - 1
+        int64 __slot = __hashes[index] AND __mask
         while __slots[__slot] >= 0
-            __slot = (__slot + 1) AND (__capacity - 1)
+            __slot = (__slot + 1) AND __mask
         __slots[__slot] = index
 
-    void __rehash(int capacity)
-        __slots = array(capacity, fill = -1)
-        for __index in range(len(__values))
+    void __rehash(int64 capacity)
+        __slots = array(nat(capacity), fill = -1)
+        for 0 <= nat __index < len(__values)
             if __active[__index]
-                __place(__index)
+                __place(int64(__index))
         __tombstones = 0
         return void
 
     void __compact()
-        T[] __new_values = array(__size)
-        int[] __new_hashes = array(__size, fill = 0)
-        bool[] __new_active = array(__size, fill = false)
-        int __write = 0
-        for __index in range(len(__values))
+        T[] __new_values = array(nat(__size))
+        int64[] __new_hashes = array(nat(__size), fill = 0)
+        bool[] __new_active = array(nat(__size), fill = false)
+        int64 __write = 0
+        for 0 <= nat __index < len(__values)
             if __active[__index]
                 __new_values[__write] = __values[__index]
                 __new_hashes[__write] = __hashes[__index]
@@ -825,55 +941,59 @@ std::vector<ClassDecl> standard_declarations(const std::string& module) {
         __values = __new_values
         __hashes = __new_hashes
         __active = __new_active
-        __rehash(len(__slots))
+        __rehash(int64(len(__slots)))
         return void
 
     bool has(T value)
-        int __hash_value = __hash(value)
+        int64 __hash_value = __hash(value)
         return __find(value, __hash_value) >= 0
 
-    void add(T value)
-        int __hash_value = __hash(value)
+    void .add(T value)
+        int64 __hash_value = __hash(value)
         if __find(value, __hash_value) >= 0
             return void
 
-        int __new_index = len(__values)
-        int __insert_slot = __empty_slot
+        int64 __new_index = int64(len(__values))
+        int64 __insert_slot = __empty_slot
         __values = __values.append(value)
         __hashes = __hashes.append(__hash_value)
         __active = __active.append(true)
         __size += 1
 
-        if __size > len(__slots) - len(__slots) / 4
-            __rehash(len(__slots) * 2)
+        int64 __slot_count = int64(len(__slots))
+        if __size > __slot_count - __slot_count / 4
+            __rehash(__slot_count * 2)
         else
             if __slots[__insert_slot] == -2
                 __tombstones -= 1
             __slots[__insert_slot] = __new_index
         return void
 
-    bool remove(T value)
-        int __hash_value = __hash(value)
-        int __slot = __slot_of(value, __hash_value)
+    bool .remove(T value)
+        int64 __hash_value = __hash(value)
+        int64 __slot = __slot_of(value, __hash_value)
         if __slot < 0
             return false
 
-        int __removed_index = __slots[__slot]
+        int64 __removed_index = __slots[__slot]
         __active[__removed_index] = false
         __slots[__slot] = -2
         __size -= 1
         __tombstones += 1
-        if len(__values) > 64 and __size * 2 <= len(__values)
+        int64 __value_count = int64(len(__values))
+        int64 __slot_count = int64(len(__slots))
+        if __value_count > 64 and __size * 2 <= __value_count
             __compact()
-        elif __tombstones > len(__slots) / 4
-            __rehash(len(__slots))
+        elif __tombstones > __slot_count / 4
+            __rehash(__slot_count)
         return true
 
-    int size()
-        return __size
+    nat size()
+        return nat(__size)
 
     T[] values()
-        if __size != len(__values)
+        int64 __count = int64(len(__values))
+        if __size != __count
             __compact()
         return __values
 )QUI";
@@ -883,10 +1003,12 @@ std::vector<ClassDecl> standard_declarations(const std::string& module) {
             throw std::logic_error("invalid built-in set declaration");
         }
         auto set = std::move(program.classes.front());
-        set.name = "$std.set.Set";
+        set.name = standard_class::set;
+        set.methods.front().return_type.name = set.name;
         set.span = standard_span();
         declarations.push_back(std::move(set));
     }
+    for (auto& declaration : declarations) declaration.standard_library = true;
     return declarations;
 }
 
@@ -901,7 +1023,24 @@ void rename_type(
     const std::unordered_set<std::string>& local_classes,
     const std::unordered_map<std::string, ImportBinding>& imports,
     const std::unordered_set<std::string>& type_parameters) {
-    if (type.name == "union") {
+    // A bare axis name refers only to a nat value, and a shape variable is a
+    // new name: neither can be a type parameter of the declaration.
+    for (const auto& axis : type.shape_axes) {
+        if (!type_parameters.contains(axis.name)) continue;
+        if (axis.kind == ShapeAxisKind::Bare) {
+            frontend_error("SHAPE_VARIABLE",
+                           "'" + axis.name +
+                               "' is a type parameter, not a nat value; choose another axis name.",
+                           axis.span);
+        }
+        if (axis.kind == ShapeAxisKind::Declare || axis.kind == ShapeAxisKind::DeclareEqual) {
+            frontend_error("SHADOWING",
+                           "'" + axis.name + "' already names a type parameter; 'nat " + axis.name +
+                               "' would declare a new shape variable. Choose another name.",
+                           axis.span);
+        }
+    }
+    if (type.name == "union" || type.name == "$tuple" || type.name == "$std.reflect.Each") {
         for (auto& argument : type.arguments) {
             rename_type(argument, ns, local_classes, imports, type_parameters);
         }
@@ -930,6 +1069,7 @@ void rename_type(
             }
             std::string suffix;
             const Exports& module = *descend_namespaces(it->second.exports, full_suffix, suffix);
+            if(const auto pseudo=module.pseudo_types.find(suffix);pseudo!=module.pseudo_types.end()) {type.name=pseudo->second;return;}
             if (const auto cls = module.classes.find(suffix);
                 cls != module.classes.end()) {
                 type.name = cls->second;
@@ -948,6 +1088,11 @@ void rename_type(
                     type.name = en->second + suffix.substr(dot);
                     return;
                 }
+            }
+            if (module.private_names.contains(suffix) ||
+                module.private_names.contains(suffix.substr(0, suffix.find('.')))) {
+                const auto shown = type.name.substr(0, type.name.size() - suffix.size() - 1);
+                private_declaration_error(suffix, shown, type.span);
             }
             frontend_error("UNKNOWN_TYPE",
                            "Module '" + head + "' has no exported type '" + full_suffix + "'.",
@@ -968,6 +1113,8 @@ void rename_type(
 // an import alias followed by re-exported aliases.
 std::optional<std::string> expression_qualified_name(const Expr& expression) {
     if (const auto* name = std::get_if<NameExpr>(&expression.data)) {
+        // `this.NAME` is a receiver field, never a namespace or a class.
+        if (name->this_qualifier || name->self_reference) return std::nullopt;
         return name->name;
     }
     if (const auto* member = std::get_if<MemberExpr>(&expression.data)) {
@@ -983,6 +1130,7 @@ const Exports* expression_namespace(
     const std::unordered_map<std::string, ImportBinding>& imports,
     std::string& spelling) {
     if (const auto* name = std::get_if<NameExpr>(&expression.data)) {
+        if (name->this_qualifier || name->self_reference) return nullptr;
         const auto import = imports.find(name->name);
         if (import == imports.end()) return nullptr;
         spelling = name->name;
@@ -1026,10 +1174,36 @@ void rename_expr(
     const std::unordered_set<std::string>& local_functions,
     const std::unordered_map<std::string, ImportBinding>& imports,
     const std::unordered_set<std::string>& type_parameters) {
+    if (auto* node = std::get_if<NameExpr>(&expression.data)) {
+        if (!node->this_qualifier && !node->self_reference) {
+            if (const auto* initializer = visible_literal_constant(node->name)) {
+                auto use = literal_constant_use(node->name, *initializer, expression.span);
+                expression.data = std::move(use->data);
+            }
+        }
+        return;
+    }
+    if (auto* node = std::get_if<LiteralConstantExpr>(&expression.data)) {
+        rename_expr(*node->value, ns, local_classes, local_functions, imports, type_parameters);
+        return;
+    }
     if (auto* node = std::get_if<StringTemplateExpr>(&expression.data)) {
         for (auto& item : node->expressions) {
             rename_expr(*item, ns, local_classes, local_functions, imports, type_parameters);
         }
+        return;
+    }
+    if (auto* node = std::get_if<TupleExpr>(&expression.data)) {
+        for (auto& item : node->elements) {
+            rename_expr(*item, ns, local_classes, local_functions, imports, type_parameters);
+        }
+        return;
+    }
+    if (auto* node = std::get_if<ArrayComprehensionExpr>(&expression.data)) {
+        if (node->type) rename_type(*node->type, ns, local_classes, imports, type_parameters);
+        visit_array_comprehension(*node, [&](Expr& child) {
+            rename_expr(child, ns, local_classes, local_functions, imports, type_parameters);
+        });
         return;
     }
     if (auto* node = std::get_if<ArrayExpr>(&expression.data)) {
@@ -1055,9 +1229,14 @@ void rename_expr(
                 constant != module->constants.end()) {
                 auto replacement =
                     clone_package_constant_expression(*constant->second, expression.span);
+                // The name as the use writes it, read before the use is replaced.
+                const auto qualified = module_spelling + "." + node->name;
+                if (auto* use = std::get_if<LiteralConstantExpr>(&replacement->data))
+                    use->name = qualified;
                 expression.data = std::move(replacement->data);
                 expression.contextual_default_type =
                     std::move(replacement->contextual_default_type);
+                if (expression.contextual_default_type) expression.constant_name = qualified;
                 rename_expr(
                     expression, ns, local_classes, local_functions, imports,
                     type_parameters);
@@ -1084,9 +1263,16 @@ void rename_expr(
                                    "' is a namespace, not a value.",
                                expression.span);
             }
+            if (module->private_names.contains(node->name))
+                private_declaration_error(node->name, module_spelling, expression.span);
+            frontend_error("UNKNOWN_MODULE_MEMBER",
+                           "Module '" + module_spelling + "' has no exported value '" +
+                               node->name + "'.",
+                           expression.span);
         }
         if (auto* base = std::get_if<NameExpr>(&node->base->data)) {
-            if (local_classes.contains(base->name)) base->name = qualify(ns, base->name);
+            if (!base->this_qualifier && !base->self_reference && local_classes.contains(base->name))
+                base->name = qualify(ns, base->name);
         }
         rename_expr(*node->base, ns, local_classes, local_functions, imports, type_parameters);
         return;
@@ -1100,8 +1286,21 @@ void rename_expr(
         rename_expr(*node->right, ns, local_classes, local_functions, imports, type_parameters);
         return;
     }
+    if (auto* node = std::get_if<ComparisonChainExpr>(&expression.data)) {
+        for (auto& operand : node->operands)
+            rename_expr(*operand, ns, local_classes, local_functions, imports, type_parameters);
+        return;
+    }
     if (auto* node = std::get_if<TryExpr>(&expression.data)) {
         rename_expr(*node->value, ns, local_classes, local_functions, imports, type_parameters);
+        return;
+    }
+    if (auto* node = std::get_if<IfExpr>(&expression.data)) {
+        for (auto& condition : node->conditions)
+            rename_expr(*condition, ns, local_classes, local_functions, imports, type_parameters);
+        for (auto& value : node->values)
+            rename_expr(*value, ns, local_classes, local_functions, imports, type_parameters);
+        rename_expr(*node->otherwise, ns, local_classes, local_functions, imports, type_parameters);
         return;
     }
     if (auto* node = std::get_if<CallExpr>(&expression.data)) {
@@ -1117,6 +1316,26 @@ void rename_expr(
     if (auto* node = std::get_if<MethodCallExpr>(&expression.data)) {
         auto* receiver_name = std::get_if<NameExpr>(&node->receiver->data);
 
+        // A built-in type name used as a namespace (real.atom, real.unary):
+        // type names are reserved, so the receiver cannot be a binding.
+        if (receiver_name && !receiver_name->this_qualifier && !receiver_name->self_reference) {
+            if (const auto target =
+                    standard_type_function_target(receiver_name->name, node->method)) {
+                for (auto& type_argument : node->type_arguments) {
+                    rename_type(type_argument, ns, local_classes, imports, type_parameters);
+                }
+                rename_call_args(
+                    node->args, ns, local_classes, local_functions, imports, type_parameters);
+                CallExpr call;
+                call.callee = std::string(*target);
+                call.args = std::move(node->args);
+                call.type_arguments = std::move(node->type_arguments);
+                call.mutation_marker = node->mutation_marker;
+                expression.data = std::move(call);
+                return;
+            }
+        }
+
         if (auto local_namespace = expression_qualified_name(*node->receiver)) {
             const std::string local_callee = *local_namespace + "." + node->method;
             if (local_classes.contains(local_callee)) {
@@ -1130,6 +1349,7 @@ void rename_expr(
                 call.callee = qualify(ns, local_callee);
                 call.args = std::move(node->args);
                 call.type_arguments = std::move(node->type_arguments);
+                call.mutation_marker = node->mutation_marker;
                 expression.data = std::move(call);
                 return;
             }
@@ -1150,6 +1370,8 @@ void rename_expr(
                 } else if (const auto cls = module->classes.find(node->method);
                            cls != module->classes.end()) {
                     callee = cls->second;
+                } else if (module->private_names.contains(node->method)) {
+                    private_declaration_error(node->method, module_spelling, expression.span);
                 } else {
                     frontend_error("UNKNOWN_MODULE_MEMBER",
                                    "Module '" + module_spelling + "' has no exported callable '" +
@@ -1161,12 +1383,14 @@ void rename_expr(
                 call.callee = std::move(callee);
                 call.args = std::move(node->args);
                 call.type_arguments = std::move(node->type_arguments);
+                call.mutation_marker = node->mutation_marker;
                 expression.data = std::move(call);
                 return;
             }
         }
 
-        if (receiver_name && local_classes.contains(receiver_name->name))
+        if (receiver_name && !receiver_name->this_qualifier && !receiver_name->self_reference &&
+            local_classes.contains(receiver_name->name))
             receiver_name->name = qualify(ns, receiver_name->name);
         rename_expr(*node->receiver, ns, local_classes, local_functions, imports, type_parameters);
         for (auto& type_argument : node->type_arguments) {
@@ -1181,7 +1405,8 @@ void reject_import_alias_shadow_stmt(
     const Stmt& statement,
     const std::unordered_set<std::string>& aliases) {
     if (const auto* node = std::get_if<BindingStmt>(&statement.data)) {
-        if (aliases.contains(node->name)) {
+        if(node->pattern)visit_pattern(*node->pattern,[&](const Pattern& p){if(p.kind==Pattern::Kind::Declare && aliases.contains(p.name))frontend_error("SHADOWING","Binding shadows an import alias '"+p.name+"'.",p.span);});
+        if (!node->pattern && aliases.contains(node->name)) {
             frontend_error("SHADOWING", "Binding shadows an import alias '" + node->name + "'.", statement.span);
         }
         return;
@@ -1195,19 +1420,28 @@ void reject_import_alias_shadow_stmt(
         for (const auto& child : node->body) reject_import_alias_shadow_stmt(*child, aliases);
         return;
     }
+    if (const auto* node = std::get_if<ParallelStmt>(&statement.data)) {
+        for (const auto& child : node->body) reject_import_alias_shadow_stmt(*child, aliases);
+        return;
+    }
     if (const auto* node = std::get_if<WhileStmt>(&statement.data)) {
         for (const auto& child : node->body) reject_import_alias_shadow_stmt(*child, aliases);
         return;
     }
     if (const auto* node = std::get_if<ForStmt>(&statement.data)) {
-        if (aliases.contains(node->name)) {
+        if(node->pattern)visit_pattern(*node->pattern,[&](const Pattern& p){if(p.kind==Pattern::Kind::Declare && aliases.contains(p.name))frontend_error("SHADOWING","Iteration binding shadows an import alias '"+p.name+"'.",p.span);});
+        if (!node->pattern && aliases.contains(node->name)) {
             frontend_error("SHADOWING", "Iteration binding shadows an import alias '" + node->name + "'.", statement.span);
         }
+        for(const auto& binding:node->collections)
+            if(aliases.contains(binding.name))
+                frontend_error("SHADOWING","Iteration binding shadows an import alias '"+binding.name+"'.",binding.span);
         for (const auto& child : node->body) reject_import_alias_shadow_stmt(*child, aliases);
         return;
     }
     if (const auto* node = std::get_if<MatchStmt>(&statement.data)) {
         for (const auto& match_case : node->cases) {
+            if(match_case.pattern)visit_pattern(*match_case.pattern,[&](const Pattern& p){if(p.kind==Pattern::Kind::Declare && aliases.contains(p.name))frontend_error("SHADOWING","Case binding shadows an import alias '"+p.name+"'.",p.span);});
             if (match_case.binder && aliases.contains(*match_case.binder)) {
                 frontend_error("SHADOWING",
                                "Match binding shadows an import alias '" + *match_case.binder + "'.",
@@ -1268,18 +1502,28 @@ void rename_stmt(
     const std::unordered_set<std::string>& local_functions,
     const std::unordered_map<std::string, ImportBinding>& imports,
     const std::unordered_set<std::string>& type_parameters) {
+    const auto rename_pattern=[&](Pattern& pattern){visit_pattern(pattern,[&](Pattern& p){if(p.type)rename_type(*p.type,ns,local_classes,imports,type_parameters);if(p.place)rename_expr(*p.place,ns,local_classes,local_functions,imports,type_parameters);});};
     if (auto* node = std::get_if<BindingStmt>(&statement.data)) {
+        if(node->pattern)rename_pattern(*node->pattern);
         rename_type(node->declared_type, ns, local_classes, imports, type_parameters);
         if (node->value) rename_expr(*node->value, ns, local_classes, local_functions, imports, type_parameters);
+        if (node->literal_constant) {
+            if (!node->value) literal_constant_error(statement.span);
+            (void)clone_literal_initializer(*node->value, node->value->span);
+            if (!literal_constant_scopes.empty())
+                literal_constant_scopes.back()[node->name] = node->value.get();
+        }
         return;
     }
     if (auto* node = std::get_if<AssignStmt>(&statement.data)) {
-        rename_expr(*node->target, ns, local_classes, local_functions, imports, type_parameters);
+        if(node->pattern)rename_pattern(*node->pattern);
+        if(node->target)rename_expr(*node->target, ns, local_classes, local_functions, imports, type_parameters);
         rename_expr(*node->value, ns, local_classes, local_functions, imports, type_parameters);
         return;
     }
     if (auto* node = std::get_if<RebindStmt>(&statement.data)) {
-        rename_expr(*node->target, ns, local_classes, local_functions, imports, type_parameters);
+        if(node->place)rename_expr(*node->place, ns, local_classes, local_functions, imports, type_parameters);
+        if(node->target)rename_expr(*node->target, ns, local_classes, local_functions, imports, type_parameters);
         return;
     }
     if (auto* node = std::get_if<ReturnStmt>(&statement.data)) {
@@ -1293,28 +1537,46 @@ void rename_stmt(
     }
     if (auto* node = std::get_if<IfStmt>(&statement.data)) {
         rename_expr(*node->condition, ns, local_classes, local_functions, imports, type_parameters);
-        for (auto& child : node->then_body) {
-            rename_stmt(*child, ns, local_classes, local_functions, imports, type_parameters);
+        {
+            LiteralConstantScope scope;
+            for (auto& child : node->then_body) {
+                rename_stmt(*child, ns, local_classes, local_functions, imports, type_parameters);
+            }
         }
+        LiteralConstantScope scope;
         for (auto& child : node->else_body) {
             rename_stmt(*child, ns, local_classes, local_functions, imports, type_parameters);
         }
         return;
     }
     if (auto* node = std::get_if<MainGuardStmt>(&statement.data)) {
+        LiteralConstantScope scope;
+        for (auto& child : node->body)
+            rename_stmt(*child, ns, local_classes, local_functions, imports, type_parameters);
+        return;
+    }
+    if (auto* node = std::get_if<ParallelStmt>(&statement.data)) {
+        LiteralConstantScope scope;
         for (auto& child : node->body)
             rename_stmt(*child, ns, local_classes, local_functions, imports, type_parameters);
         return;
     }
     if (auto* node = std::get_if<WhileStmt>(&statement.data)) {
         rename_expr(*node->condition, ns, local_classes, local_functions, imports, type_parameters);
+        LiteralConstantScope scope;
         for (auto& child : node->body) {
             rename_stmt(*child, ns, local_classes, local_functions, imports, type_parameters);
         }
         return;
     }
     if (auto* node = std::get_if<ForStmt>(&statement.data)) {
-        rename_expr(*node->iterable, ns, local_classes, local_functions, imports, type_parameters);
+        visit_for_header(*node,[&](Expr& operand) {
+            rename_expr(operand,ns,local_classes,local_functions,imports,type_parameters);
+        });
+        if(node->type) rename_type(*node->type,ns,local_classes,imports,type_parameters);
+        for(auto& binding:node->collections) if(binding.type) rename_type(*binding.type,ns,local_classes,imports,type_parameters);
+        if(node->pattern)visit_pattern(*node->pattern,[&](Pattern& p){if(p.type)rename_type(*p.type,ns,local_classes,imports,type_parameters);if(p.place)rename_expr(*p.place,ns,local_classes,local_functions,imports,type_parameters);});
+        LiteralConstantScope scope;
         for (auto& child : node->body) {
             rename_stmt(*child, ns, local_classes, local_functions, imports, type_parameters);
         }
@@ -1323,7 +1585,9 @@ void rename_stmt(
     auto& node = std::get<MatchStmt>(statement.data);
     rename_expr(*node.value, ns, local_classes, local_functions, imports, type_parameters);
     for (auto& match_case : node.cases) {
-        rename_type(match_case.type, ns, local_classes, imports, type_parameters);
+        if(match_case.pattern)visit_pattern(*match_case.pattern,[&](Pattern& p){if(p.type)rename_type(*p.type,ns,local_classes,imports,type_parameters);});
+        else rename_type(match_case.type, ns, local_classes, imports, type_parameters);
+        LiteralConstantScope scope;
         for (auto& child : match_case.body) {
             rename_stmt(*child, ns, local_classes, local_functions, imports, type_parameters);
         }
@@ -1339,6 +1603,14 @@ void rename_function(
     const std::unordered_set<std::string>& inherited_type_parameters = {}) {
     std::unordered_set<std::string> type_parameters = inherited_type_parameters;
     type_parameters.insert(function.type_parameters.begin(), function.type_parameters.end());
+    // A function sees its own contextual constants only.
+    auto outer = std::move(literal_constant_scopes);
+    literal_constant_scopes.clear();
+    struct RestoreScopes {
+        decltype(outer)& saved;
+        ~RestoreScopes() { literal_constant_scopes = std::move(saved); }
+    } restore{outer};
+    LiteralConstantScope scope;
 
     rename_type(function.return_type, ns, local_classes, imports, type_parameters);
     for (auto& parameter : function.parameters) {
@@ -1353,24 +1625,16 @@ void rename_function(
 }
 
 
-std::string compact_type_spelling(const TypeName& type, std::string_view source) {
-    const auto start = std::min(type.span.start.offset, source.size());
-    const auto end = std::min(type.span.end.offset, source.size());
-    std::string out;
-    if (end > start) {
-        for (const char c : source.substr(start, end - start)) {
-            if (!std::isspace(static_cast<unsigned char>(c))) out.push_back(c);
-        }
-    }
-    return out.empty() ? type.name : out;
-}
+std::string canonical_signature_type(const TypeName& type, const FunctionDecl& function);
 
 bool same_parameter_contract(const Parameter& a, const Parameter& b, std::string_view source) {
+    (void)source;
     return a.name == b.name && a.writable == b.writable && a.is_const == b.is_const &&
-           compact_type_spelling(a.type, source) == compact_type_spelling(b.type, source);
+           a.type.name == b.type.name;
 }
 
 std::string function_prototype_key(const FunctionDecl& function, std::string_view source) {
+    (void)source;
     std::string key = function.name + "<";
     for (std::size_t i = 0; i < function.type_parameters.size(); ++i) {
         if (i) key += ",";
@@ -1382,19 +1646,169 @@ std::string function_prototype_key(const FunctionDecl& function, std::string_vie
         }
     }
     key += ">->";
-    key += compact_type_spelling(function.return_type, source);
+    key += canonical_signature_type(function.return_type, function);
     key += "(";
     for (std::size_t i = 0; i < function.parameters.size(); ++i) {
         if (i) key += ",";
         const auto& parameter = function.parameters[i];
         if (parameter.is_const) key += "const ";
-        key += compact_type_spelling(parameter.type, source);
+        key += canonical_signature_type(parameter.type, function);
         if (parameter.writable) key += "&";
         key += " ";
         key += parameter.name;
     }
     key += ")";
     return key;
+}
+
+// The names a source file declares, as written, checked before anything
+// qualifies or instantiates them: `_` is the discard name and names nothing,
+// and names that start with "__quidra_" are the compiler's (the instances it
+// makes of generic declarations are named so). Bindings inside bodies and
+// match binders are the checker's.
+void validate_declared_name(const std::string& name, SourceSpan span,
+                            bool typed_binding = false) {
+    if (is_discard_name(name)) {
+        frontend_error("DISCARD",
+                       typed_binding ? discard_typed_message : discard_declaration_message,
+                       span);
+    }
+    if (name.starts_with(abi::symbol_namespace::internal_prefix)) {
+        frontend_error("SHADOWING", compiler_name_message(name), span);
+    }
+}
+
+void validate_declared_names(const std::vector<std::string>& type_parameters, SourceSpan span) {
+    for (const auto& parameter : type_parameters) validate_declared_name(parameter, span);
+}
+
+void validate_declared_names(const FunctionDecl& function) {
+    validate_declared_name(function.name, function.span);
+    validate_declared_names(function.type_parameters, function.span);
+    for (const auto& parameter : function.parameters) {
+        validate_declared_name(parameter.name, parameter.span);
+    }
+}
+
+void validate_declared_names(const Program& program) {
+    for (const auto& import_decl : program.imports) {
+        validate_declared_name(import_decl.alias, import_decl.span);
+    }
+    for (const auto& class_decl : program.classes) {
+        validate_declared_name(class_decl.name, class_decl.span);
+        validate_declared_names(class_decl.type_parameters, class_decl.span);
+        for (const auto& field : class_decl.fields) validate_declared_name(field.name, field.span);
+        for (const auto& method : class_decl.methods) validate_declared_names(method);
+    }
+    for (const auto& enum_decl : program.enums) {
+        validate_declared_name(enum_decl.name, enum_decl.span);
+        for (const auto& variant : enum_decl.variants) {
+            validate_declared_name(variant.name, variant.span);
+        }
+    }
+    for (const auto& function : program.functions) validate_declared_names(function);
+    for (const auto& statement : program.statements) {
+        if (const auto* binding = std::get_if<BindingStmt>(&statement->data)) {
+            validate_declared_name(binding->name, statement->span, true);
+        }
+    }
+}
+
+// The targets of `export "C"`, checked on the declarations as written, before
+// generic declarations are instantiated (a generic one is never in the
+// checked program) and before names are qualified: the C symbol is the name
+// as declared. The types, forms and symbols are the checker's.
+void validate_foreign_exports(Program& program) {
+    for (const auto& class_decl : program.classes) {
+        for (const auto& method : class_decl.methods) {
+            if (!method.foreign_export) continue;
+            frontend_error("FFI_EXPORT",
+                           method.is_constructor
+                               ? "export \"C\" applies only to top-level free functions; constructors cannot be exported."
+                               : "export \"C\" applies only to top-level free functions; methods cannot be exported.",
+                           method.foreign_export->span);
+        }
+    }
+    for (auto& function : program.functions) {
+        if (!function.foreign_export) continue;
+        if (!function.type_parameters.empty()) {
+            frontend_error("FFI_EXPORT",
+                           "Generic functions cannot be exported with the C ABI; export a concrete wrapper.",
+                           function.foreign_export->span);
+        }
+        if (function.foreign_export->abi != "C") {
+            frontend_error("FFI_EXPORT", "Only the \"C\" ABI can be exported.",
+                           function.foreign_export->span);
+        }
+        function.foreign_export->symbol = function.name;
+    }
+}
+
+// L3: a private class or enum is usable only inside its module, so no
+// public declaration may expose it to importers: the parameters or result of
+// a public function, a public field of a public class, a payload of a public
+// enum, or the type of a public constant (PRIVATE_DECLARATION).
+void reject_private_exposure(const Program& program) {
+    std::unordered_map<std::string, const char*> private_types;
+    for (const auto& declaration : program.classes)
+        if (declaration.is_private) private_types.emplace(declaration.name, "class");
+    for (const auto& declaration : program.enums)
+        if (declaration.is_private) private_types.emplace(declaration.name, "enum");
+    if (private_types.empty()) return;
+    const std::function<const std::string*(const TypeName&)> exposed =
+        [&](const TypeName& type) -> const std::string* {
+        if (const auto found = private_types.find(type.name); found != private_types.end())
+            return &found->first;
+        if (const auto dot = type.name.find('.'); dot != std::string::npos) {
+            // An enum variant spelled through its enum.
+            if (const auto found = private_types.find(type.name.substr(0, dot));
+                found != private_types.end())
+                return &found->first;
+        }
+        for (const auto& argument : type.arguments)
+            if (const auto* name = exposed(argument)) return name;
+        for (const auto& parameter : type.function_parameters)
+            if (const auto* name = exposed(parameter)) return name;
+        return nullptr;
+    };
+    const auto report = [&](const std::string& what, const std::string& type_name,
+                            SourceSpan span) {
+        frontend_error("PRIVATE_DECLARATION",
+                       what + " exposes private " + private_types.at(type_name) + " '" +
+                           type_name + "'.",
+                       span);
+    };
+    for (const auto& function : program.functions) {
+        if (function.is_private) continue;
+        const auto what = std::string("Public function '") + function.name + "'";
+        if (const auto* name = exposed(function.return_type))
+            report(what, *name, function.return_type.span);
+        for (const auto& parameter : function.parameters)
+            if (const auto* name = exposed(parameter.type)) report(what, *name, parameter.type.span);
+    }
+    for (const auto& declaration : program.classes) {
+        if (declaration.is_private) continue;
+        for (const auto& field : declaration.fields) {
+            if (field.is_private) continue;
+            if (const auto* name = exposed(field.type))
+                report("Public field '" + field.name + "' of class '" + declaration.name + "'",
+                       *name, field.type.span);
+        }
+    }
+    for (const auto& declaration : program.enums) {
+        if (declaration.is_private) continue;
+        for (const auto& variant : declaration.variants) {
+            if (!variant.payload) continue;
+            if (const auto* name = exposed(*variant.payload))
+                report("Public enum '" + declaration.name + "'", *name, variant.payload->span);
+        }
+    }
+    for (const auto& statement : program.statements) {
+        const auto* binding = std::get_if<BindingStmt>(&statement->data);
+        if (!binding || !binding->is_const || binding->is_private || binding->is_local) continue;
+        if (const auto* name = exposed(binding->declared_type))
+            report("Public constant '" + binding->name + "'", *name, binding->declared_type.span);
+    }
 }
 
 void resolve_local_prototypes(Program& program, std::string_view source) {
@@ -1423,9 +1837,27 @@ void resolve_local_prototypes(Program& program, std::string_view source) {
             frontend_error("PROTOTYPE_MISMATCH",
                            "Function prototype '" + name + "' must precede its definition.", prototype.span);
         }
+        if (prototype.is_private != definition.is_private) {
+            frontend_error("PROTOTYPE_MISMATCH",
+                           "Function prototype '" + name +
+                               "' and its definition must agree on 'private'.",
+                           definition.span);
+        }
+        if (prototype.mutation_marker != definition.mutation_marker) {
+            frontend_error("PROTOTYPE_MISMATCH",
+                           "Function prototype '" + name +
+                               "' and its definition must agree on the '.' marker.",
+                           definition.span);
+        }
+        if (prototype.foreign_export.has_value() != definition.foreign_export.has_value()) {
+            const auto& marked = prototype.foreign_export ? prototype : definition;
+            frontend_error("FFI_EXPORT",
+                           "A prototype and its definition must both carry export \"C\".",
+                           marked.foreign_export->span);
+        }
         if (prototype.type_parameters != definition.type_parameters ||
             prototype.type_constraints != definition.type_constraints ||
-            compact_type_spelling(prototype.return_type, source) != compact_type_spelling(definition.return_type, source) ||
+            canonical_signature_type(prototype.return_type, prototype) != canonical_signature_type(definition.return_type, definition) ||
             prototype.parameters.size() != definition.parameters.size()) {
             frontend_error("PROTOTYPE_MISMATCH",
                            "Function prototype and definition must have the same complete signature.",
@@ -1475,6 +1907,30 @@ void resolve_local_prototypes(Program& program, std::string_view source) {
                            "Class prototype and definition must have the same generic contract and appear in that order.",
                            definition.span);
         }
+        if (prototype.is_private != definition.is_private) {
+            frontend_error("PROTOTYPE_MISMATCH",
+                           "Class prototype '" + name + "' and its definition must agree on 'private'.",
+                           definition.span);
+        }
+        const auto& prototype_initializer = prototype.methods.front();
+        auto& definition_initializer = definition.methods.front();
+        if (prototype.self_name != definition.self_name ||
+            canonical_signature_type(prototype_initializer.return_type, prototype_initializer) !=
+                canonical_signature_type(definition_initializer.return_type, definition_initializer) ||
+            prototype_initializer.parameters.size() != definition_initializer.parameters.size()) {
+            frontend_error("PROTOTYPE_MISMATCH", "Class prototype and definition must have the same generation contract.", definition.span);
+        }
+        for (std::size_t i = 0; i < prototype_initializer.parameters.size(); ++i) {
+            auto& parameter = definition_initializer.parameters[i];
+            const auto& expected = prototype_initializer.parameters[i];
+            if (!same_parameter_contract(expected, parameter, source) || expected.is_local != parameter.is_local ||
+                canonical_signature_type(expected.type, prototype_initializer) !=
+                    canonical_signature_type(parameter.type, definition_initializer))
+                frontend_error("PROTOTYPE_MISMATCH", "Class prototype and definition argument storage contracts differ.", parameter.span);
+            if (parameter.default_value)
+                frontend_error("PROTOTYPE_MISMATCH", "Defaults belong on the class prototype only when a prototype exists.", parameter.default_value->span);
+            parameter.default_value = std::move(prototype.methods.front().parameters[i].default_value);
+        }
         definition.prototype_span = prototype.span;
         remove_classes[prototypes.front()] = true;
     }
@@ -1506,10 +1962,20 @@ public:
                 class_completion_[declaration.name] = 0;
                 continue;
             }
-            class_exposure_[declaration.name] =
-                declaration.prototype_span ? declaration.prototype_span->start.offset
-                                           : declaration.span.start.offset;
-            class_completion_[declaration.name] = declaration.span.start.offset;
+            const auto exposure = declaration.prototype_span
+                ? declaration.prototype_span->start.offset
+                : declaration.span.start.offset;
+            const auto [exposure_entry, exposure_inserted] =
+                class_exposure_.try_emplace(declaration.name, exposure);
+            if (!exposure_inserted) {
+                exposure_entry->second = std::min(exposure_entry->second, exposure);
+            }
+            const auto completion = declaration.span.start.offset;
+            const auto [completion_entry, completion_inserted] =
+                class_completion_.try_emplace(declaration.name, completion);
+            if (!completion_inserted) {
+                completion_entry->second = std::min(completion_entry->second, completion);
+            }
         }
     }
 
@@ -1595,6 +2061,7 @@ private:
 
     void check_expr(const Expr& expression, std::string_view current_function) const {
         if (const auto* name = std::get_if<NameExpr>(&expression.data)) {
+            if (name->this_qualifier || name->self_reference) return;
             if (const auto found = function_exposure_.find(name->name);
                 found != function_exposure_.end() && name->name != current_function &&
                 expression.span.start.offset < found->second) {
@@ -1620,6 +2087,15 @@ private:
                 check_type(type, expression.span.start.offset, false);
             for (const auto& argument : call->args)
                 if (argument.value) check_expr(*argument.value, current_function);
+            return;
+        }
+        if (const auto* node = std::get_if<TupleExpr>(&expression.data)) {
+            for (const auto& item : node->elements) check_expr(*item, current_function);
+            return;
+        }
+        if (const auto* node = std::get_if<ArrayComprehensionExpr>(&expression.data)) {
+            if (node->type) check_type(*node->type, node->binding_span.start.offset, false);
+            visit_array_comprehension(*node, [&](const Expr& child) { check_expr(child, current_function); });
             return;
         }
         if (const auto* node = std::get_if<ArrayExpr>(&expression.data)) {
@@ -1649,8 +2125,18 @@ private:
             check_expr(*node->right, current_function);
             return;
         }
+        if (const auto* node = std::get_if<ComparisonChainExpr>(&expression.data)) {
+            for (const auto& operand : node->operands) check_expr(*operand, current_function);
+            return;
+        }
         if (const auto* node = std::get_if<TryExpr>(&expression.data)) {
             check_expr(*node->value, current_function);
+            return;
+        }
+        if (const auto* node = std::get_if<IfExpr>(&expression.data)) {
+            for (const auto& condition : node->conditions) check_expr(*condition, current_function);
+            for (const auto& value : node->values) check_expr(*value, current_function);
+            check_expr(*node->otherwise, current_function);
             return;
         }
         if (const auto* node = std::get_if<StringTemplateExpr>(&expression.data)) {
@@ -1659,6 +2145,7 @@ private:
     }
 
     void check_stmt(const Stmt& statement, std::string_view current_function) const {
+        std::visit([&](const auto& node){if constexpr(requires {node.pattern;})if(node.pattern)visit_pattern(*node.pattern,[&](const Pattern& p){if(p.type && p.type->name!="auto")check_type(*p.type,p.span.start.offset,true);if(p.place)check_expr(*p.place,current_function);});},statement.data);
         if (const auto* node = std::get_if<BindingStmt>(&statement.data)) {
             if (node->declared_type.name != "auto")
                 check_type(node->declared_type, statement.span.start.offset, true);
@@ -1666,12 +2153,13 @@ private:
             return;
         }
         if (const auto* node = std::get_if<AssignStmt>(&statement.data)) {
-            check_expr(*node->target, current_function);
+            if(node->target)check_expr(*node->target, current_function);
             check_expr(*node->value, current_function);
             return;
         }
         if (const auto* node = std::get_if<RebindStmt>(&statement.data)) {
-            check_expr(*node->target, current_function);
+            if(node->place)check_expr(*node->place, current_function);
+            if(node->target)check_expr(*node->target, current_function);
             return;
         }
         if (const auto* node = std::get_if<ReturnStmt>(&statement.data)) {
@@ -1692,20 +2180,28 @@ private:
             for (const auto& child : node->body) check_stmt(*child, current_function);
             return;
         }
+        if (const auto* node = std::get_if<ParallelStmt>(&statement.data)) {
+            for (const auto& child : node->body) check_stmt(*child, current_function);
+            return;
+        }
         if (const auto* node = std::get_if<WhileStmt>(&statement.data)) {
             check_expr(*node->condition, current_function);
             for (const auto& child : node->body) check_stmt(*child, current_function);
             return;
         }
         if (const auto* node = std::get_if<ForStmt>(&statement.data)) {
-            check_expr(*node->iterable, current_function);
+            visit_for_header(*node,[&](const Expr& operand) { check_expr(operand,current_function); });
+            if(node->type) check_type(*node->type,node->type->span.start.offset,false);
+            for(const auto& binding:node->collections) if(binding.type) check_type(*binding.type,binding.type->span.start.offset,false);
+            if(node->pattern)visit_pattern(*node->pattern,[&](const Pattern& p){if(p.type)check_type(*p.type,p.span.start.offset,false);if(p.place)check_expr(*p.place,current_function);});
             for (const auto& child : node->body) check_stmt(*child, current_function);
             return;
         }
         if (const auto* node = std::get_if<MatchStmt>(&statement.data)) {
             check_expr(*node->value, current_function);
             for (const auto& match_case : node->cases) {
-                check_type(match_case.type, match_case.span.start.offset, false);
+                if(match_case.pattern)visit_pattern(*match_case.pattern,[&](const Pattern& p){if(p.type)check_type(*p.type,p.span.start.offset,false);});
+                else check_type(match_case.type, match_case.span.start.offset, false);
                 for (const auto& child : match_case.body) check_stmt(*child, current_function);
             }
         }
@@ -1719,13 +2215,15 @@ public:
         std::optional<std::string> root_source = std::nullopt,
         std::map<std::string, fs::path>* resolved_packages = nullptr,
         bool enforce_package_lock = true,
-        std::vector<CompilerExtensionRegistration>* compiler_extensions = nullptr)
+        std::vector<CompilerExtensionRegistration>* compiler_extensions = nullptr,
+        CompileInputs* inputs = nullptr)
         : cwd_(fs::absolute(std::move(cwd)).lexically_normal()),
           max_errors_(max_errors ? max_errors : 1),
           root_source_(std::move(root_source)),
           resolved_packages_(resolved_packages),
           enforce_package_lock_(enforce_package_lock),
-          compiler_extensions_(compiler_extensions) {}
+          compiler_extensions_(compiler_extensions),
+          inputs_(inputs) {}
 
     Program load(const fs::path& root) {
         Program merged;
@@ -1735,13 +2233,13 @@ public:
         merged.root_source_file = absolute_root.string();
         if (enforce_package_lock_) {
             try {
-                package_lock_ = read_package_lock(cwd_);
+                package_lock_ = read_package_lock(cwd_, inputs_);
             } catch (const std::exception& error) {
                 frontend_error("PACKAGE_LOCK", error.what());
             }
             package_lock_loaded_ = true;
         }
-        load_file(root, "", true, merged);
+        load_file(root, "", true, true, merged);
         if (package_lock_) {
             for (const auto& [name, _] : *package_lock_) {
                 if (!loaded_packages_.contains(name)) {
@@ -1766,6 +2264,7 @@ private:
     std::map<std::string, fs::path>* resolved_packages_{};
     bool enforce_package_lock_{true};
     std::vector<CompilerExtensionRegistration>* compiler_extensions_{};
+    CompileInputs* inputs_{};
     bool package_lock_loaded_{};
     std::optional<PackageLockEntries> package_lock_;
     std::unordered_map<std::string, std::string> package_hash_cache_;
@@ -1789,7 +2288,7 @@ private:
 
         std::optional<PackageManifest> manifest;
         try {
-            manifest = try_read_package_manifest(normalized.parent_path());
+            manifest = try_read_package_manifest(normalized.parent_path(), inputs_);
             if (manifest) {
                 if (manifest->name != name) {
                     frontend_error(
@@ -1833,7 +2332,7 @@ private:
                     std::optional<fs::path> dependency_main;
                     try {
                         dependency_main =
-                            resolve_installed_package_path(dependency_name);
+                            resolve_installed_package_path(dependency_name, inputs_);
                     } catch (const std::exception& error) {
                         frontend_error("PACKAGE_DEPENDENCY", error.what(), span);
                     }
@@ -1849,7 +2348,7 @@ private:
                     try {
                         const auto dependency_manifest =
                             try_read_package_manifest(
-                                dependency_main->parent_path());
+                                dependency_main->parent_path(), inputs_);
                         if (!dependency_manifest) {
                             frontend_error(
                                 "PACKAGE_DEPENDENCY",
@@ -1891,17 +2390,18 @@ private:
                 for (const auto& [extension_name, descriptor_path] :
                      package_compiler_extension_paths(
                          normalized.parent_path(), *manifest)) {
-                    const auto descriptor = read_text(descriptor_path);
+                    const auto descriptor = read_text(
+                        descriptor_path, InputFileKind::descriptor, inputs_);
                     const auto document = parse_toml_subset(
                         descriptor, descriptor_path.string());
                     const auto* extension_version =
                         document.find("extension", "version");
                     const auto* phase =
                         document.find("extension", "phase");
-                    if (!extension_version || *extension_version != "1") {
+                    if (!extension_version || *extension_version != "2") {
                         throw std::runtime_error(
                             "compiler extension descriptor requires "
-                            "[extension] version = 1: " +
+                            "[extension] version = 2: " +
                             descriptor_path.string());
                     }
                     if (!phase || *phase != "tensor-region") {
@@ -1909,6 +2409,19 @@ private:
                             "compiler extension descriptor has unsupported "
                             "phase; expected 'tensor-region': " +
                             descriptor_path.string());
+                    }
+                    for (const auto& [table_name, fields] : document.tables) {
+                        if (!table_name.starts_with("specialization.") &&
+                            !table_name.starts_with("backend.") &&
+                            !table_name.starts_with("memory.")) continue;
+                        const auto dtype = fields.find("dtype");
+                        if (dtype != fields.end() &&
+                            !abi::canonical_tensor_dtype_name(dtype->second)) {
+                            throw std::runtime_error(
+                                "compiler extension rule '" + table_name +
+                                "' requires a canonical tensor dtype, not '" +
+                                dtype->second + "': " + descriptor_path.string());
+                        }
                     }
                     std::unordered_set<std::string> operation_ids;
                     for (const auto& [table_name, fields] :
@@ -2067,6 +2580,8 @@ private:
                                 replacement->second + "': " +
                                 descriptor_path.string());
                         }
+                        if (const auto relation = fields.find("same_shape"); relation != fields.end())
+                            (void)shape_relation_parameters(relation->second);
                         if (const auto policy = fields.find("policy");
                             policy != fields.end()) {
                             if (policy->second.empty() ||
@@ -2101,7 +2616,7 @@ private:
 
         if (!package_lock_loaded_) {
             try {
-                package_lock_ = read_package_lock(cwd_);
+                package_lock_ = read_package_lock(cwd_, inputs_);
             } catch (const std::exception& error) {
                 frontend_error("PACKAGE_LOCK", error.what(), span);
             }
@@ -2161,6 +2676,7 @@ private:
             } catch (const std::exception& error) {
                 frontend_error("PACKAGE_LOCK", error.what(), span);
             }
+            if (inputs_) inputs_->record(PackageTreeInput{normalized, actual->second});
         }
 
         if (actual->second != expected->second.sha256) {
@@ -2188,7 +2704,8 @@ private:
         return (cwd_ / normalized).lexically_normal();
     }
 
-    Exports load_file(const fs::path& source_path, const std::string& ns, bool root, Program& merged) {
+    Exports load_file(const fs::path& source_path, const std::string& ns, bool root, bool user,
+                      Program& merged) {
         const auto absolute = source_path.is_absolute()
             ? source_path.lexically_normal()
             : (cwd_ / source_path).lexically_normal();
@@ -2202,7 +2719,7 @@ private:
             source = *root_source_;
         } else {
             try {
-                source = read_text(absolute);
+                source = read_text(absolute, InputFileKind::source, inputs_);
             } catch (const std::exception&) {
                 frontend_error("IMPORT_IO", "Cannot read imported module '" + absolute.string() + "'.");
             }
@@ -2210,6 +2727,10 @@ private:
 
         const auto source_file = absolute.string();
         merged.source_texts[source_file] = source;
+        if (user && std::find(merged.user_sources.begin(), merged.user_sources.end(),
+                              source_file) == merged.user_sources.end()) {
+            merged.user_sources.push_back(source_file);
+        }
 
         auto tokens = Lexer(source).scan();
         std::unordered_set<std::string> referenced_standard_modules;
@@ -2222,6 +2743,8 @@ private:
         }
         Parser parser(std::move(tokens), max_errors_);
         Program program = parser.parse();
+        validate_declared_names(program);
+        validate_foreign_exports(program);
         resolve_local_prototypes(program, source);
         SourceOrderValidator(program).run();
         for (auto& function : program.functions) function.source_file = source_file;
@@ -2258,8 +2781,11 @@ private:
                 if (std::holds_alternative<MainGuardStmt>(statement->data)) continue;
                 if (const auto* binding = std::get_if<BindingStmt>(&statement->data);
                     binding && binding->is_const && !binding->reference && binding->value) {
-                    (void)clone_package_constant_expression(
-                        *binding->value, binding->value->span);
+                    if (binding->literal_constant)
+                        (void)clone_literal_initializer(*binding->value, binding->value->span);
+                    else
+                        (void)clone_package_constant_expression(
+                            *binding->value, binding->value->span);
                     continue;
                 }
                 frontend_error(
@@ -2272,6 +2798,7 @@ private:
             if (auto* guard = std::get_if<MainGuardStmt>(&statement->data)) {
                 guard->active = root;
                 guard->source_file = source_file;
+                guard->module_namespace = ns;
             }
         }
 
@@ -2288,17 +2815,35 @@ private:
             }
         }
 
+        reject_private_exposure(program);
         Exports exports;
-        for (const auto& class_decl : program.classes)
+        for (const auto& class_decl : program.classes) {
+            if (class_decl.is_private) {
+                exports.private_names.insert(class_decl.name);
+                continue;
+            }
             insert_class_export(
                 exports, class_decl.name, qualify(ns, class_decl.name), class_decl.span);
-        for (const auto& enum_decl : program.enums)
+        }
+        for (const auto& enum_decl : program.enums) {
+            if (enum_decl.is_private) {
+                exports.private_names.insert(enum_decl.name);
+                continue;
+            }
             exports.enums[enum_decl.name] = qualify(ns, enum_decl.name);
-        for (const auto& name : local_functions) exports.functions[name] = qualify(ns, name);
+        }
+        for (const auto& function : program.functions) {
+            if (function.is_private) exports.private_names.insert(function.name);
+            else exports.functions[function.name] = qualify(ns, function.name);
+        }
         if (!root) {
             for (const auto& statement : program.statements) {
                 const auto* binding = std::get_if<BindingStmt>(&statement->data);
-                if (!binding || !binding->is_const || !binding->value) continue;
+                if (!binding || !binding->is_const || !binding->value || binding->is_local) continue;
+                if (binding->is_private) {
+                    exports.private_names.insert(binding->name);
+                    continue;
+                }
                 if (exports.classes.contains(binding->name) ||
                     exports.enums.contains(binding->name) ||
                     exports.functions.contains(binding->name) ||
@@ -2311,9 +2856,10 @@ private:
                             "' conflicts with another exported declaration.",
                         statement->span);
                 }
-                auto value = clone_package_constant_expression(
-                    *binding->value, binding->value->span);
-                if (binding->declared_type.name != "auto") {
+                auto value = binding->literal_constant
+                    ? literal_constant_use(binding->name, *binding->value, binding->value->span)
+                    : clone_package_constant_expression(*binding->value, binding->value->span);
+                if (!binding->literal_constant && binding->declared_type.name != "auto") {
                     value->contextual_default_type = binding->declared_type;
                 }
                 exports.constants.emplace(
@@ -2331,6 +2877,11 @@ private:
                 loaded_standard_declarations_.insert(module).second) {
                 auto declarations = standard_declarations(module);
                 for (auto& declaration : declarations) {
+                    // Language-owned declarations live in their standard
+                    // namespace, never in the user program's scope.
+                    declaration.module_namespace = "$std." + module;
+                    for (auto& method : declaration.methods)
+                        method.module_namespace = declaration.module_namespace;
                     merged.classes.push_back(std::move(declaration));
                 }
             }
@@ -2369,7 +2920,8 @@ private:
             if (!import_decl.local_path) {
                 std::optional<fs::path> package_path;
                 try {
-                    package_path = resolve_installed_package_path(import_decl.target);
+                    package_path =
+                        resolve_installed_package_path(import_decl.target, inputs_);
                 } catch (const std::invalid_argument& error) {
                     stack_.pop_back();
                     frontend_error("PACKAGE_IMPORT", error.what(), import_decl.span);
@@ -2384,7 +2936,7 @@ private:
                 }
                 record_package(import_decl.target, *package_path, import_decl.span);
                 const auto child_ns = qualify(ns, import_decl.alias);
-                auto child_exports = load_file(*package_path, child_ns, false, merged);
+                auto child_exports = load_file(*package_path, child_ns, false, false, merged);
                 if (import_decl.is_public) {
                     exports.namespaces[import_decl.alias] = std::make_shared<Exports>(child_exports);
                 }
@@ -2401,9 +2953,10 @@ private:
                 stack_.pop_back();
                 frontend_error("IMPORT_PATH", error.what(), import_decl.span);
             }
+            if (inputs_) inputs_->record(LocalImportInput{absolute, import_decl.target, target});
 
             const auto child_ns = qualify(ns, import_decl.alias);
-            auto child_exports = load_file(target, child_ns, false, merged);
+            auto child_exports = load_file(target, child_ns, false, user, merged);
             if (import_decl.is_public) {
                 exports.namespaces[import_decl.alias] = std::make_shared<Exports>(child_exports);
             }
@@ -2432,18 +2985,24 @@ private:
             for (auto& method : class_decl.methods) {
                 rename_function(
                     method, ns, local_classes, local_functions, imports, class_parameters);
+                method.module_namespace = ns;
             }
             class_decl.name = qualify(ns, class_decl.name);
+            class_decl.module_namespace = ns;
         }
 
         for (auto& function : program.functions) {
             rename_function(function, ns, local_classes, local_functions, imports);
             function.name = qualify(ns, function.name);
+            function.module_namespace = ns;
         }
 
-        for (auto& statement : program.statements) {
-            if (root || std::holds_alternative<MainGuardStmt>(statement->data))
-                rename_stmt(*statement, ns, local_classes, local_functions, imports, {});
+        {
+            LiteralConstantScope scope;
+            for (auto& statement : program.statements) {
+                if (root || std::holds_alternative<MainGuardStmt>(statement->data))
+                    rename_stmt(*statement, ns, local_classes, local_functions, imports, {});
+            }
         }
         if (!root) {
             // Keep imported declarations in the semantic program while marking their top-level
@@ -2486,54 +3045,207 @@ TypeName clone_type(const TypeName& source) {
     out.tensor_shape_expressions = source.tensor_shape_expressions;
     out.tensor_rank = source.tensor_rank;
     out.tensor_known_shape_prefix = source.tensor_known_shape_prefix;
+    out.brace_shape = source.brace_shape;
+    out.shape_axes = source.shape_axes;
     for (const auto& argument : source.arguments) out.arguments.push_back(clone_type(argument));
     for (const auto& parameter : source.function_parameters)
         out.function_parameters.push_back(clone_type(parameter));
     return out;
 }
 
-std::string canonical_extent_expression(const Expr& expression) {
+// The spelling of an extent expression in an identity key. A shape variable
+// of the type being keyed prints as `rename` maps it (its number or `_`); a
+// conversion nat(e) prints e, which is the value it captures.
+std::string canonical_extent_expression(
+    const Expr& expression,
+    const std::unordered_map<std::string, std::string>* rename = nullptr) {
     if (const auto* literal = std::get_if<IntegerExpr>(&expression.data)) {
         return std::to_string(literal->value);
     }
     if (const auto* name = std::get_if<NameExpr>(&expression.data)) {
-        return name->name;
+        if (!name->this_qualifier && !name->self_reference && rename) {
+            if (const auto found = rename->find(name->name); found != rename->end())
+                return found->second;
+        }
+        return name->this_qualifier ? "this." + name->name : name->name;
+    }
+    if (const auto* call = std::get_if<CallExpr>(&expression.data)) {
+        if (call->callee == "nat" && call->type_arguments.empty() && call->args.size() == 1 &&
+            !call->args[0].name && !call->args[0].writable) {
+            return canonical_extent_expression(*call->args[0].value, rename);
+        }
+        std::string out = call->callee + "(";
+        for (std::size_t i = 0; i < call->args.size(); ++i) {
+            if (i) out += ",";
+            out += canonical_extent_expression(*call->args[i].value, rename);
+        }
+        return out + ")";
     }
     if (const auto* unary = std::get_if<UnaryExpr>(&expression.data)) {
-        return unary->op + "(" + canonical_extent_expression(*unary->operand) + ")";
+        return unary->op + "(" + canonical_extent_expression(*unary->operand, rename) + ")";
     }
     if (const auto* binary = std::get_if<BinaryExpr>(&expression.data)) {
-        return "(" + canonical_extent_expression(*binary->left) + binary->op +
-               canonical_extent_expression(*binary->right) + ")";
+        return "(" + canonical_extent_expression(*binary->left, rename) + binary->op +
+               canonical_extent_expression(*binary->right, rename) + ")";
     }
     return "<extent>";
 }
 
-std::string canonical_type(const TypeName& type) {
-    std::string out = type.name;
+void count_extent_names(const Expr& expression, std::unordered_map<std::string, int>& counts) {
+    if (const auto* name = std::get_if<NameExpr>(&expression.data)) {
+        if (!name->this_qualifier && !name->self_reference) {
+            if (auto found = counts.find(name->name); found != counts.end()) ++found->second;
+        }
+    } else if (const auto* call = std::get_if<CallExpr>(&expression.data)) {
+        for (const auto& argument : call->args) count_extent_names(*argument.value, counts);
+    } else if (const auto* unary = std::get_if<UnaryExpr>(&expression.data)) {
+        count_extent_names(*unary->operand, counts);
+    } else if (const auto* binary = std::get_if<BinaryExpr>(&expression.data)) {
+        count_extent_names(*binary->left, counts);
+        count_extent_names(*binary->right, counts);
+    }
+}
+
+// The identity key of a brace shape (L17): constraints, never names. A
+// shape variable that occurs once constrains nothing and prints `_`, as an
+// unconstrained axis does; one that occurs more than once prints `$k` at
+// every occurrence, numbered by first occurrence; `nat N = EXPR` and an
+// unnamed expression print their expression; a bare existing value prints
+// its name. So {nat K, K} is <$0,$0>, {nat A, nat B} and {_, _} are <_,_>,
+// and a migrated {nat(n), 2} keeps the key <n,2> of today's <n, 2>.
+std::string brace_shape_key(const std::vector<ShapeAxis>& axes,
+                            const std::unordered_map<std::string, std::string>* shared = nullptr) {
+    std::unordered_map<std::string, int> counts;
+    for (const auto& axis : axes) {
+        if (axis.kind == ShapeAxisKind::Declare || axis.kind == ShapeAxisKind::DeclareEqual)
+            counts.emplace(axis.name, 0);
+    }
+    for (const auto& axis : axes) {
+        if (axis.kind == ShapeAxisKind::Declare || axis.kind == ShapeAxisKind::DeclareEqual) {
+            if (auto found = counts.find(axis.name); found != counts.end()) ++found->second;
+        }
+        if (axis.value) count_extent_names(*axis.value, counts);
+    }
+    std::unordered_map<std::string, std::string> rename;
+    int next = 0;
+    // Numbered by first occurrence: a declaration or a bare reference.
+    const auto number = [&](const std::string& name) {
+        if (rename.contains(name)) return;
+        const auto found = counts.find(name);
+        if (found == counts.end()) return;
+        rename[name] = found->second > 1 ? "$" + std::to_string(next++) : "_";
+    };
+    for (const auto& axis : axes) {
+        if (axis.kind == ShapeAxisKind::Declare || axis.kind == ShapeAxisKind::DeclareEqual ||
+            axis.kind == ShapeAxisKind::Bare) {
+            number(axis.name);
+        }
+    }
+    // A `nat N = EXPR` variable stands for its expression.
+    for (const auto& axis : axes) {
+        if (axis.kind == ShapeAxisKind::DeclareEqual && axis.value)
+            rename[axis.name] = canonical_extent_expression(*axis.value, &rename);
+    }
+    if (shared) rename = *shared;
+    std::string out = "<";
+    for (std::size_t i = 0; i < axes.size(); ++i) {
+        if (i) out += ",";
+        const auto& axis = axes[i];
+        switch (axis.kind) {
+            case ShapeAxisKind::Discard: out += "_"; break;
+            case ShapeAxisKind::Declare:
+            case ShapeAxisKind::DeclareEqual:
+            case ShapeAxisKind::Bare: {
+                const auto found = rename.find(axis.name);
+                out += found != rename.end() ? found->second : axis.name;
+                break;
+            }
+            case ShapeAxisKind::Unnamed:
+                out += axis.value ? canonical_extent_expression(*axis.value, &rename) : "_";
+                break;
+        }
+    }
+    return out + ">";
+}
+
+std::unordered_map<std::string, std::string> signature_shape_rename(const FunctionDecl& function) {
+    std::vector<ShapeAxis> axes;
+    const auto append = [&](const TypeName& type) {
+        if (type.brace_shape) axes.insert(axes.end(), type.shape_axes.begin(), type.shape_axes.end());
+    };
+    append(function.return_type);
+    for (const auto& parameter : function.parameters) append(parameter.type);
+    std::unordered_map<std::string, int> counts;
+    std::unordered_map<std::string, const Expr*> derived;
+    for (const auto& axis : axes) {
+        if (axis.kind == ShapeAxisKind::Declare || axis.kind == ShapeAxisKind::DeclareEqual) {
+            ++counts[axis.name];
+            if (axis.kind == ShapeAxisKind::DeclareEqual) derived[axis.name] = axis.value.get();
+        }
+    }
+    for (const auto& axis : axes) if (axis.value) count_extent_names(*axis.value, counts);
+    std::unordered_map<std::string, std::string> rename;
+    int next = 0;
+    const auto number = [&](const std::string& name) {
+        if (!rename.contains(name) && counts.contains(name))
+            rename[name] = counts.at(name) > 1 ? "$" + std::to_string(next++) : "_";
+    };
+    for (const auto& axis : axes) {
+        if (axis.kind == ShapeAxisKind::Declare || axis.kind == ShapeAxisKind::DeclareEqual ||
+            axis.kind == ShapeAxisKind::Bare) number(axis.name);
+    }
+    // Derived axes may reference declarations later in the signature.
+    std::unordered_map<std::string, int> state;
+    std::function<void(const std::string&)> derive = [&](const std::string& name) {
+        if (!derived.contains(name) || state[name] == 2) return;
+        if (state[name] == 1) return; // The checker reports the cycle.
+        state[name] = 1;
+        std::unordered_map<std::string, int> references;
+        for (const auto& [variable, unused] : derived) {
+            (void)unused; references.emplace(variable, 0);
+        }
+        count_extent_names(*derived.at(name), references);
+        for (const auto& [variable, count] : references) if (count) derive(variable);
+        rename[name] = canonical_extent_expression(*derived.at(name), &rename);
+        state[name] = 2;
+    };
+    for (const auto& axis : axes) if (derived.contains(axis.name)) derive(axis.name);
+    for (std::size_t p = 0; p < function.parameters.size(); ++p)
+        if (!rename.contains(function.parameters[p].name))
+            rename[function.parameters[p].name] = "#parameter" + std::to_string(p);
+    return rename;
+}
+
+std::string canonical_type(const TypeName& type,
+                           const std::unordered_map<std::string, std::string>* shapes = nullptr) {
+    // A built-in type is named by its canonical spelling, whichever alias
+    // the source used (int and int64 are one type).
+    std::string out(canonical_type_name(type.name));
     if (!type.arguments.empty()) {
         out += "<";
         for (std::size_t i = 0; i < type.arguments.size(); ++i) {
             if (i) out += ",";
-            out += canonical_type(type.arguments[i]);
+            out += canonical_type(type.arguments[i], shapes);
         }
         out += ">";
     }
-    if (type.name == "fn") {
+    if (type.name == "func") {
         out += "(";
         for (std::size_t i = 0; i < type.function_parameters.size(); ++i) {
             if (i) out += ",";
-            out += canonical_type(type.function_parameters[i]);
+            out += canonical_type(type.function_parameters[i], shapes);
         }
         out += ")";
     }
-    if (!type.tensor_shape_prefix.empty()) {
+    if (type.brace_shape) {
+        out += brace_shape_key(type.shape_axes, shapes);
+    } else if (!type.tensor_shape_prefix.empty()) {
         out += "<";
         for (std::size_t i = 0; i < type.tensor_shape_prefix.size(); ++i) {
             if (i) out += ",";
             if (i < type.tensor_shape_expressions.size() &&
                 type.tensor_shape_expressions[i]) {
-                out += canonical_extent_expression(*type.tensor_shape_expressions[i]);
+                out += canonical_extent_expression(*type.tensor_shape_expressions[i], shapes);
             } else {
                 const auto extent = type.tensor_shape_prefix[i];
                 out += extent < 0 ? "_" : std::to_string(extent);
@@ -2553,6 +3265,12 @@ std::string canonical_type(const TypeName& type) {
     return out;
 }
 
+std::string canonical_signature_type(const TypeName& type, const FunctionDecl& function) {
+    const auto shapes = signature_shape_rename(function);
+    return canonical_type(type, &shapes);
+}
+
+
 std::uint64_t fnv1a(std::string_view text) {
     std::uint64_t value = 1469598103934665603ULL;
     for (unsigned char c : text) {
@@ -2568,13 +3286,6 @@ std::string short_hash(std::string_view text) {
     return out.str();
 }
 
-std::string safe_name(std::string name) {
-    for (auto& c : name) {
-        if (!std::isalnum(static_cast<unsigned char>(c)) && c != '_') c = '_';
-    }
-    return name;
-}
-
 bool contains_parameter(const TypeName& type, const std::unordered_set<std::string>& parameters) {
     if (parameters.contains(type.name)) return true;
     return std::any_of(type.arguments.begin(), type.arguments.end(),
@@ -2584,47 +3295,80 @@ bool contains_parameter(const TypeName& type, const std::unordered_set<std::stri
 }
 
 bool standard_collection_key_type(const TypeName& type) {
+    if(type.name=="$tuple" && type.dimensions.empty())return std::all_of(type.arguments.begin(),type.arguments.end(),standard_collection_key_type);
     if (!type.arguments.empty() || !type.dimensions.empty()) return false;
-    return type.name == "int" || type.name == "int8" || type.name == "int16" ||
-           type.name == "int32" || type.name == "uint8" || type.name == "uint16" ||
-           type.name == "uint32" || type.name == "uint64" || type.name == "bigint" ||
-           type.name == "bool" ||
-           type.name == "string";
+    if (const auto* numeric = numeric_type_name(type.name)) {
+        return numeric->family == NumericFamily::Integer ||
+               numeric->family == NumericFamily::Natural;
+    }
+    return type.name == "bool" || type.name == "string";
 }
 
 std::optional<std::vector<StmtPtr>> standard_collection_hash_body(
     const TypeName& type,
     const std::string& parameter) {
+    if(type.name=="$tuple" && type.dimensions.empty()) {
+        std::ostringstream source;
+        const auto spelling=[&](const auto& self,const TypeName& t)->std::string {if(t.name!="$tuple")return t.name;std::string name="(";for(std::size_t i=0;i<t.arguments.size();++i){if(i)name+=", ";name+=self(self,t.arguments[i]);}return name+")";};
+        source<<"int64 __hash("<<spelling(spelling,type)<<" "<<parameter<<")\n";
+        std::size_t serial=0;
+        const auto hash=[&](const auto& self,const TypeName& t,const std::string& value)->std::string {
+            const auto id=std::to_string(serial++);const auto result="__tuple_hash_"+id;
+            if(t.name=="$tuple") {
+                std::vector<std::string> names;source<<"    (";for(std::size_t i=0;i<t.arguments.size();++i){if(i)source<<", ";names.push_back("__tuple_key_"+id+"_"+std::to_string(i));source<<spelling(spelling,t.arguments[i])<<" "<<names.back();}source<<") = "<<value<<"\n";
+                source<<"    int64 "<<result<<" = 0\n";
+                for(std::size_t i=0;i<t.arguments.size();++i){const auto child=self(self,t.arguments[i],names[i]);source<<"    "<<result<<" = ("<<result<<" * 1000003 + ("<<child<<" % 2147483647)) % 2147483647\n";}
+            } else if(t.name=="string") {
+                source<<"    int[] __tuple_units_"<<id<<" = "<<value<<".codepoints()\n    int64 "<<result<<" = 0\n    for auto __tuple_unit_"<<id<<" = __tuple_units_"<<id<<"[]\n        int64 __tuple_unit64_"<<id<<" = int64(__tuple_unit_"<<id<<")\n        "<<result<<" = ("<<result<<" * 131 + __tuple_unit64_"<<id<<") % 2147483647\n";
+            } else if(t.name=="bool") {
+                source<<"    int64 "<<result<<" = 0\n    if "<<value<<"\n        "<<result<<" = 1\n";
+            } else {
+                const auto* numeric=numeric_type_name(t.name);
+                if(numeric->kind==TypeKind::Int || numeric->kind==TypeKind::Nat){source<<"    int __tuple_mod_"<<id<<" = int("<<value<<") % 2147483647\n    if __tuple_mod_"<<id<<" < 0\n        __tuple_mod_"<<id<<" += 2147483647\n    int64 "<<result<<" = int64(__tuple_mod_"<<id<<")\n";}
+                else if(numeric->kind==TypeKind::Nat64)source<<"    int64 "<<result<<" = int64("<<value<<" AND nat64(9223372036854775807))\n";
+                else source<<"    int64 "<<result<<" = int64("<<value<<") AND 9223372036854775807\n";
+            }
+            return result;
+        };
+        const auto result=hash(hash,type,parameter);source<<"    return "<<result<<"\n";
+        Parser parser(Lexer(source.str()).scan(),20);auto program=parser.parse();if(program.functions.size()!=1)throw std::logic_error("invalid tuple hash specialization");return std::move(program.functions.front().body);
+    }
     if (!type.arguments.empty() || !type.dimensions.empty()) return std::nullopt;
 
     std::ostringstream source;
+    const auto* numeric = numeric_type_name(type.name);
+    const auto kind = numeric ? numeric->kind : TypeKind::Invalid;
+    // The hash of a key is an int64, as the synthesized collections keep
+    // their slots and hashes.
     if (type.name == "bool") {
-        source << "int __hash(bool " << parameter << ")\n"
+        source << "int64 __hash(bool " << parameter << ")\n"
                << "    if " << parameter << "\n"
                << "        return 1\n"
                << "    return 0\n";
     } else if (
-        type.name == "int" || type.name == "int8" ||
-        type.name == "int16" || type.name == "int32") {
-        source << "int __hash(" << type.name << " " << parameter << ")\n"
-               << "    int __value = int(" << parameter << ")\n"
+        kind == TypeKind::Int64 || kind == TypeKind::Int8 ||
+        kind == TypeKind::Int16 || kind == TypeKind::Int32) {
+        source << "int64 __hash(" << numeric->spelling << " " << parameter << ")\n"
+               << "    int64 __value = int64(" << parameter << ")\n"
                << "    return __value AND 9223372036854775807\n";
     } else if (
-        type.name == "uint8" || type.name == "uint16" ||
-        type.name == "uint32") {
-        source << "int __hash(" << type.name << " " << parameter << ")\n"
-               << "    return int(" << parameter << ")\n";
-    } else if (type.name == "uint64") {
-        source << "int __hash(uint64 " << parameter << ")\n"
-               << "    uint64 __result = " << parameter
-               << " AND uint64(9223372036854775807)\n"
-               << "    return int(__result)\n";
-    } else if (type.name == "bigint") {
-        source << "int __hash(bigint " << parameter << ")\n"
-               << "    bigint __result = " << parameter << " % bigint(2147483647)\n"
+        kind == TypeKind::Nat8 || kind == TypeKind::Nat16 ||
+        kind == TypeKind::Nat32) {
+        source << "int64 __hash(" << numeric->spelling << " " << parameter << ")\n"
+               << "    return int64(" << parameter << ")\n";
+    } else if (kind == TypeKind::Nat64) {
+        source << "int64 __hash(nat64 " << parameter << ")\n"
+               << "    nat64 __result = " << parameter
+               << " AND nat64(9223372036854775807)\n"
+               << "    int64 __code = int64(__result)\n"
+               << "    return __code\n";
+    } else if (kind == TypeKind::Int || kind == TypeKind::Nat) {
+        source << "int64 __hash(" << numeric->spelling << " " << parameter << ")\n"
+               << "    int __result = int(" << parameter << ") % 2147483647\n"
                << "    if __result < 0\n"
                << "        __result += 2147483647\n"
-               << "    return int(__result)\n";
+               << "    int64 __code = int64(__result)\n"
+               << "    return __code\n";
     } else {
         return std::nullopt;
     }
@@ -2677,7 +3421,10 @@ class GenericExpander {
 public:
     explicit GenericExpander(Program source) : source_(std::move(source)) {
         output_.root_source_file = source_.root_source_file;
+        output_.source_display_path = source_.source_display_path;
         output_.source_texts = source_.source_texts;
+        output_.user_sources = source_.user_sources;
+        output_.package_directories = source_.package_directories;
         validate_declarations();
 
         for (auto& class_decl : source_.classes) {
@@ -2723,7 +3470,7 @@ public:
         }
 
         for (const auto& [name, declaration] : concrete_functions_) {
-            function_return_types_[name] = materialize_type(declaration->return_type, {}, {});
+            function_return_types_[name] = materialize_type(declaration->return_type, {}, {}, true);
         }
         for (const auto& [name, declaration] : concrete_functions_) {
             output_.functions.push_back(clone_function(*declaration, {}, {}, ""));
@@ -2772,19 +3519,31 @@ private:
     }
 
     static bool scalar_integer_constraint_type(std::string_view name) {
-        return name == "int" || name == "int64" || name == "int8" ||
-               name == "int16" || name == "int32" || name == "uint8" ||
-               name == "uint16" || name == "uint32" || name == "uint64" ||
-               name == "bigint";
+        const auto* numeric = numeric_type_name(name);
+        return numeric && (numeric->family == NumericFamily::Integer ||
+                           numeric->family == NumericFamily::Natural);
     }
 
     static bool scalar_floating_constraint_type(std::string_view name) {
-        return name == "float" || name == "float64" || name == "float32";
+        const auto* numeric = numeric_type_name(name);
+        return numeric && numeric->family == NumericFamily::Real && numeric->width != 0;
     }
 
+    // Constraint membership follows the numeric-kind table. Complex
+    // values are numeric and equatable, while ordered excludes them.
     static bool scalar_numeric_constraint_type(std::string_view name) {
-        return scalar_integer_constraint_type(name) ||
-               scalar_floating_constraint_type(name) || name == "bigreal";
+        const auto* numeric = numeric_type_name(name);
+        return numeric != nullptr;
+    }
+
+    static bool scalar_ordered_constraint_type(std::string_view name) {
+        const auto* numeric=numeric_type_name(name);
+        return numeric&&numeric->family!=NumericFamily::Complex;
+    }
+
+    static bool scalar_complex_type(std::string_view name) {
+        const auto* numeric = numeric_type_name(name);
+        return numeric && numeric->family == NumericFamily::Complex;
     }
 
     const ClassDecl* constraint_class(std::string_view name) const {
@@ -2804,19 +3563,18 @@ private:
             type.array_depth = 0;
             return equatable_constraint_type(std::move(type), true, visiting);
         }
+        if(type.name=="$tuple" || type.name=="$union")return std::all_of(type.arguments.begin(),type.arguments.end(),[&](const TypeName& child){return child.name=="none" || equatable_constraint_type(clone_type(child),false,visiting);});
         if (!type.arguments.empty() || !type.function_parameters.empty() ||
-            type.name == "tensor" || type.name == "fn" ||
+            type.name == "tensor" || type.name == "func" ||
             type.name == "union") {
             return false;
         }
-        if (scalar_numeric_constraint_type(type.name) || type.name == "bool" ||
-            type.name == "string" || type.name == "bin" || type.name == "error") {
+        if (scalar_numeric_constraint_type(type.name) || scalar_complex_type(type.name) ||
+            type.name == "bool" || type.name == "string" || type.name == "bin" ||
+            type.name == "error") {
             return true;
         }
-        if (type.name == "$std.json.Value" ||
-            type.name == "$std.http.Response" ||
-            type.name == "$std.file.Handle" ||
-            type.name == "$std.atomic.Counter") {
+        if (is_unequatable_handle_without_autograd_target(type.name)) {
             return false;
         }
         const auto* declaration = constraint_class(type.name);
@@ -2844,7 +3602,8 @@ private:
         if (constraint == "numeric" || constraint == "ordered")
             return type.dimensions.empty() && type.arguments.empty() &&
                 type.function_parameters.empty() &&
-                scalar_numeric_constraint_type(type.name);
+                (constraint=="numeric"?scalar_numeric_constraint_type(type.name):
+                                       scalar_ordered_constraint_type(type.name));
         if (constraint == "equatable") {
             std::unordered_set<std::string> visiting;
             return equatable_constraint_type(std::move(type), false, visiting);
@@ -2852,10 +3611,16 @@ private:
         return false;
     }
 
+    // `additionally_reserved` holds names that a type parameter may not reuse.
+    // They are looked up qualified with `reserved_namespace`. For a top-level
+    // generic that is the declaration's own module namespace ("" for the root
+    // file), so a package generic is checked against its own module's
+    // functions, classes, and enums and never against the importing program.
     void validate_type_parameters(
         const std::vector<std::string>& parameters,
         const std::vector<std::string>& constraints,
         const std::unordered_set<std::string>& additionally_reserved,
+        const std::string& reserved_namespace,
         SourceSpan span) const {
         if (!constraints.empty() && constraints.size() != parameters.size()) {
             throw std::logic_error("Generic constraint metadata is misaligned.");
@@ -2869,7 +3634,8 @@ private:
                                span);
             }
             if (is_language_type_name(parameter) || is_reserved_value_name(parameter) ||
-                additionally_reserved.contains(parameter) || parameter == "main") {
+                additionally_reserved.contains(qualify(reserved_namespace, parameter)) ||
+                parameter == "main") {
                 frontend_error("SHADOWING",
                                "Generic type parameter name '" + parameter + "' is reserved or already visible.",
                                span);
@@ -2907,10 +3673,8 @@ private:
         }
     }
 
-    // `construct(...)` names the one constructor a class may declare. The
-    // bare spelling produces the enclosing class; `T | error construct(...)`
-    // is the one spelled form for a constructor that can fail. Optional call
-    // shapes belong in default parameters rather than constructor overloads.
+    // The class header supplies the generation signature. The synthetic
+    // initializer returns the class, optionally combined with error.
     void validate_constructor(
         const ClassDecl& class_decl, const FunctionDecl& method) const {
         TypeName self;
@@ -2928,29 +3692,27 @@ private:
         error_type.name = "error";
         fallible.arguments.push_back(std::move(error_type));
         const auto declared = canonical_type(method.return_type);
-        if (method.constructor_typed && declared == self_spelling) {
+        if (declared != self_spelling && declared != canonical_type(fallible)) {
             frontend_error("CONSTRUCTOR_SIGNATURE",
-                           "construct does not name its own type; write construct(...) for a constructor of '" +
-                               class_decl.name + "', or '" + self_spelling +
-                               " | error construct(...)' for one that can fail.",
-                           method.span);
-        }
-        if (method.constructor_typed && declared != canonical_type(fallible)) {
-            frontend_error("CONSTRUCTOR_SIGNATURE",
-                           "A constructor of '" + class_decl.name + "' is spelled construct(...) or '" +
-                               self_spelling + " | error construct(...)'; it cannot return '" + declared + "'.",
+                           "Generation of '" + class_decl.name + "' must return '" +
+                               self_spelling + "' or '" + self_spelling + " | error'.",
                            method.span);
         }
         if (!method.type_parameters.empty()) {
             frontend_error("CONSTRUCTOR_SIGNATURE",
-                           "Constructors take the class's type parameters and cannot declare their own.",
+                           "Class generation uses the type parameters of its class header.",
                            method.span);
         }
     }
 
+    std::unordered_map<std::string, std::string> signature_shape_names(const FunctionDecl& function) const {
+        return signature_shape_rename(function);
+    }
+
     std::string generic_parameter_shape(
         const TypeName& source,
-        const std::vector<std::string>& parameters) const {
+        const std::vector<std::string>& parameters,
+        const std::unordered_map<std::string, std::string>* shapes = nullptr) const {
         auto type = clone_type(source);
         const auto rewrite = [&](auto&& self, TypeName& current) -> void {
             for (std::size_t i = 0; i < parameters.size(); ++i) {
@@ -2963,15 +3725,16 @@ private:
             for (auto& parameter : current.function_parameters) self(self, parameter);
         };
         rewrite(rewrite, type);
-        return canonical_type(type);
+        return canonical_type(type, shapes);
     }
 
     std::string generic_call_shape(const FunctionDecl& function) const {
+        const auto shapes = signature_shape_names(function);
         std::string key;
         for (const auto& parameter : function.parameters) {
             if (!key.empty()) key += ";";
             if (parameter.is_const) key += "const ";
-            key += generic_parameter_shape(parameter.type, function.type_parameters);
+            key += generic_parameter_shape(parameter.type, function.type_parameters, &shapes);
             if (parameter.writable) key += "&";
             key += " " + parameter.name;
         }
@@ -2985,18 +3748,83 @@ private:
         const std::unordered_set<std::string> parameters{
             generic.type_parameters.begin(), generic.type_parameters.end()};
         Substitution inferred;
+        const auto generic_shapes = signature_shape_names(generic);
+        const auto concrete_shapes = signature_shape_names(concrete);
         for (std::size_t i = 0; i < generic.parameters.size(); ++i) {
             const auto& pattern = generic.parameters[i].type;
             const auto& actual = concrete.parameters[i].type;
             if (!infer_generic_pattern(pattern, actual, parameters, inferred)) {
                 return false;
             }
-            if (canonical_type(substitute_raw(pattern, inferred)) !=
-                canonical_type(actual)) {
+            if (canonical_type(substitute_raw(pattern, inferred), &generic_shapes) !=
+                canonical_type(actual, &concrete_shapes)) {
                 return false;
             }
         }
         return true;
+    }
+
+    bool concrete_outside_generic_primitive_domain(
+        const FunctionDecl& generic, const FunctionDecl& concrete) const {
+        if (generic.parameters.size() != concrete.parameters.size()) return false;
+        // This exception needs a closed primitive domain; nominal types,
+        // callbacks and other unproved containers retain exact-pattern rules.
+        const auto primitive_type = [&](auto&& self, const TypeName& type) -> bool {
+            if (!type.function_parameters.empty()) return false;
+            if (type.name == "tensor") {
+                return type.arguments.size() == 1 &&
+                    self(self, type.arguments.front());
+            }
+            return type.arguments.empty() &&
+                (numeric_type_name(type.name) || type.name == "bool" ||
+                 type.name == "string" || type.name == "bin" ||
+                 type.name == "error" || type.name == "none");
+        };
+        const std::unordered_set<std::string> parameters{
+            generic.type_parameters.begin(), generic.type_parameters.end()};
+        const auto generic_shapes = signature_shape_names(generic);
+        const auto concrete_shapes = signature_shape_names(concrete);
+        Substitution result_arguments;
+        std::unordered_set<std::string> conflicting_arguments;
+        bool outside = false;
+        for (std::size_t i = 0; i < generic.parameters.size(); ++i) {
+            const auto& pattern = generic.parameters[i].type;
+            const auto& actual = concrete.parameters[i].type;
+            if (!primitive_type(primitive_type, actual)) return false;
+            // Separate argument occurrences only for the disjointness proof.
+            // Keep each argument's wrapper, shape and internal relationship.
+            Substitution local;
+            if (!infer_generic_pattern(pattern, actual, parameters, local) ||
+                canonical_type(substitute_raw(pattern, local), &generic_shapes) !=
+                    canonical_type(actual, &concrete_shapes)) return false;
+            for (const auto& [name, type] : local) {
+                if (!primitive_type(primitive_type, type) ||
+                    !type.dimensions.empty() || !type.arguments.empty()) return false;
+                const auto found = std::find(generic.type_parameters.begin(),
+                    generic.type_parameters.end(), name);
+                if (found == generic.type_parameters.end()) return false;
+                const auto index = static_cast<std::size_t>(
+                    found - generic.type_parameters.begin());
+                const auto constraint = function_constraint(generic, index);
+                if (!constraint.empty() && known_generic_constraint(constraint) &&
+                    !satisfies_generic_constraint(clone_type(type), constraint)) outside = true;
+                if (!conflicting_arguments.contains(name)) {
+                    const auto previous = result_arguments.find(name);
+                    if (previous == result_arguments.end()) {
+                        result_arguments.emplace(name, clone_type(type));
+                    } else if (canonical_type(previous->second) != canonical_type(type)) {
+                        result_arguments.erase(previous);
+                        conflicting_arguments.insert(name);
+                    }
+                }
+            }
+        }
+        // A changed relationship cannot determine a result through an
+        // inconsistent variable. Preserve the result pattern as well.
+        return outside &&
+            canonical_type(substitute_raw(generic.return_type, result_arguments),
+                           &generic_shapes) ==
+                canonical_type(concrete.return_type, &concrete_shapes);
     }
 
     static std::string_view function_constraint(
@@ -3010,6 +3838,7 @@ private:
         std::string_view narrow, std::string_view broad) {
         if (narrow == broad) return false;
         if (broad.empty()) return !narrow.empty();
+        if(narrow=="ordered"&&broad=="numeric")return true;
         if ((narrow == "floating" || narrow == "integer") &&
             (broad == "numeric" || broad == "ordered")) {
             return true;
@@ -3050,11 +3879,12 @@ private:
     }
 
     std::string concrete_signature_key(const FunctionDecl& function) const {
+        const auto shapes = signature_shape_names(function);
         std::string key;
         for (const auto& parameter : function.parameters) {
             if (!key.empty()) key += ";";
             if (parameter.is_const) key += "const ";
-            key += canonical_type(parameter.type);
+            key += canonical_type(parameter.type, &shapes);
             if (parameter.writable) key += "&";
             key += " " + parameter.name;
         }
@@ -3062,6 +3892,7 @@ private:
     }
 
     std::string function_declaration_key(const FunctionDecl& function) const {
+        const auto shapes = signature_shape_names(function);
         std::string key = function.name + "(" + generic_call_shape(function) + ")";
         key += "<";
         for (std::size_t i = 0; i < function.type_parameters.size(); ++i) {
@@ -3069,7 +3900,7 @@ private:
             key += std::string(function_constraint(function, i));
         }
         key += ">->" + generic_parameter_shape(
-            function.return_type, function.type_parameters);
+            function.return_type, function.type_parameters, &shapes);
         return key;
     }
 
@@ -3088,6 +3919,15 @@ private:
                     "Function '" + name +
                         "' cannot be overloaded by argument count; use default parameters on one definition.",
                     function->span);
+            }
+            // L7: a specialization may change the implementation, never
+            // whether the operation changes existing state.
+            if (function->mutation_marker != reference.mutation_marker) {
+                frontend_error("MUTATION_MARKER",
+                               "Members of a specialization family must agree on the '.' marker: '" +
+                                   name + "' is declared '." + name + "' in one member and '" + name +
+                                   "' in another.",
+                               function->span);
             }
             for (std::size_t i = 0; i < arity; ++i) {
                 if (function->parameters[i].name != reference.parameters[i].name ||
@@ -3128,7 +3968,11 @@ private:
         }
 
         for (const auto* function : concretes) {
-            if (!concrete_matches_generic_pattern(*generics.front(), *function)) {
+            if (!concrete_matches_generic_pattern(*generics.front(), *function) &&
+                !std::all_of(generics.begin(), generics.end(),
+                    [&](const FunctionDecl* generic) {
+                        return concrete_outside_generic_primitive_domain(*generic, *function);
+                    })) {
                 frontend_error(
                     "DUPLICATE_NAME",
                     "Concrete specialization of '" + name +
@@ -3220,19 +4064,20 @@ private:
         for (const auto& class_decl : source_.classes) {
             validate_type_parameters(
                 class_decl.type_parameters, class_decl.type_constraints,
-                declaration_names, class_decl.span);
+                declaration_names, class_decl.module_namespace, class_decl.span);
             const std::unordered_set<std::string> class_parameters{
                 class_decl.type_parameters.begin(), class_decl.type_parameters.end()};
-            const bool standard_generated =
-                class_decl.name.rfind("$std.", 0) == 0 ||
-                class_decl.name.rfind("__quidra_gc__std_", 0) == 0;
             // Imported package classes are namespace-scoped. Their members are
             // never introduced as bare names in the importing program, so a
             // package can preserve natural qualified member APIs
             // without weakening reservation for root user declarations.
             const bool namespace_scoped =
-                standard_generated ||
+                class_decl.standard_library ||
                 class_decl.name.find('.') != std::string::npos;
+            if (!class_decl.self_name.empty() &&
+                (is_reserved_value_name(class_decl.self_name) || declaration_names.contains(class_decl.self_name) ||
+                 class_parameters.contains(class_decl.self_name)))
+                frontend_error("SHADOWING", "The instance name conflicts with an existing declaration or reserved name.", class_decl.self_span.value_or(class_decl.span));
             std::unordered_set<std::string> member_names;
             for (const auto& field : class_decl.fields) {
                 if (!namespace_scoped && is_reserved_value_name(field.name)) {
@@ -3255,7 +4100,7 @@ private:
                         frontend_error(
                             "DUPLICATE_NAME",
                             "Class '" + class_decl.name +
-                                "' declares more than one construct(...); use default parameters on a single constructor.",
+                                "' has more than one generation initializer.",
                             method.span);
                     }
                     constructor_seen = true;
@@ -3279,7 +4124,7 @@ private:
                 method_families[method.name].push_back(&method);
                 validate_type_parameters(
                     method.type_parameters, method.type_constraints,
-                    class_parameters, method.span);
+                    class_parameters, std::string{}, method.span);
             }
             for (const auto& [name, family] : method_families) {
                 if (family.size() > 1) validate_function_family(name, family);
@@ -3289,7 +4134,7 @@ private:
         for (const auto& function : source_.functions) {
             validate_type_parameters(
                 function.type_parameters, function.type_constraints,
-                declaration_names, function.span);
+                declaration_names, function.module_namespace, function.span);
         }
         for (const auto& [name, family] : function_families) {
             if (family.size() > 1) validate_function_family(name, family);
@@ -3306,6 +4151,7 @@ private:
     std::unordered_map<std::string, FunctionDecl*> concrete_functions_;
 
     std::unordered_map<std::string, std::string> class_instances_;
+    std::unordered_map<std::string, TypeName> class_instance_types_;
     std::unordered_map<std::string, std::string> function_instances_;
     std::unordered_map<std::string, std::string> concrete_specialization_instances_;
     std::unordered_map<std::string, std::size_t> class_index_;
@@ -3323,6 +4169,8 @@ private:
     std::unordered_map<std::string, TypeName> function_return_types_;
     std::unordered_map<std::string, std::unordered_map<std::string, TypeName>> method_return_types_;
     std::unordered_map<std::string, TypeName> type_environment_;
+    std::unordered_map<const Expr*, TypeName> comprehension_types_;
+    std::optional<TypeName> traversal_expected_result_;
 
     static std::unordered_set<std::string> set_of(const std::vector<std::string>& values) {
         return {values.begin(), values.end()};
@@ -3337,8 +4185,8 @@ private:
         return key + ">";
     }
 
-    std::string mangle(const std::string& prefix, const std::string& name, const std::string& key) const {
-        return "__quidra_" + prefix + "_" + safe_name(name) + "_" + short_hash(key);
+    std::string mangle(std::string_view kind, const std::string& name, const std::string& key) const {
+        return abi::generic_instance_prefix(kind, name) + short_hash(key);
     }
 
     bool class_has_generic_method(const std::string& class_name, const std::string& method) const {
@@ -3380,13 +4228,15 @@ private:
         auto& signature = member.signature;
         signature.name = source.name;
         signature.source_file = source.source_file;
+        signature.module_namespace = source.module_namespace;
         signature.span = source.span;
         signature.is_private = source.is_private;
+        signature.mutation_marker = source.mutation_marker;
         signature.type_parameters = source.type_parameters;
         signature.type_constraints = source.type_constraints;
         const auto deferred = set_of(source.type_parameters);
         signature.return_type =
-            materialize_type(source.return_type, class_substitution, deferred);
+            materialize_type(source.return_type, class_substitution, deferred,true);
         for (const auto& parameter : source.parameters) {
             Parameter copy;
             copy.name = parameter.name;
@@ -3395,6 +4245,7 @@ private:
             copy.writable = parameter.writable;
             copy.span = parameter.span;
             copy.is_const = parameter.is_const;
+            copy.is_local = parameter.is_local;
             if (parameter.default_value) {
                 copy.default_value = standard_name("$method_family_default");
             }
@@ -3457,7 +4308,8 @@ private:
         // determines their representation. Generic inference must not invent
         // default int/float types for them.
         if (std::holds_alternative<IntegerExpr>(expression.data) ||
-            std::holds_alternative<FloatExpr>(expression.data)) {
+            std::holds_alternative<RealLiteralExpr>(expression.data) ||
+            std::holds_alternative<LiteralConstantExpr>(expression.data)) {
             return std::nullopt;
         }
         if (std::holds_alternative<StringExpr>(expression.data) ||
@@ -3465,11 +4317,12 @@ private:
         if (std::holds_alternative<BoolExpr>(expression.data)) return simple_type("bool");
 
         if (const auto* name = std::get_if<NameExpr>(&expression.data)) {
+            if (name->self_reference && !current_class.empty()) return simple_type(current_class);
             if (const auto local = type_environment_.find(name->name);
-                local != type_environment_.end()) {
+                !name->this_qualifier && !name->self_reference && local != type_environment_.end()) {
                 return clone_type(local->second);
             }
-            if (!current_class.empty()) {
+            if (name->this_qualifier && !current_class.empty()) {
                 if (const auto* field = output_field(current_class, name->name)) {
                     return clone_type(field->type);
                 }
@@ -3477,6 +4330,21 @@ private:
             return std::nullopt;
         }
 
+        if(const auto* tuple=std::get_if<TupleExpr>(&expression.data)) {
+            TypeName type;type.name="$tuple";type.span=expression.span;
+            for(const auto& element:tuple->elements) {
+                auto inferred=infer_expression_type(*element,current_class);
+                if(!inferred) return std::nullopt;
+                type.arguments.push_back(std::move(*inferred));
+            }
+            return type;
+        }
+
+        if (std::holds_alternative<ArrayComprehensionExpr>(expression.data)) {
+            if (const auto type = comprehension_types_.find(&expression); type != comprehension_types_.end())
+                return clone_type(type->second);
+            return std::nullopt;
+        }
         if (const auto* array = std::get_if<ArrayExpr>(&expression.data)) {
             if (array->elements.empty()) return std::nullopt;
             const auto first = infer_expression_type(*array->elements.front(), current_class);
@@ -3507,7 +4375,7 @@ private:
             auto right = infer_expression_type(*binary->right, current_class);
             const auto numeric_literal = [](const Expr& value) {
                 return std::holds_alternative<IntegerExpr>(value.data) ||
-                       std::holds_alternative<FloatExpr>(value.data);
+                       std::holds_alternative<RealLiteralExpr>(value.data);
             };
             const auto with_span = [&](TypeName value) {
                 value.span = expression.span;
@@ -3549,7 +4417,7 @@ private:
                 result.arguments.push_back(clone_type(call->type_arguments.front()));
                 const auto shape =
                     infer_expression_type(*call->args[0].value, current_class);
-                if (shape && shape->name == "int" &&
+                if (shape && names_shape_element(shape->name) &&
                     shape->dimensions.size() == 1 &&
                     shape->dimensions.front() >= 0) {
                     result.tensor_rank = shape->dimensions.front();
@@ -3557,18 +4425,8 @@ private:
                 result.span = expression.span;
                 return result;
             }
-            static const std::unordered_map<std::string, std::string>
-                numeric_cast_result_types{
-                    {"int8", "int8"}, {"int16", "int16"}, {"int32", "int32"},
-                    {"int", "int"}, {"int64", "int"},
-                    {"uint8", "uint8"}, {"uint16", "uint16"},
-                    {"uint32", "uint32"}, {"uint64", "uint64"},
-                    {"bigint", "bigint"},
-                    {"float32", "float32"}, {"float", "float"}, {"float64", "float"},
-                    {"bigreal", "bigreal"}};
-            if (const auto scalar = numeric_cast_result_types.find(call->callee);
-                scalar != numeric_cast_result_types.end()) {
-                return simple_type(scalar->second);
+            if (const auto* numeric = numeric_type_name(call->callee)) {
+                return simple_type(std::string(numeric->spelling));
             }
             if (class_index_.contains(call->callee)) {
                 TypeName result;
@@ -3603,7 +4461,7 @@ private:
         if (const auto* index = std::get_if<IndexExpr>(&expression.data)) {
             auto base = infer_expression_type(*index->base, current_class);
             if (!base) return std::nullopt;
-            if (base->name == "tensor") {
+            if (base->name == "tensor" && base->dimensions.empty()) {
                 if (base->tensor_rank) {
                     if (index->items.size() > static_cast<std::size_t>(*base->tensor_rank)) {
                         return std::nullopt;
@@ -3614,7 +4472,7 @@ private:
                     }
                     base->tensor_rank = rank;
                 }
-                const auto project_prefix = [&](std::vector<long long>& prefix) {
+                const auto project_prefix = [&](auto& prefix) {
                     std::size_t axis = 0;
                     for (const auto& item : index->items) {
                         if (!item.slice) {
@@ -3658,7 +4516,7 @@ private:
                 }
                 if (call->method == "shape" && call->args.empty()) {
                     TypeName result;
-                    result.name = "int";
+                    result.name = "nat";
                     result.dimensions.push_back(receiver->tensor_rank.value_or(-1));
                     result.array_depth = 1;
                     result.span = expression.span;
@@ -3671,7 +4529,7 @@ private:
                     result.tensor_known_shape_prefix.clear();
                     const auto shape =
                         infer_expression_type(*call->args[0].value, current_class);
-                    if (shape && shape->name == "int" &&
+                    if (shape && names_shape_element(shape->name) &&
                         shape->dimensions.size() == 1 &&
                         shape->dimensions.front() >= 0) {
                         result.tensor_rank = shape->dimensions.front();
@@ -3697,7 +4555,7 @@ private:
                     result.tensor_known_shape_prefix.clear();
                     const auto shape =
                         infer_expression_type(*call->args[1].value, current_class);
-                    if (shape && shape->name == "int" &&
+                    if (shape && names_shape_element(shape->name) &&
                         shape->dimensions.size() == 1 &&
                         shape->dimensions.front() >= 0) {
                         result.tensor_rank = shape->dimensions.front();
@@ -3712,7 +4570,7 @@ private:
                     result.tensor_known_shape_prefix.clear();
                     const auto shape =
                         infer_expression_type(*call->args[1].value, current_class);
-                    if (shape && shape->name == "int" &&
+                    if (shape && names_shape_element(shape->name) &&
                         shape->dimensions.size() == 1 &&
                         shape->dimensions.front() >= 0) {
                         result.tensor_rank = shape->dimensions.front();
@@ -3746,6 +4604,33 @@ private:
             return infer_expression_type(*try_expr->value, current_class);
         }
 
+        if (const auto* node = std::get_if<IfExpr>(&expression.data)) {
+            // The one type of the branches; a numeric literal branch takes it.
+            std::optional<TypeName> result;
+            const auto consider = [&](const Expr& value) {
+                const Expr* literal = &value;
+                if (const auto* unary = std::get_if<UnaryExpr>(&value.data);
+                    unary && unary->op == "-") {
+                    literal = unary->operand.get();
+                }
+                if (std::holds_alternative<IntegerExpr>(literal->data) ||
+                    std::holds_alternative<RealLiteralExpr>(literal->data)) {
+                    return true;
+                }
+                auto current = infer_expression_type(value, current_class);
+                if (!current) return false;
+                if (result) return canonical_type(*current) == canonical_type(*result);
+                result = std::move(current);
+                return true;
+            };
+            for (const auto& value : node->values) {
+                if (!consider(*value)) return std::nullopt;
+            }
+            if (!consider(*node->otherwise)) return std::nullopt;
+            if (result) result->span = expression.span;
+            return result;
+        }
+
         return std::nullopt;
     }
 
@@ -3777,7 +4662,23 @@ private:
             return true;
         }
 
-        if (pattern.name != actual.name ||
+        // Recover only a class instance registered from checked type arguments.
+        // A single generic parameter above still binds the concrete instance.
+        if (const auto origin = class_instance_types_.find(actual.name);
+            origin != class_instance_types_.end() &&
+            canonical_type_name(pattern.name) == canonical_type_name(origin->second.name)) {
+            const auto registered = class_instances_.find(
+                instance_key(origin->second.name, origin->second.arguments));
+            if (registered != class_instances_.end() && registered->second == actual.name) {
+                auto original = clone_type(origin->second);
+                original.dimensions = actual.dimensions;
+                original.array_depth = actual.array_depth;
+                original.span = actual.span;
+                return infer_generic_pattern(pattern, original, parameters, inferred);
+            }
+        }
+
+        if (canonical_type_name(pattern.name) != canonical_type_name(actual.name) ||
             pattern.arguments.size() != actual.arguments.size() ||
             pattern.function_parameters.size() != actual.function_parameters.size() ||
             pattern.dimensions.size() != actual.dimensions.size()) {
@@ -3795,7 +4696,7 @@ private:
                 if (required < 0) continue;
                 std::optional<long long> actual_extent;
                 if (axis < actual.tensor_known_shape_prefix.size()) {
-                    actual_extent = actual.tensor_known_shape_prefix[axis];
+                    actual_extent = actual.tensor_known_shape_prefix[axis].known();
                 } else if (axis < actual.tensor_shape_prefix.size() &&
                            actual.tensor_shape_prefix[axis] >= 0) {
                     actual_extent = actual.tensor_shape_prefix[axis];
@@ -3827,17 +4728,30 @@ private:
         const FunctionDecl& templ,
         const std::vector<CallArg>& args,
         const std::string& current_class) const {
-        const std::unordered_set<std::string> parameters{
-            templ.type_parameters.begin(), templ.type_parameters.end()};
+        return infer_type_arguments(
+            templ.type_parameters, templ.type_parameters, templ.parameters, args, current_class,&templ.return_type);
+    }
+
+    // Solves `solved` (the type parameters the call's arguments may bind)
+    // against the parameter types, and returns the arguments of `wanted`, a
+    // subset of `solved`, in order; nullopt when an argument does not match
+    // or a wanted parameter stays undetermined.
+    std::optional<std::vector<TypeName>> infer_type_arguments(
+        const std::vector<std::string>& solved,
+        const std::vector<std::string>& wanted,
+        const std::vector<Parameter>& callee_parameters,
+        const std::vector<CallArg>& args,
+        const std::string& current_class,const TypeName* result_pattern=nullptr) const {
+        const std::unordered_set<std::string> parameters{solved.begin(), solved.end()};
         Substitution inferred;
-        std::vector<bool> filled(templ.parameters.size(), false);
+        std::vector<bool> filled(callee_parameters.size(), false);
         std::size_t positional = 0;
 
         for (const auto& argument : args) {
-            std::size_t index = templ.parameters.size();
+            std::size_t index = callee_parameters.size();
             if (argument.name) {
-                for (std::size_t i = 0; i < templ.parameters.size(); ++i) {
-                    if (templ.parameters[i].name == *argument.name) {
+                for (std::size_t i = 0; i < callee_parameters.size(); ++i) {
+                    if (callee_parameters[i].name == *argument.name) {
                         index = i;
                         break;
                     }
@@ -3846,25 +4760,53 @@ private:
                 while (positional < filled.size() && filled[positional]) ++positional;
                 index = positional++;
             }
-            if (index >= templ.parameters.size() || filled[index]) return std::nullopt;
+            if (index >= callee_parameters.size() || filled[index]) return std::nullopt;
             filled[index] = true;
 
             const auto actual = infer_expression_type(*argument.value, current_class);
             if (!actual) continue;
             if (!infer_generic_pattern(
-                    templ.parameters[index].type, *actual, parameters, inferred)) {
+                    callee_parameters[index].type, *actual, parameters, inferred)) {
                 return std::nullopt;
             }
         }
 
+        if(result_pattern&&result_pattern->name=="$std.reflect.Each"&&traversal_expected_result_) {
+            if(!infer_generic_pattern(*result_pattern,*traversal_expected_result_,parameters,inferred))return std::nullopt;
+        }
         std::vector<TypeName> result;
-        result.reserve(templ.type_parameters.size());
-        for (const auto& parameter : templ.type_parameters) {
+        result.reserve(wanted.size());
+        for (const auto& parameter : wanted) {
             const auto found = inferred.find(parameter);
             if (found == inferred.end()) return std::nullopt;
             result.push_back(clone_type(found->second));
         }
         return result;
+    }
+
+    // `Box(...)` of a generic class without type arguments: the class's type
+    // arguments follow from its constructor's parameter types against the
+    // call's arguments, with the rules of generic functions. A constructor
+    // that declares type parameters of its own takes part in the same solve;
+    // its own arguments are selected afterwards on the instance. A class
+    // without a constructor has nothing to infer from (nullptr result).
+    const FunctionDecl* class_template_constructor(const ClassDecl& templ) const {
+        for (const auto& method : templ.methods) {
+            if (method.is_constructor) return &method;
+        }
+        return nullptr;
+    }
+
+    std::optional<std::vector<TypeName>> infer_class_arguments(
+        const ClassDecl& templ,
+        const FunctionDecl& constructor,
+        const std::vector<CallArg>& args,
+        const std::string& current_class) const {
+        auto solved = templ.type_parameters;
+        solved.insert(solved.end(), constructor.type_parameters.begin(),
+                      constructor.type_parameters.end());
+        return infer_type_arguments(
+            solved, templ.type_parameters, constructor.parameters, args, current_class);
     }
 
     std::optional<std::vector<std::size_t>> bind_family_arguments(
@@ -3922,7 +4864,7 @@ private:
                 const auto contextual_numeric_literal =
                     [&](const auto& self, const Expr& value) -> bool {
                         if (std::holds_alternative<IntegerExpr>(value.data) ||
-                            std::holds_alternative<FloatExpr>(value.data)) {
+                            std::holds_alternative<RealLiteralExpr>(value.data)) {
                             return true;
                         }
                         if (const auto* unary =
@@ -3996,7 +4938,7 @@ private:
         const auto concrete_name = mangle("fs", function.name, key);
         concrete_specialization_instances_[key] = concrete_name;
         function_return_types_[concrete_name] =
-            materialize_type(function.return_type, {}, {});
+            materialize_type(function.return_type, {}, {},true);
         auto concrete = clone_function(function, {}, {}, "");
         concrete.name = concrete_name;
         output_.functions.push_back(std::move(concrete));
@@ -4090,10 +5032,12 @@ private:
     TypeName materialize_type(
         const TypeName& source,
         const Substitution& substitution,
-        const std::unordered_set<std::string>& deferred) {
+        const std::unordered_set<std::string>& deferred,bool traversal_result=false) {
         auto type = substitute_raw(source, substitution);
 
-        if (type.name == "union") {
+        if(type.name=="$std.reflect.Each"&&(!traversal_result||!type.dimensions.empty()))
+            frontend_error("TRAVERSAL","reflect.Each<E> is only a traversal function's complete result type.",type.span);
+        if (type.name == "union" || type.name == "$tuple" || type.name == "$std.reflect.Each") {
             for (auto& argument : type.arguments) {
                 argument = materialize_type(argument, {}, deferred);
             }
@@ -4117,7 +5061,7 @@ private:
                 }
                 return type;
             }
-            if (type.name == "fn") {
+            if (type.name == "func") {
                 if (type.arguments.size() != 1) {
                     frontend_error("GENERIC_ARITY", "fn requires exactly one result type.", type.span);
                 }
@@ -4179,6 +5123,52 @@ private:
         return result;
     }
 
+    static bool is_relational_operator(const std::string& op) {
+        return op == "<" || op == "<=" || op == ">" || op == ">=";
+    }
+
+    // L14: `a < b < c > (d)` reads as `a < b<c>(d)`, a generic call of `b`,
+    // because a type-argument list is tried before the comparison. When `b`
+    // names no function, class or generic declaration it is a value, so the
+    // source is a chain whose last '>' turns its direction, which is
+    // CHAINED_COMPARISON at the '<' before the callee rather than a
+    // generic-call error.
+    void reject_misread_generic_call(
+        const Expr& operand, const SourceSpan& op_span, const std::string& current_class) const {
+        const auto* call = std::get_if<CallExpr>(&operand.data);
+        if (!call || call->type_arguments.empty()) return;
+        const auto& name = call->callee;
+        if (name == "tensor" || name.starts_with("$std.") || class_templates_.contains(name) ||
+            concrete_classes_.contains(name) || function_templates_.contains(name) ||
+            concrete_functions_.contains(name) || function_families_.contains(name) ||
+            specialization_families_.contains(name) ||
+            (!current_class.empty() &&
+             (class_has_generic_method(current_class, name) ||
+              class_has_method_specialization_family(current_class, name))))
+            return;
+        std::string hint = "parenthesize the comparison that '>' starts";
+        if (call->type_arguments.size() == 1 && call->args.size() == 1 &&
+            call->type_arguments[0].arguments.empty() &&
+            call->type_arguments[0].array_depth == 0 && !call->args[0].name &&
+            !call->args[0].writable) {
+            const auto& value = *call->args[0].value;
+            std::optional<std::string> spelled;
+            if (const auto* argument = std::get_if<NameExpr>(&value.data);
+                argument && !argument->this_qualifier && !argument->self_reference)
+                spelled = argument->name;
+            else if (const auto* literal = std::get_if<IntegerExpr>(&value.data))
+                spelled = literal->spelling.empty() ? std::to_string(literal->value)
+                                                    : literal->spelling;
+            if (spelled)
+                hint = "write '(" + call->type_arguments[0].name + " > " + *spelled +
+                       ")' if '>' starts a new comparison";
+        }
+        frontend_error("CHAINED_COMPARISON",
+                       "A comparison chain must keep one direction: '<' and '<=', or '>' and "
+                       "'>=', or only '=='; " + hint + ".",
+                       op_span.end.offset > op_span.start.offset ? op_span : operand.span);
+    }
+
     ExprPtr clone_expr(
         const Expr& source,
         const Substitution& substitution,
@@ -4191,9 +5181,14 @@ private:
         if (source.contextual_default_type) {
             out->contextual_default_type = clone_type(*source.contextual_default_type);
         }
+        out->constant_name = source.constant_name;
 
         if (const auto* node = std::get_if<IntegerExpr>(&source.data)) out->data = *node;
-        else if (const auto* node = std::get_if<FloatExpr>(&source.data)) out->data = *node;
+        else if (const auto* node = std::get_if<RealLiteralExpr>(&source.data)) out->data = *node;
+        else if (const auto* node = std::get_if<ImaginaryLiteralExpr>(&source.data)) out->data = *node;
+        else if (const auto* node = std::get_if<LiteralConstantExpr>(&source.data))
+            out->data = LiteralConstantExpr{
+                node->name, clone_expr(*node->value, substitution, deferred, current_class), node->origin};
         else if (const auto* node = std::get_if<StringExpr>(&source.data)) out->data = *node;
         else if (const auto* node = std::get_if<BoolExpr>(&source.data)) out->data = *node;
         else if (std::holds_alternative<VoidExpr>(source.data)) out->data = VoidExpr{};
@@ -4207,6 +5202,38 @@ private:
                 copy.expressions.push_back(clone_expr(*item, substitution, deferred, current_class));
             }
             out->data = std::move(copy);
+        } else if (const auto* node = std::get_if<TupleExpr>(&source.data)) {
+            TupleExpr copy;
+            for (const auto& item : node->elements) {
+                copy.elements.push_back(clone_expr(*item, substitution, deferred, current_class));
+            }
+            out->data = std::move(copy);
+        } else if (const auto* node = std::get_if<ArrayComprehensionExpr>(&source.data)) {
+            comprehension_types_.erase(out.get());
+            ArrayComprehensionExpr copy;
+            copy.name = node->name;
+            copy.binding_span = node->binding_span;
+            copy.source = clone_expr(*node->source, substitution, deferred, current_class);
+            if (node->type) copy.type = materialize_type(*node->type, substitution, deferred);
+            const auto before = type_environment_;
+            if (copy.type) type_environment_[copy.name] = clone_type(*copy.type);
+            else if (auto source_type = infer_expression_type(*copy.source, current_class);
+                     source_type && !source_type->dimensions.empty()) {
+                source_type->dimensions.erase(source_type->dimensions.begin());
+                source_type->array_depth = source_type->dimensions.size();
+                type_environment_[copy.name] = std::move(*source_type);
+            }
+            try {
+                if (node->condition) copy.condition = clone_expr(*node->condition, substitution, deferred, current_class);
+                copy.value = clone_expr(*node->value, substitution, deferred, current_class);
+                if (auto result = infer_expression_type(*copy.value, current_class)) {
+                    result->dimensions.insert(result->dimensions.begin(), -1);
+                    result->array_depth = result->dimensions.size();
+                    comprehension_types_[out.get()] = std::move(*result);
+                }
+            } catch (...) { type_environment_ = before; throw; }
+            type_environment_ = before;
+            out->data = std::move(copy);
         } else if (const auto* node = std::get_if<ArrayExpr>(&source.data)) {
             ArrayExpr copy;
             for (const auto& item : node->elements) {
@@ -4219,6 +5246,8 @@ private:
             for (const auto& item : node->items) {
                 IndexPart cloned;
                 cloned.slice = item.slice;
+                cloned.start_form = item.start_form;
+                cloned.end_form = item.end_form;
                 cloned.span = item.span;
                 if (item.index) cloned.index = clone_expr(*item.index, substitution, deferred, current_class);
                 if (item.start) cloned.start = clone_expr(*item.start, substitution, deferred, current_class);
@@ -4234,12 +5263,35 @@ private:
             out->data = UnaryExpr{
                 node->op, clone_expr(*node->operand, substitution, deferred, current_class)};
         } else if (const auto* node = std::get_if<BinaryExpr>(&source.data)) {
+            if (is_relational_operator(node->op))
+                reject_misread_generic_call(*node->right, node->op_span, current_class);
             out->data = BinaryExpr{
                 node->op,
                 clone_expr(*node->left, substitution, deferred, current_class),
-                clone_expr(*node->right, substitution, deferred, current_class)};
+                clone_expr(*node->right, substitution, deferred, current_class),
+                node->op_span};
+        } else if (const auto* node = std::get_if<ComparisonChainExpr>(&source.data)) {
+            ComparisonChainExpr copy;
+            for (std::size_t i = 0; i < node->operands.size(); ++i) {
+                if (i && is_relational_operator(node->ops[i - 1]))
+                    reject_misread_generic_call(
+                        *node->operands[i], node->op_spans[i - 1], current_class);
+                copy.operands.push_back(
+                    clone_expr(*node->operands[i], substitution, deferred, current_class));
+            }
+            copy.ops = node->ops;
+            copy.op_spans = node->op_spans;
+            out->data = std::move(copy);
         } else if (const auto* node = std::get_if<TryExpr>(&source.data)) {
             out->data = TryExpr{clone_expr(*node->value, substitution, deferred, current_class)};
+        } else if (const auto* node = std::get_if<IfExpr>(&source.data)) {
+            IfExpr copy;
+            for (const auto& condition : node->conditions)
+                copy.conditions.push_back(clone_expr(*condition, substitution, deferred, current_class));
+            for (const auto& value : node->values)
+                copy.values.push_back(clone_expr(*value, substitution, deferred, current_class));
+            copy.otherwise = clone_expr(*node->otherwise, substitution, deferred, current_class);
+            out->data = std::move(copy);
         } else if (const auto* node = std::get_if<CallExpr>(&source.data)) {
             auto type_arguments = materialize_type_arguments(node->type_arguments, substitution, deferred);
             const bool deferred_call = std::any_of(
@@ -4248,13 +5300,23 @@ private:
 
             CallExpr copy;
             copy.callee = node->callee;
+            // A numeric type parameter in call position denotes the explicit
+            // conversion of its concrete specialization, including tensors.
+            if (const auto target = substitution.find(copy.callee);
+                target != substitution.end() && target->second.dimensions.empty() &&
+                target->second.arguments.empty() && target->second.function_parameters.empty() &&
+                numeric_type_name(target->second.name)) {
+                copy.callee = target->second.name;
+            }
+            copy.constructor = node->constructor;
+            copy.mutation_marker = node->mutation_marker;
             copy.args = clone_args(node->args, substitution, deferred, current_class);
 
             if (!type_arguments.empty() && !deferred_call) {
                 if (copy.callee == "tensor" || copy.callee == "$std.tensor.zeros" ||
                     copy.callee == "$std.tensor.ones" ||
                     copy.callee == "$std.reflect.collect" ||
-                    copy.callee == "$std.reflect.paths") {
+                    copy.callee == "$std.reflect.paths" || copy.callee == "$std.reflect.each" || copy.callee == "$std.reflect.each_paths") {
                     copy.type_arguments = std::move(type_arguments);
                 } else if (class_templates_.contains(copy.callee)) {
                     copy.callee = instantiate_class(copy.callee, type_arguments);
@@ -4330,19 +5392,48 @@ private:
                             current_class, copy.callee, *inferred, source.span);
                         copy.callee = method_name(copy.callee, *inferred);
                     }
-                } else if (class_templates_.contains(copy.callee)) {
-                    frontend_error(
-                        "GENERIC_ARGUMENTS_REQUIRED",
-                        "Generic class '" + copy.callee +
-                            "' requires explicit type arguments.",
-                        source.span);
+                } else if (const auto templ = class_templates_.find(copy.callee);
+                           templ != class_templates_.end()) {
+                    const auto* constructor = class_template_constructor(*templ->second);
+                    if (!constructor) {
+                        frontend_error(
+                            "GENERIC_ARGUMENTS_REQUIRED",
+                            "Generic class '" + copy.callee +
+                                "' requires explicit type arguments.",
+                            source.span);
+                    }
+                    const auto inferred = infer_class_arguments(
+                        *templ->second, *constructor, copy.args, current_class);
+                    if (!inferred) {
+                        std::string parameters;
+                        for (const auto& parameter : templ->second->type_parameters) {
+                            if (!parameters.empty()) parameters += ", ";
+                            parameters += parameter;
+                        }
+                        frontend_error(
+                            "GENERIC_INFERENCE",
+                            "Class type arguments must follow from the constructor's arguments; write '" +
+                                copy.callee + "<" + parameters + ">(...)'.",
+                            source.span);
+                    }
+                    const bool inferred_deferred = std::any_of(
+                        inferred->begin(), inferred->end(),
+                        [&](const auto& argument) {
+                            return contains_parameter(argument, deferred);
+                        });
+                    if (!inferred_deferred) {
+                        copy.callee = instantiate_class(copy.callee, *inferred);
+                    }
                 }
+            }
+            if (!deferred_call && copy.type_arguments.empty()) {
             }
             out->data = std::move(copy);
         } else if (const auto* node = std::get_if<MethodCallExpr>(&source.data)) {
             MethodCallExpr copy;
             copy.receiver = clone_expr(*node->receiver, substitution, deferred, current_class);
             copy.method = node->method;
+            copy.mutation_marker = node->mutation_marker;
             copy.args = clone_args(node->args, substitution, deferred, current_class);
 
             auto type_arguments = materialize_type_arguments(node->type_arguments, substitution, deferred);
@@ -4371,7 +5462,7 @@ private:
                         "Generic method receiver must resolve to a concrete class.",
                         source.span);
                 }
-                if (receiver_type->name == "$std.autograd.Target" &&
+                if (receiver_type->name == standard_class::autograd_target &&
                     copy.method == "gradient") {
                     // autograd.Target.gradient<T>() is a built-in method. Keep its
                     // explicit type argument for the checker instead of trying to
@@ -4439,6 +5530,20 @@ private:
         return out;
     }
 
+    Pattern clone_pattern(const Pattern& source,const Substitution& substitution,
+                          const std::unordered_set<std::string>& deferred,const std::string& current_class) {
+        Pattern copy;copy.kind=source.kind;copy.name=source.name;copy.reference=source.reference;copy.is_const=source.is_const;copy.span=source.span;
+        if(source.type)copy.type=materialize_type(*source.type,substitution,deferred);
+        if(source.place)copy.place=clone_expr(*source.place,substitution,deferred,current_class);
+        for(const auto& element:source.elements)copy.elements.push_back(clone_pattern(element,substitution,deferred,current_class));
+        return copy;
+    }
+
+    void infer_pattern_bindings(const Pattern& pattern,const TypeName& subject) {
+        if(pattern.kind==Pattern::Kind::Tuple){if(subject.name!="$tuple" || subject.arguments.size()!=pattern.elements.size())return;for(std::size_t i=0;i<pattern.elements.size();++i)infer_pattern_bindings(pattern.elements[i],subject.arguments[i]);return;}
+        if(pattern.kind==Pattern::Kind::Declare)type_environment_[pattern.name]=clone_type(pattern.type && pattern.type->name!="auto"?*pattern.type:subject);
+    }
+
     StmtPtr clone_stmt(
         const Stmt& source,
         const Substitution& substitution,
@@ -4456,8 +5561,12 @@ private:
             copy.reference = node->reference;
             copy.reference_initializer = node->reference_initializer;
             copy.is_const = node->is_const;
+            copy.literal_constant = node->literal_constant;
+            copy.is_local = node->is_local;
+            if(node->pattern)copy.pattern=clone_pattern(*node->pattern,substitution,deferred,current_class);
             if (node->value) copy.value = clone_expr(*node->value, substitution, deferred, current_class);
-            if (copy.declared_type.name != "auto") {
+            if(copy.pattern){if(copy.value)if(const auto inferred=infer_expression_type(*copy.value,current_class))infer_pattern_bindings(*copy.pattern,*inferred);}
+            else if (copy.declared_type.name != "auto") {
                 type_environment_[copy.name] = clone_type(copy.declared_type);
             } else if (copy.value) {
                 if (const auto inferred = infer_expression_type(*copy.value, current_class)) {
@@ -4466,13 +5575,15 @@ private:
             }
             out->data = std::move(copy);
         } else if (const auto* node = std::get_if<AssignStmt>(&source.data)) {
-            out->data = AssignStmt{
-                clone_expr(*node->target, substitution, deferred, current_class),
-                clone_expr(*node->value, substitution, deferred, current_class),
-                node->compound_op};
+            AssignStmt copy;
+            if(node->target)copy.target=clone_expr(*node->target,substitution,deferred,current_class);
+            copy.value=clone_expr(*node->value,substitution,deferred,current_class);copy.compound_op=node->compound_op;
+            if(node->pattern)copy.pattern=clone_pattern(*node->pattern,substitution,deferred,current_class);
+            out->data=std::move(copy);
         } else if (const auto* node = std::get_if<RebindStmt>(&source.data)) {
             out->data = RebindStmt{
-                node->name, clone_expr(*node->target, substitution, deferred, current_class)};
+                node->name, clone_expr(*node->target, substitution, deferred, current_class),
+                node->place ? clone_expr(*node->place, substitution, deferred, current_class) : nullptr};
         } else if (const auto* node = std::get_if<ReturnStmt>(&source.data)) {
             out->data = ReturnStmt{
                 clone_expr(*node->value, substitution, deferred, current_class)};
@@ -4498,11 +5609,19 @@ private:
             MainGuardStmt copy;
             copy.active = node->active;
             copy.source_file = node->source_file;
+            copy.module_namespace = node->module_namespace;
             const auto before = type_environment_;
             for (const auto& child : node->body)
                 copy.body.push_back(clone_stmt(*child, substitution, deferred, current_class));
             type_environment_ = before;
             out->data = std::move(copy);
+        } else if (const auto* node = std::get_if<ParallelStmt>(&source.data)) {
+            ParallelStmt copy;
+            const auto before=type_environment_;
+            for (const auto& child : node->body)
+                copy.body.push_back(clone_stmt(*child, substitution, deferred, current_class));
+            type_environment_=before;
+            out->data=std::move(copy);
         } else if (const auto* node = std::get_if<WhileStmt>(&source.data)) {
             WhileStmt copy;
             copy.condition = clone_expr(*node->condition, substitution, deferred, current_class);
@@ -4516,14 +5635,70 @@ private:
             ForStmt copy;
             copy.name = node->name;
             copy.writable = node->writable;
+            const auto previous_expected=traversal_expected_result_;
+            if(node->type) {
+                TypeName each;each.name="$std.reflect.Each";
+                each.arguments.push_back(substitute_raw(*node->type,substitution));
+                traversal_expected_result_=std::move(each);
+            }else traversal_expected_result_.reset();
             copy.iterable = clone_expr(*node->iterable, substitution, deferred, current_class);
+            traversal_expected_result_=previous_expected;
+            if(node->pattern)copy.pattern=clone_pattern(*node->pattern,substitution,deferred,current_class);
+            copy.is_auto=node->is_auto;
+            copy.declares=node->declares;
+            copy.legacy=node->legacy;
+            copy.parallel=node->parallel;
+            copy.parallel_span=node->parallel_span;
+            copy.index=node->index;
+            for(const auto& binding:node->collections) {
+                ForCollectionBinding extra;
+                extra.name=binding.name;
+                extra.iterable=clone_expr(*binding.iterable,substitution,deferred,current_class);
+                if(binding.type) extra.type=materialize_type(*binding.type,substitution,deferred);
+                extra.is_auto=binding.is_auto;
+                extra.declares=binding.declares;
+                extra.span=binding.span;
+                copy.collections.push_back(std::move(extra));
+            }
+            if(node->type) copy.type=materialize_type(*node->type,substitution,deferred);
+            if(node->range) {
+                copy.range.emplace();
+                copy.range->start_inclusive=node->range->start_inclusive;
+                copy.range->end_inclusive=node->range->end_inclusive;
+                copy.range->descending=node->range->descending;
+                copy.range->implicit_start_zero=node->range->implicit_start_zero;
+                copy.range->implicit_end_zero=node->range->implicit_end_zero;
+                copy.range->end=clone_expr(*node->range->end,substitution,deferred,current_class);
+                if(node->range->step)
+                    copy.range->step=clone_expr(*node->range->step,substitution,deferred,current_class);
+            }
             const auto before = type_environment_;
+            std::vector<std::optional<TypeName>> collection_types;
+            for(const auto& binding:copy.collections)
+                collection_types.push_back(infer_expression_type(*binding.iterable,current_class));
             if (const auto iterable_type = infer_expression_type(*copy.iterable, current_class);
                 iterable_type && !iterable_type->dimensions.empty()) {
                 auto element_type = clone_type(*iterable_type);
                 element_type.dimensions.erase(element_type.dimensions.begin());
                 element_type.array_depth = element_type.dimensions.size();
-                type_environment_[copy.name] = std::move(element_type);
+                if(copy.pattern)infer_pattern_bindings(*copy.pattern,element_type);else type_environment_[copy.name] = std::move(element_type);
+            }
+            if(copy.type) type_environment_[copy.name]=clone_type(*copy.type);
+            for(std::size_t i=0;i<copy.collections.size();++i) {
+                const auto& binding=copy.collections[i];
+                if(binding.name=="_") continue;
+                if(binding.type) type_environment_[binding.name]=clone_type(*binding.type);
+                else if(const auto& type=collection_types[i]; type && !type->dimensions.empty()) {
+                    auto element=clone_type(*type);
+                    element.dimensions.erase(element.dimensions.begin());
+                    element.array_depth=element.dimensions.size();
+                    type_environment_[binding.name]=std::move(element);
+                }
+            }
+            if(copy.index) {
+                TypeName index_type;
+                index_type.name="nat";
+                type_environment_[copy.index->name]=std::move(index_type);
             }
             for (const auto& child : node->body) {
                 copy.body.push_back(clone_stmt(*child, substitution, deferred, current_class));
@@ -4538,16 +5713,17 @@ private:
             for (const auto& match_case : match_node.cases) {
                 type_environment_ = before;
                 MatchCase case_copy;
-                case_copy.type = materialize_type(match_case.type, substitution, deferred);
+                if(!match_case.pattern)case_copy.type = materialize_type(match_case.type, substitution, deferred);
                 case_copy.tag = match_case.tag;
                 case_copy.binder = match_case.binder;
                 case_copy.span = match_case.span;
-                if (const auto* name = std::get_if<NameExpr>(&copy.value->data)) {
-                    type_environment_[name->name] = clone_type(case_copy.type);
-                }
-                if (case_copy.binder) {
-                    type_environment_[*case_copy.binder] = clone_type(case_copy.type);
-                }
+                if(match_case.pattern)case_copy.pattern=clone_pattern(*match_case.pattern,substitution,deferred,current_class);
+                std::optional<TypeName> selected;
+                if(case_copy.pattern){if(const auto subject=infer_expression_type(*copy.value,current_class);subject && subject->name=="$union"){
+                    for(const auto& candidate:subject->arguments)if(tuple_pattern_matches(*case_copy.pattern,candidate,[](const TypeName& t)->const std::vector<TypeName>* {return t.name=="$tuple" && t.dimensions.empty()?&t.arguments:nullptr;},[](const TypeName& leaf,const TypeName& t){return canonical_type(leaf)==canonical_type(t);})){if(selected){selected.reset();break;}selected=clone_type(candidate);}
+                    if(selected)infer_pattern_bindings(*case_copy.pattern,*selected);
+                }}else selected=clone_type(case_copy.type);
+                if(selected){if(const auto* name=std::get_if<NameExpr>(&copy.value->data);name && !name->this_qualifier && !name->self_reference)type_environment_[name->name]=clone_type(*selected);if(case_copy.binder)type_environment_[*case_copy.binder]=clone_type(*selected);}
                 for (const auto& child : match_case.body) {
                     case_copy.body.push_back(clone_stmt(*child, substitution, deferred, current_class));
                 }
@@ -4565,18 +5741,23 @@ private:
         const std::unordered_set<std::string>& deferred,
         const std::string& current_class) {
         const auto saved_environment = type_environment_;
+        const auto saved_expected=traversal_expected_result_;
         type_environment_.clear();
         try {
             FunctionDecl out;
             out.name = source.name;
             out.source_file = source.source_file;
-            out.return_type = materialize_type(source.return_type, substitution, deferred);
+            out.module_namespace = source.module_namespace;
+            out.return_type = materialize_type(source.return_type, substitution, deferred,true);
+            traversal_expected_result_=out.return_type.name=="$std.reflect.Each"?std::optional<TypeName>{substitute_raw(source.return_type,substitution)}:std::nullopt;
             out.span = source.span;
             out.is_private = source.is_private;
+            out.mutation_marker = source.mutation_marker;
             out.is_constructor = source.is_constructor;
             out.constructor_typed = source.constructor_typed;
             out.type_parameters = source.type_parameters;
             out.external_symbol = source.external_symbol;
+            out.foreign_export = source.foreign_export;
             out.type_constraints = source.type_constraints;
 
             for (const auto& parameter : source.parameters) {
@@ -4586,6 +5767,7 @@ private:
                 copy.writable = parameter.writable;
                 copy.span = parameter.span;
                 copy.is_const = parameter.is_const;
+                copy.is_local = parameter.is_local;
                 if (parameter.default_value) {
                     copy.default_value = clone_expr(
                         *parameter.default_value, substitution, deferred, current_class);
@@ -4596,10 +5778,10 @@ private:
             for (const auto& statement : source.body) {
                 out.body.push_back(clone_stmt(*statement, substitution, deferred, current_class));
             }
-            type_environment_ = saved_environment;
+            type_environment_ = saved_environment;traversal_expected_result_=saved_expected;
             return out;
         } catch (...) {
-            type_environment_ = saved_environment;
+            type_environment_ = saved_environment;traversal_expected_result_=saved_expected;
             throw;
         }
     }
@@ -4629,16 +5811,16 @@ private:
             templ->second->type_parameters, templ->second->type_constraints,
             arguments, "class", name, templ->second->span);
 
-        if (name == "$std.map.Map" && !arguments.empty() &&
+        if (name == standard_class::map && !arguments.empty() &&
             !standard_collection_key_type(arguments[0])) {
             frontend_error("STANDARD_KEY_TYPE",
-                           "map.Map keys must be integer, bool, or string values.",
+                           "map.Map keys must be integer, bool, string, or tuples of these values.",
                            source_arguments[0].span);
         }
-        if (name == "$std.set.Set" && !arguments.empty() &&
+        if (name == standard_class::set && !arguments.empty() &&
             !standard_collection_key_type(arguments[0])) {
             frontend_error("STANDARD_KEY_TYPE",
-                           "set.Set values must be integer, bool, or string values.",
+                           "set.Set values must be integer, bool, string, or tuples of these values.",
                            source_arguments[0].span);
         }
 
@@ -4647,8 +5829,14 @@ private:
             return existing->second;
         }
 
-        const auto concrete_name = mangle("gc", name, key);
+        const auto concrete_name = mangle(abi::generic_class_kind, name, key);
         class_instances_[key] = concrete_name;
+        TypeName instance_type;
+        instance_type.name = name;
+        for (const auto& argument : arguments) {
+            instance_type.arguments.push_back(clone_type(argument));
+        }
+        class_instance_types_.emplace(concrete_name, std::move(instance_type));
 
         Substitution substitution;
         for (std::size_t i = 0; i < arguments.size(); ++i) {
@@ -4668,7 +5856,12 @@ private:
         ClassDecl out;
         out.name = concrete_name;
         out.source_file = source.source_file;
+        out.module_namespace = source.module_namespace;
         out.span = source.span;
+        out.standard_library = source.standard_library;
+        out.self_name = source.self_name;
+        out.self_span = source.self_span;
+        out.is_private = source.is_private;
 
         for (const auto& field : source.fields) {
             FieldDecl copy;
@@ -4677,6 +5870,7 @@ private:
             copy.span = field.span;
             copy.is_const = field.is_const;
             copy.is_private = field.is_private;
+            copy.reference = field.reference;
             if (field.default_value) {
                 copy.default_value = clone_expr(*field.default_value, class_substitution, {}, concrete_name);
             }
@@ -4710,7 +5904,7 @@ private:
             if (specialized_family) continue;
             if (method.type_parameters.empty()) {
                 method_return_types_[concrete_name][method.name] =
-                    materialize_type(method.return_type, class_substitution, {});
+                    materialize_type(method.return_type, class_substitution, {},true);
             } else {
                 const auto deferred = set_of(method.type_parameters);
                 auto method_template =
@@ -4726,9 +5920,9 @@ private:
                 source_method_families.at(method.name).size() > 1;
             if (specialized_family || !method.type_parameters.empty()) continue;
             auto copy = clone_function(method, class_substitution, {}, concrete_name);
-            if ((source.name == "$std.map.Map" || source.name == "$std.set.Set") &&
+            if ((source.name == standard_class::map || source.name == standard_class::set) &&
                 method.name == "__hash") {
-                const auto parameter = source.name == "$std.map.Map" ? "K" : "T";
+                const auto parameter = source.name == standard_class::map ? "K" : "T";
                 if (const auto key = class_substitution.find(parameter);
                     key != class_substitution.end()) {
                     if (auto body = standard_collection_hash_body(
@@ -4777,7 +5971,7 @@ private:
         }
 
         function_return_types_[concrete_name] =
-            materialize_type(function.return_type, substitution, {});
+            materialize_type(function.return_type, substitution, {},true);
         auto concrete = clone_function(function, substitution, {}, "");
         concrete.name = concrete_name;
         concrete.type_parameters.clear();
@@ -4870,7 +6064,7 @@ private:
             mangle("ms", member.signature.name, key);
         instances[key] = concrete_name;
         method_return_types_[class_name][concrete_name] =
-            materialize_type(member.source->return_type, combined, {});
+            materialize_type(member.source->return_type, combined, {},true);
         auto concrete =
             clone_function(*member.source, combined, {}, class_name);
         concrete.name = concrete_name;
@@ -5046,7 +6240,7 @@ private:
 
         const auto concrete_method_name = method_name(method, arguments);
         method_return_types_[class_name][concrete_method_name] =
-            materialize_type(templ.return_type, substitution, {});
+            materialize_type(templ.return_type, substitution, {},true);
         auto concrete = clone_function(templ, substitution, {}, class_name);
         concrete.name = concrete_method_name;
         concrete.type_parameters.clear();
@@ -5060,14 +6254,16 @@ private:
 ResolvedProgram load_program_with_modules(
     const std::filesystem::path& root_file,
     const std::filesystem::path& command_working_directory,
-    std::size_t max_errors) {
+    std::size_t max_errors,
+    CompileInputs* inputs) {
     std::vector<CompilerExtensionRegistration> compiler_extensions;
+    std::map<std::string, fs::path> packages;
     auto program = ModuleLoader(
-        command_working_directory, max_errors, std::nullopt, nullptr, true,
-        &compiler_extensions)
+        command_working_directory, max_errors, std::nullopt, &packages, true,
+        &compiler_extensions, inputs)
         .load(root_file);
     return ResolvedProgram{
-        std::move(program), std::move(compiler_extensions)};
+        std::move(program), std::move(compiler_extensions), std::move(packages)};
 }
 
 ResolvedProgram load_program_with_root_source(
@@ -5077,12 +6273,13 @@ ResolvedProgram load_program_with_root_source(
     std::size_t max_errors,
     bool enforce_package_lock) {
     std::vector<CompilerExtensionRegistration> compiler_extensions;
+    std::map<std::string, fs::path> packages;
     auto program = ModuleLoader(
         command_working_directory, max_errors, std::string(root_source),
-        nullptr, enforce_package_lock, &compiler_extensions)
+        &packages, enforce_package_lock, &compiler_extensions)
         .load(root_file);
     return ResolvedProgram{
-        std::move(program), std::move(compiler_extensions)};
+        std::move(program), std::move(compiler_extensions), std::move(packages)};
 }
 
 std::map<std::string, fs::path> resolve_package_dependencies(
@@ -5109,7 +6306,66 @@ std::map<std::string, fs::path> resolve_package_dependencies_source(
     return packages;
 }
 
+void validate_same_shape_declarations(const ResolvedProgram& program) {
+    for (const auto& extension : program.compiler_extensions) {
+        for (const auto& [table, fields] : extension.tables) {
+            if (!table.starts_with("specialization.") && !table.starts_with("backend.") &&
+                !table.starts_with("memory.")) continue;
+            const auto relation = fields.find("same_shape");
+            if (relation == fields.end()) continue;
+            std::vector<std::string> parameters;
+            try { parameters = shape_relation_parameters(relation->second); }
+            catch (const std::exception& error) {
+                frontend_error("PACKAGE_COMPILER_EXTENSION", error.what(), {});
+            }
+            const auto operation = fields.find("operation");
+            if (operation == fields.end())
+                frontend_error("PACKAGE_COMPILER_EXTENSION", "same_shape requires an operation", {});
+            const auto entry = extension.tables.find("operation." + operation->second);
+            if (entry == extension.tables.end() || !entry->second.contains("function"))
+                frontend_error("PACKAGE_COMPILER_EXTENSION", "same_shape requires a declared operation function", {});
+            auto configured = entry->second.at("function");
+            for (const auto member_prefix :
+                 {member_function_name::method_prefix, member_function_name::constructor_prefix}) {
+                if (configured.starts_with(member_prefix)) {
+                    configured.erase(0, member_prefix.size());
+                    break;
+                }
+            }
+            const auto prefix = extension.package + ".";
+            if (configured.starts_with(prefix)) configured.erase(0, prefix.size());
+            bool matched = false;
+            const auto validate = [&](const FunctionDecl& function, const std::string& name) {
+                const auto relative = fs::path(function.source_file).lexically_normal().lexically_relative(
+                    fs::path(extension.package_root).lexically_normal());
+                if (relative.empty() || relative.is_absolute() || *relative.begin() == ".." ||
+                    (name != configured && !name.ends_with("." + configured))) return;
+                matched = true;
+                for (const auto& parameter_name : parameters) {
+                    const auto parameter = std::find_if(function.parameters.begin(), function.parameters.end(),
+                        [&](const auto& candidate) { return candidate.name == parameter_name; });
+                    if (parameter == function.parameters.end() || parameter->type.name != "tensor" ||
+                        parameter->type.array_depth != 0)
+                        frontend_error("PACKAGE_COMPILER_EXTENSION", "same_shape operand '" + parameter_name +
+                            "' must name a tensor parameter of operation '" + operation->second + "'", function.span);
+                }
+            };
+            for (const auto& function : program.program.functions) validate(function, function.name);
+            for (const auto& declaration : program.program.classes) {
+                std::size_t constructor = 0;
+                for (const auto& method : declaration.methods) {
+                    validate(method, declaration.name + "." +
+                        (method.is_constructor ? std::to_string(constructor++) : method.name));
+                }
+            }
+            if (!matched)
+                frontend_error("PACKAGE_COMPILER_EXTENSION", "same_shape operation function is not declared", {});
+        }
+    }
+}
+
 ConcreteProgram expand_generics(ResolvedProgram program) {
+    validate_same_shape_declarations(program);
     return ConcreteProgram{
         GenericExpander(std::move(program.program)).run(),
         std::move(program.compiler_extensions)};

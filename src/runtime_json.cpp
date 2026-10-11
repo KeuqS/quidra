@@ -1,4 +1,8 @@
+#include "ieee_decimal.hpp"
 #include "runtime_internal.hpp"
+#include "runtime_report.hpp"
+#include "quidra/abi/process_status.hpp"
+#include "quidra/abi/runtime_entry_points.hpp"
 
 #include <algorithm>
 #include <cerrno>
@@ -16,14 +20,13 @@
 #include <utility>
 #include <vector>
 
-extern "C" char* quidra_runtime_copy_text(
-    const char* data, unsigned long long raw_size);
+// The ABI this runtime shares with generated code (include/quidra/abi).
+namespace abi = quidra::abi;
 
 namespace {
 
 [[noreturn]] void runtime_allocation_failure() {
-    std::fprintf(stderr, "Quidra runtime error: allocation failed\n");
-    std::exit(101);
+    quidra::runtime::report_uncoded("allocation failed");
 }
 
 char* runtime_copy_string(const std::string& value) {
@@ -61,7 +64,10 @@ struct JsonHandle {
     JsonNode* node{};
 };
 
-thread_local std::string json_last_error;
+// The calling thread's last failed json.parse: the parser's problem (an
+// immortal text) and the byte offset where it stopped.
+thread_local const char* json_last_problem = nullptr;
+thread_local long long json_last_offset = 0;
 
 void append_utf8(std::string& out, unsigned codepoint) {
     if (codepoint <= 0x7fU) {
@@ -79,6 +85,19 @@ void append_utf8(std::string& out, unsigned codepoint) {
         out.push_back(static_cast<char>(0x80U | ((codepoint >> 6U) & 0x3fU)));
         out.push_back(static_cast<char>(0x80U | (codepoint & 0x3fU)));
     }
+}
+
+// The binary64 value of a JSON number's text (always decimal), rounded
+// once from its exact value (ieee_decimal.hpp). False when the value is
+// beyond the finite range, or not zero but rounds to zero; `out` then holds
+// the rounded infinity or zero.
+bool json_number_value(const std::string& text, double& out) {
+    namespace ieee = quidra::ieee_decimal;
+    ieee::Decimal decimal;
+    if (!ieee::parse(text, decimal)) return false;
+    const auto rounded = ieee::round(decimal, ieee::binary64);
+    out = ieee::binary64_value(rounded);
+    return !rounded.overflow && !rounded.underflow_to_zero;
 }
 
 class JsonParser {
@@ -103,20 +122,23 @@ public:
         return document_;
     }
 
-    const std::string& error() const { return error_; }
+    // The problem that stopped the parse (null before one) and its offset.
+    const char* problem() const { return problem_; }
+    long long offset() const { return offset_; }
 
 private:
     const char* start_{};
     const char* cursor_{};
     std::shared_ptr<JsonDocument> document_;
-    std::string error_;
+    const char* problem_ = nullptr;
+    long long offset_ = 0;
 
     JsonNode* make_node() { return document_->make_node(); }
 
-    JsonNode* fail(const std::string& message) {
-        if (error_.empty()) {
-            const auto offset = static_cast<unsigned long long>(cursor_ - start_);
-            error_ = message + " at byte " + std::to_string(offset);
+    JsonNode* fail(const char* problem) {
+        if (!problem_) {
+            problem_ = problem;
+            offset_ = cursor_ && start_ ? static_cast<long long>(cursor_ - start_) : 0;
         }
         return nullptr;
     }
@@ -270,10 +292,7 @@ private:
         node->number_text = std::move(token);
         // JSON itself has no IEEE-754 range restriction. Keep the source
         // spelling losslessly; narrow accessors decide whether a value fits.
-        errno = 0;
-        char* end = nullptr;
-        const double value = std::strtod(node->number_text.c_str(), &end);
-        if (errno != ERANGE && end && *end == '\0' && std::isfinite(value)) {
+        if (double value = 0.0; json_number_value(node->number_text, value)) {
             node->number = value;
         }
         return node;
@@ -479,12 +498,14 @@ bool json_equal_node(const JsonNode* left, const JsonNode* right) {
 }
 
 extern "C" void* quidra_json_parse_raw(const char* text) {
-    json_last_error.clear();
+    json_last_problem = nullptr;
+    json_last_offset = 0;
     try {
         JsonParser parser(text);
         auto document = parser.parse();
         if (!document) {
-            json_last_error = parser.error().empty() ? "invalid JSON" : parser.error();
+            json_last_problem = parser.problem() ? parser.problem() : "invalid JSON";
+            json_last_offset = parser.offset();
             return nullptr;
         }
         return json_wrapper(document, document->root);
@@ -501,8 +522,15 @@ extern "C" void quidra_json_drop(void* value) {
     delete handle;
 }
 
-extern "C" char* quidra_json_last_error_copy() {
-    return runtime_copy_string(json_last_error.empty() ? "invalid JSON" : json_last_error);
+// The error of the calling thread's last failed json.parse (JSON_PARSE): the
+// parser's problem and the byte offset where it stopped.
+extern "C" void* quidra_error_json_last(unsigned long long line, unsigned long long column) {
+    const std::uint64_t slots[] = {
+        static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(
+            json_last_problem ? json_last_problem : "invalid JSON")),
+        static_cast<std::uint64_t>(json_last_offset)};
+    return quidra::runtime::make_error_record(abi::ErrorValueCode::json_parse, slots, line,
+                                              column, false);
 }
 
 extern "C" const char* quidra_json_kind(void* value) {
@@ -579,16 +607,16 @@ extern "C" long long quidra_json_integer(void* value) {
 extern "C" bool quidra_json_number_ok(void* value) {
     auto* node = json_node(value);
     if (!node || node->kind != JsonKind::Number) return false;
-    errno = 0;
-    char* end = nullptr;
-    const double parsed = std::strtod(node->number_text.c_str(), &end);
-    return errno != ERANGE && end && *end == '\0' && std::isfinite(parsed);
+    double parsed = 0.0;
+    return json_number_value(node->number_text, parsed);
 }
 
 extern "C" double quidra_json_number(void* value) {
     auto* node = json_node(value);
     if (!node || node->kind != JsonKind::Number) return 0.0;
-    return std::strtod(node->number_text.c_str(), nullptr);
+    double number = 0.0;
+    (void)json_number_value(node->number_text, number);
+    return number;
 }
 
 extern "C" char* quidra_json_number_text(void* value) {

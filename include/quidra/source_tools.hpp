@@ -18,6 +18,16 @@ struct SourceNode {
     std::optional<std::string> authority;
     std::optional<std::string> parent_id;
     std::size_t depth{};
+    // A name node resolved to a receiver member.
+    bool this_qualified{};
+    // A call or a declaration written with the mutation marker (L1).
+    bool mutation_marker{};
+    std::optional<bool> start_inclusive;
+    std::optional<bool> end_inclusive;
+    bool is_local{};
+    bool self_reference{};
+    std::string instance_name{};
+    std::optional<std::size_t> collection_count;
 };
 
 struct SourceInspection {

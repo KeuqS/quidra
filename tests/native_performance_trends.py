@@ -11,32 +11,33 @@ import tempfile
 import time
 
 WORKLOADS = {
-    "bitwise": """int value = 1
-for index in range(2000000)
-    value = ((value XOR index) << 1) XOR (value >> 3)
+    "bitwise": """int64 value = 1
+for 0 <= nat index < 2000000
+    int64 converted_index = int64(index)
+    value = ((value XOR converted_index) << 1) XOR (value >> 3)
 print(value)
 """,
     "sort": """int[] values = array(50000, fill = 0)
-for index in range(50000)
-    values[index] = 50000 - index
+for 0 <= nat index < 50000
+    values[index] = 50000 - int(index)
 values = values.sorted()
 print(values[0])
 """,
     "string_concat": """string text = ""
-for index in range(200000)
+for 0 <= nat index < 200000
     text += "x"
 print(len(text))
 """,
     "stream_file": """int | error run()
     file.Handle output = try file.create("trend-output.txt")
-    for index in range(50000)
-        try output.write_line("abcdef")
-    try output.flush()
-    try output.seek(0)
+    for 0 <= nat index < 50000
+        try .output.write_line("abcdef")
+    try .output.flush()
+    try .output.seek(0)
 
     int lines = 0
     while true
-        auto | error next = output.read_line()
+        auto | error next = .output.read_line()
         match next
             string line
                 if line != "abcdef"
@@ -46,7 +47,7 @@ print(len(text))
                 break
             error problem
                 return problem
-    output.close()
+    .output.close()
     return lines
 
 auto | error result = run()
@@ -57,10 +58,10 @@ match result
         print(problem)
 """,
     "map_delete": """map.Map<int, int> values = map.Map<int, int>()
-for index in range(50000)
-    values.set(index, index)
-for index in range(0, 50000, 2)
-    values.remove(index)
+for 0 <= nat index < 50000
+    .values.set(int(index), int(index))
+for 0 <= nat index < 50000 step 2
+    .values.remove(int(index))
 print(values.size())
 """,
     "file_read_whole": """string text = file.read("parse-input.txt")
@@ -69,7 +70,7 @@ print(len(text))
     "file_split_whole": """string text = file.read("parse-input.txt")
 string[] rows = text.split(NL)
 int lines = 0
-for line in rows
+for auto line = rows[]
     if line != ""
         lines += 1
 print(lines)
@@ -77,7 +78,7 @@ print(lines)
     "file_read_stream": """file.Handle reader = file.open("parse-input.txt")
 int lines = 0
 while true
-    auto | error next = reader.read_line()
+    auto | error next = .reader.read_line()
     match next
         string line
             lines += 1
@@ -85,14 +86,14 @@ while true
             break
         error problem
             process.exit(3)
-reader.close()
+.reader.close()
 print(lines)
 """,
     "file_parse_stream": """file.Handle reader = file.open("parse-input.txt")
 int lines = 0
 int checksum = 0
 while true
-    auto | error next = reader.read_line()
+    auto | error next = .reader.read_line()
     match next
         string line
             string[] fields = line.split(" ")
@@ -106,14 +107,14 @@ while true
             break
         error problem
             process.exit(3)
-reader.close()
+.reader.close()
 print("{lines} {checksum}")
 """,
     "file_parse_whole": """string text = file.read("parse-input.txt")
 string[] rows = text.split(NL)
 int lines = 0
 int checksum = 0
-for line in rows
+for auto line = rows[]
     if line != ""
         string[] fields = line.split(" ")
         int parsed_index = int.parse(fields[0])
@@ -224,17 +225,17 @@ def main():
                 samples.append(time.perf_counter() - started)
 
             if name == "file_read_whole":
-                expected = f"{fixture_bytes}\n".encode()
+                expected = f"{fixture_bytes}".encode()
                 if output_bytes != expected:
                     raise RuntimeError(
                         f"{name}: expected byte count {fixture_bytes}, got {output_bytes!r}")
             elif name in {"file_split_whole", "file_read_stream"}:
-                expected = f"{FILE_PARSE_LINES}\n".encode()
+                expected = f"{FILE_PARSE_LINES}".encode()
                 if output_bytes != expected:
                     raise RuntimeError(
                         f"{name}: expected line count {FILE_PARSE_LINES}, got {output_bytes!r}")
             elif name in {"file_parse_stream", "file_parse_whole"}:
-                expected = f"{FILE_PARSE_LINES} {fixture_checksum}\n".encode()
+                expected = f"{FILE_PARSE_LINES} {fixture_checksum}".encode()
                 if output_bytes != expected:
                     raise RuntimeError(
                         f"{name}: parse checksum mismatch: {output_bytes!r}")

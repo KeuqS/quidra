@@ -1,0 +1,16 @@
+// A copied holder keeps referring to its array target.
+class Holder this(local int[] &value_initial)
+    int[] &value
+
+    &this.value = &value_initial
+
+int .grow(Holder holder)
+    for 0 <= nat i < 1000
+        holder.value = holder.value.append(int(i))
+    return 1
+
+int[] values = [5, 0, 0]
+Holder c = Holder(&values)
+c.value[0] += .grow(c)
+print("cell: {c.value[0]} {len(c.value)}")
+print(NL)

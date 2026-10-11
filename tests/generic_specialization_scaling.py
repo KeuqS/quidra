@@ -51,7 +51,7 @@ def program_source(count: int, specialized: bool) -> str:
     for index in range(count):
         lines.extend(
             [
-                f"class Case{index}",
+                f"class Case{index}()",
                 "    int value",
                 "",
             ]
@@ -61,7 +61,7 @@ def program_source(count: int, specialized: bool) -> str:
     for index in range(count):
         type_name = f"Case{index}"
         variable = f"item{index}"
-        lines.append(f"{type_name} {variable}")
+        lines.append(f"{type_name} {variable} = {type_name}()")
         lines.append(f"{variable}.value = {index}")
         if specialized:
             lines.append(f"total += read_value<{type_name}>({variable})")

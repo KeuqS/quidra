@@ -5,13 +5,21 @@
    line-ending style does not change string data. Control characters use
    NL, HT, CR, DQ, BS, FF, VT, and BL. *)
 
-program          = { NEWLINE | import_decl | extern_decl | cli_decl | enum_decl | class_decl | function_decl | main_guard | statement }, EOF ;
+program          = { NEWLINE | import_decl | export_decl | cli_decl | top_declaration | main_guard | statement }, EOF ;
+top_declaration  = [ "private" ], ( extern_decl | enum_decl | class_decl | function_decl | const_binding ) ;
+(* `private` is the module-local prefix of top-level declarations and the class-local prefix of
+   members. A private top-level declaration is usable only inside its module (source file) and is
+   never exported, also not by `public import`. export_decl stays a separate program item:
+   `private export "C"` is an error, because exported C functions are public. *)
+const_binding    = "const", type, identifier, "=", expression, statement_end ;
 
 import_decl      = [ "public" ], "import", identifier,
                    [ "=", ( string | identifier ) ], statement_end ;
 
-extern_decl      = "extern", type, identifier, "(", [ parameters ], ")",
+extern_decl      = "extern", type, [ "." ], identifier, "(", [ parameters ], ")",
                    "=", string, statement_end ;
+
+export_decl      = "export", string, function_decl ;
 
 cli_decl         = "cli", identifier, NEWLINE, INDENT,
                    cli_field, { cli_field | NEWLINE }, DEDENT ;
@@ -26,63 +34,113 @@ enum_variant     = identifier, [ "(", type, ")" ], statement_end ;
 
 class_decl       = class_prototype | class_definition ;
 qualified_identifier = identifier, { ".", identifier } ;
-class_prototype  = "class", qualified_identifier, [ type_parameters ], ";", statement_end ;
-class_definition = "class", qualified_identifier, [ type_parameters ], NEWLINE, INDENT,
-                   class_member, { class_member | NEWLINE }, DEDENT ;
-class_member     = [ "private" ], ( field | constructor | function_definition ) ;
-constructor      = [ type, "|", "error" ], "construct", "(", [ parameters ], ")", suite ;
-field            = [ "const" ], type, identifier, [ "=", expression ], statement_end ;
+class_signature  = "class", qualified_identifier, [ type_parameters ],
+                   [ identifier ], "(", [ parameters ], ")", [ "|", "error" ] ;
+class_prototype  = class_signature, ";", statement_end ;
+class_definition = class_signature, NEWLINE, INDENT,
+                   class_item, { class_item | NEWLINE }, DEDENT ;
+class_item       = [ "private" ], ( field | function_definition ) | statement ;
+field            = [ "const" ], type, identifier, [ "=", expression ], statement_end
+                 | type, "&", identifier, [ "=", "&", expression ], statement_end ;
+(* Ordinary header parameters and direct declarations are members. Header/body
+   local declarations are initialization-only. Inner control-block declarations
+   are local. Header members initialize first, then executable direct items run
+   in source order. Methods do not execute at generation. The optional identifier
+   is the fixed instance name. `construct` and `this` are ordinary identifiers. *)
 
 function_decl    = function_prototype | function_definition ;
 function_prototype = function_signature, ";", statement_end ;
 function_definition = function_signature, suite ;
-function_signature = type, identifier, [ type_parameters ],
+function_signature = type, [ "." ], identifier, [ type_parameters ],
                    "(", [ parameters ], ")" ;
 type_parameters  = "<", type_parameter, { ",", type_parameter }, ">" ;
 type_parameter   = identifier, [ ":", generic_constraint ] ;
 generic_constraint = "numeric" | "integer" | "floating" | "ordered" | "equatable" ;
 parameters       = parameter, { ",", parameter }, [ "," ] ;
-parameter        = [ "const" ], type, [ "&" ], identifier, [ "=", expression ] ;
+parameter        = [ "local" ], ( "const", type | type, [ "&" ] ), identifier, [ "=", expression ] ;
 
 type             = array_type, { "|", array_type } ;
-array_type       = type_atom, { "[", [ integer_expression ], "]" } ;
-type_atom        = function_type | tensor_type | qualified_identifier, [ type_arguments ] ;
-function_type    = "fn", "<", type, ">", "(", [ type, { ",", type } ], ")" ;
-tensor_type      = "tensor", "<", type, ">", [ shape_pattern ] ;
-shape_pattern    = "<", shape_axis, { ",", shape_axis }, ">" ;
-shape_axis       = integer_expression | "_" ;
+array_type       = type_atom, { "[", [ expression ], "]" } ;
+type_atom        = tuple_type | "(", type, ")" | function_type | tensor_type | qualified_identifier, [ type_arguments ] ;
+function_type    = "func", "<", type, ">", "(", [ type, { ",", type } ], ")" ;
+tensor_type      = "tensor", "<", type, ">", [ brace_shape ] ;
+brace_shape      = "{", brace_axis, { ",", brace_axis }, "}" ;
+brace_axis       = "nat", identifier, [ "=", expression ]
+                 | "_"
+                 | expression ;
 integer_expression = integer_term, { ( "+" | "-" ), integer_term } ;
 integer_term     = integer_factor, { ( "*" | "/" | "%" ), integer_factor } ;
 integer_factor   = ( "+" | "-" ), integer_factor
-                 | integer | identifier | "(", integer_expression, ")" ;
+                 | integer_literal | identifier | "(", integer_expression, ")" ;
 type_arguments   = "<", type, { ",", type }, ">" ;
 
 suite            = NEWLINE, INDENT, statement, { statement | NEWLINE }, DEDENT ;
 main_guard       = "if", "main", suite ;
-statement        = binding | assignment | address_assignment | return_stmt |
-                   loop_control_stmt | if_stmt | while_stmt | for_stmt | match_stmt | expr_stmt ;
-binding          = [ "const" ], type, [ "&" ], identifier,
-                   [ "=", [ "&" ], expression ], statement_end ;
+statement        = binding | destructuring | assignment | address_assignment | return_stmt |
+                   loop_control_stmt | if_stmt | while_stmt | for_stmt | match_stmt | parallel_stmt | expr_stmt ;
+binding          = [ "local" ], ( "const", [ "literal" ], type, identifier, "=", expression
+                   | type, [ "&" ], identifier, [ "=", [ "&" ], expression ]
+                   | [ "const" ], class_type, identifier, direct_call ), statement_end ;
+class_type       = qualified_identifier, [ type_arguments ] ;
+(* `literal` is a contextual keyword, only between `const` and the type:
+   `const literal real NAME = EXPRESSION` declares a contextual constant,
+   whose type is `real` (or `com`) and whose initializer is a constant exact
+   expression; elsewhere `literal` is an ordinary identifier. *)
 assignment       = assignable, assignment_operator, expression, statement_end ;
 assignment_operator = "=" | "+=" | "-=" | "*=" | "/=" | "%=" ;
-address_assignment = "&", identifier, "=", "&", expression, statement_end ;
+address_assignment = "&", reference_place, "=", "&", expression, statement_end ;
+reference_place  = identifier ;
 assignable       = postfix ;
 return_stmt      = "return", [ expression ], statement_end ;
 loop_control_stmt = ( "break" | "continue" ), statement_end ;
-if_stmt          = "if", expression, suite,
-                   { "elif", expression, suite }, [ "else", suite ] ;
-while_stmt       = "while", expression, suite ;
-for_stmt         = "for", [ "&" ], identifier, "in", expression, suite ;
-match_stmt       = "match", expression, NEWLINE, INDENT,
+if_stmt          = "if", or_expr, suite,
+                   { "elif", or_expr, suite }, [ "else", suite ] ;
+parallel_stmt    = "parallel", ( suite | for_stmt ) ;
+(* parallel for schedules each value iteration as its own independent node. *)
+(* Each direct statement is one node. Bindings are visible to later nodes only
+   within the block. return, break and continue may not leave a node. *)
+while_stmt       = "while", or_expr, suite ;
+for_stmt         = "for", ( range_header | collection_header | zip_header ), suite ;
+range_header     = bit_or_expr, ascending_op, [ type ], identifier, ascending_op, bit_or_expr, [ "step", bit_or_expr ]
+                 | bit_or_expr, descending_op, [ type ], identifier, descending_op, bit_or_expr, [ "step", bit_or_expr ]
+                 | [ type ], identifier, ascending_op, bit_or_expr, [ "step", bit_or_expr ]
+                 | bit_or_expr, descending_op, [ type ], identifier, [ "step", bit_or_expr ] ;
+ascending_op     = "<" | "<=" ;
+descending_op    = ">" | ">=" ;
+(* A postfix call may be reflect.each or a traversal function. Such a traversal
+   is only an element source or the return of a reflect.Each<T> function. *)
+collection_header = [ type | "auto" ], [ "&" ], identifier, "=", [ "&" ], postfix, "[", [ ( "nat" | "auto" ), identifier ], "]" ;
+zip_header       = array_value_binding, ",", array_value_binding, { ",", array_value_binding } ;
+array_value_binding = [ type | "auto" ], identifier, "=", postfix, "[", "]" ;
+(* Zip headers take Array values only, without reference, range, traversal,
+   pattern or index bindings. Sources are evaluated once, left to right;
+   each value is snapshotted immediately. Equal lengths are checked before
+   the body runs, including when one source is empty. *)
+(* Reference collection headers require declarations and & on both sides.
+   Range shorthand omits only the inclusive zero bound; full headers win
+   when a middle variable and two operators are present. *)
+match_stmt       = "match", or_expr, NEWLINE, INDENT,
                    match_case, { match_case | NEWLINE }, DEDENT ;
-match_case       = type, [ identifier | "(", identifier, ")" ], suite ;
+match_case       = ( type, [ identifier | "(", identifier, ")" ] | match_pattern ), suite ;
+match_pattern    = "(", match_element, ",", match_element, { ",", match_element }, ")" ;
+match_element    = [ "const" ], ( type | "auto" ), identifier | type | "_" | match_pattern ;
+(* A parenthesized case is a type when it scans as one and its group is followed
+   by a name, an array suffix, | or end of line; otherwise it is a pattern. *)
 expr_stmt        = expression, statement_end ;
 
-expression       = or_expr ;
+expression       = if_expr | or_expr ;
+if_expr          = "if", or_expr, "then", or_expr,
+                   { "elif", or_expr, "then", or_expr }, "else", or_expr ;
 or_expr          = and_expr, { "or", and_expr } ;
 and_expr         = equality, { "and", equality } ;
 equality         = comparison, { ( "==" | "!=" ), comparison } ;
 comparison       = bit_or_expr, { ( "<" | "<=" | ">" | ">=" ), bit_or_expr } ;
+(* Chained comparisons: two or more relational operators at one comparison level form a chain
+   `a < b <= c`, meaning `a < b and b <= c` with every operand evaluated at most once, left to
+   right, short-circuiting. A chain uses only {<, <=} or only {>, >=}. Two or more `==` at one
+   equality level form an equality chain; `!=` never chains and cannot share a level with `==`.
+   An unparenthesized relational comparison next to `==` or `!=` (`a < b == c`, `a == b < c`)
+   is a mixed chain and a compile error; write `(a < b) == c` for the comparison of a result. *)
 bit_or_expr      = bit_xor_expr, { "OR", bit_xor_expr } ;
 bit_xor_expr     = bit_and_expr, { "XOR", bit_and_expr } ;
 bit_and_expr     = shift_expr, { "AND", shift_expr } ;
@@ -90,17 +148,29 @@ shift_expr       = term, { ( "<<" | ">>" ), term } ;
 term             = factor, { ( "+" | "-" ), factor } ;
 factor           = unary, { ( "*" | "/" | "%" ), unary } ;
 unary            = ( "try" | "not" | "NOT" | "-" | "&" ), unary | power ;
-power            = postfix, [ "^", unary ] ;
+power            = ( marked_call | postfix ), [ "^", unary ] ;
+marked_call      = ".", postfix ;   (* the postfix must end in a call *)
+(* Mutation markers (L1): `.` before a definition's name (`void .update()`,
+   `extern void .set(...)`) declares that the function may change existing state that its `&`
+   parameters do not expose, and one `.` before a call's postfix chain (`.update()`,
+   `.obj.update()`, `.mod.T(...)`) marks a call that may. A `.` written before a postfix chain
+   covers the calls of that chain (receiver positions), not calls nested in its arguments. A `.`
+   where an operand starts is always a marker; a member access follows a complete operand. In a
+   type, the `.` of a qualified name touches the name before it, so `T .name(` declares a marked
+   function. *)
 postfix          = primary, { generic_call | direct_call | index_suffix | member_suffix } ;
 generic_call     = type_arguments, "(", [ arguments ], ")" ;
 direct_call      = "(", [ arguments ], ")" ;
 index_suffix     = "[", index_item, { ",", index_item }, "]" ;
 index_item       = expression
-                 | [ expression ], ":", [ expression ], [ ":", [ expression ] ] ;
+                 | [ slice_start ], ":", [ slice_end ], [ ":", [ expression ] ] ;
+slice_start      = expression, [ "<" | ">" ] ;   (* a marker touches the colon *)
+slice_end        = [ "<" | ">" ], expression ;   (* a marker touches the colon *)
 member_suffix    = ".", identifier, [ type_arguments ],
                    [ "(", [ arguments ], ")" ] ;
-primary          = integer | float | string | "true" | "false" | "void" | "none" |
-                   array | identifier | "(", expression, ")" ;
+primary          = integer_literal | real_literal | imaginary_literal | string |
+                   "true" | "false" | "void" | "none" |
+                   tuple_expr | array | identifier | "(", expression, ")" ;
 array            = "[", [ expression, { ",", expression }, [ "," ] ], "]" ;
 arguments        = argument, { ",", argument }, [ "," ] ;
 argument         = "&", identifier, "=", "&", expression
@@ -109,13 +179,20 @@ argument         = "&", identifier, "=", "&", expression
 statement_end    = NEWLINE | EOF ;
 
 (* Numeric lexical constraints:
-   - integer literals are decimal digits only; 0x/0b/0o-style base prefixes do not exist;
-   - floating literals contain a decimal point;
-   - exponent notation is available only after that decimal point, e.g. 1.0e8;
-   - numeric literals carry integer/real families rather than default concrete types;
-   - an integer-family literal has no implementation-width ceiling when its unique
-     context is bigint; fixed-width contexts retain their normal range limits;
-   - fixed-width integer bitwise operators are AND, OR, XOR, NOT, <<, and >>.
+   - integer literals are decimal digits only; 0x/0b/0o prefixes do not exist;
+   - real literals contain a decimal point; exponent notation only after it (1.0e8);
+   - an imaginary literal is a real literal immediately followed by `i` that is not
+     followed by an identifier character (2.0i, 1.0e-3i); `i` is not reserved, so
+     `int i = 5` stays valid; `2i` is lexed as an integer-form imaginary literal
+     and rejected by the checker;
+   - literals carry categories, not types: non-negative integer, negative integer
+     (unary `-` applied to an integer literal), real, imaginary, and complex (a real
+     and an imaginary literal joined by + or -); each materializes only into the
+     types of its category;
+   - in a nat or int context an integer literal has no width ceiling; fixed-width
+     contexts keep their ranges; a real literal rounds correctly to realN and is
+     exact for real;
+   - AND, OR, XOR, NOT, <<, >> apply only to nat8..nat64 and int8..int64.
      Lowercase and/or/not remain bool-only logical operators. *)
 
 (* Static/frontend constraints:
@@ -132,41 +209,110 @@ statement_end    = NEWLINE | EOF ;
    - cli_decl is root-only, occurs at most once, and its fields use
      argument(), trailing argument(default = value), option(default = value), or flag();
      required positional argument() fields must precede optional positional fields;
-   - `tensor<T><D0, D1, ...>` uses a mandatory fixed-width native numeric element type plus an
-     optional exact-rank shape pattern; each shape axis is `_` or an integer
+   - `tensor<T>{AXIS, ...}` uses a mandatory fixed-width native numeric element type plus an
+     optional exact-rank shape pattern; each shape axis is `_`, a shape-variable declaration or a nat
      expression, and the number of axes is the required rank. Integer expressions
      that are not compile-time constants are evaluated once when the binding is
      created and their nonnegative results are captured for that binding;
+   - a shape in braces, `tensor<T>{AXIS, ...}`, gives the roles of the four bracket
+     kinds: `<...>` the element type, `{...}` the shape, `[...]` an index or a slice,
+     `(...)` a call; outside string literals, `{` and `}` appear only in shapes, and
+     `tensor` is always followed by `<T>`. An axis is `nat N` (a new shape variable,
+     the axis's extent), `nat N = EXPR` (a new shape variable equal to EXPR), a bare
+     name (an existing shape variable or nat value: the axis equals it), `_` (an
+     extent of any length that binds nothing) or any other integer expression (the
+     axis equals it); only `nat` declares, only a lone identifier is a bare name, and
+     `(n)` is an expression. Every extent is nat: an integer of another kind is
+     written `nat(n)`. A bare name that names nothing, or a binding that is not nat,
+     is an error; declaring a visible name is SHADOWING, and declaring one twice in a
+     shape is an error (`{nat N, N}` is square). A shape is one scope unit: an axis may
+     use any variable of its shape whatever the textual order, `nat N = EXPR` axes are
+     evaluated in dependency order, and a cycle is an error. Shape variables are
+     read-only nat values, scoped like bindings and reused by bare name; without an
+     initializer a declaration has no `nat N` axis. In bindings and match cases the
+     axes take every form; in signatures, constructors, extern declarations, fn types
+     and other type positions a brace shape takes integer literals and `_`;
    - array dimensions use the same integer-expression rule. `[]` remains a
      runtime-sized dimension, while `[expr]` captures expr once for the binding;
-   - generic classes require explicit type arguments; generic function/method
+   - generic classes require explicit type arguments in type positions; a
+     construction call may omit them when the constructor's arguments uniquely
+     determine every class type parameter; generic function/method
      type arguments may be omitted when every generic parameter is uniquely inferred
      from call arguments; all concrete uses are monomorphized before ordinary static checking;
-   - `fn<R>(P...)` is a capture-free function-value type. Converting a declared
+   - `func<R>(P...)` is a capture-free function-value type. Converting a declared
      function to it requires the complete explicit function-value context and an exact
      by-value signature; extern functions, reference-parameter functions, and bound
      methods do not implicitly become function values;
-   - `T(...)` is a constructor call of class T: a class has at most one `construct`
-     member, and alternative call forms use that constructor's default parameters rather
-     than overload resolution. `construct(...)` names no type; a fallible one is spelled
-     `T | error construct(...)`. A class-typed declaration without an initializer creates
-     the value with its field defaults; fields may remain uninitialized until assigned;
+   - `T(...)` runs the class header and ordered initialization body. Header defaults
+     or free factories express alternate forms; `construct` is an ordinary name.
+     `T name(args)` is declaration syntax equivalent to `T name = T(args)`.
+     A bare class binding has no accessible instance until whole-value initialization;
+     standard Map/Set bare bindings retain initialized empty storage;
    - in an initialized local binding, bare `auto` infers the non-`error` success side and
      fails fast if the initializer produces `error`; `auto | error` is the only union form
      containing `auto` and explicitly retains that failure channel. Forms such as
      `error | auto` and `auto | none` are invalid;
-   - class members are public by default. private is a class-member-only prefix, valid on
-     constructors too; private access is restricted to methods declared by the owning class;
+   - class members are public by default. private limits a member to its declaring class; top-level private limits a declaration to its module;
    - a string literal placeholder `{&storage}` is an input target and is valid only as
      the format of scan(...); print, flush and scan return void | error, and an
      expression statement whose value can be error fails fast on error;
    - `public import` re-exports the imported alias as a nested namespace of the module;
+   - class members use their bare names; an optional header instance name denotes
+     the fixed whole instance and cannot be replaced or escape during initialization;
+     `this` has no implicit meaning. local before const/type declares a temporary,
+     scoped from its declaration through inner control blocks, never another definition;
+   - `_` is the discard name, not a reserved word: it is never declared (as a binding,
+     parameter, field, function, method, class, enum, variant, type parameter, match
+     binder, loop name or import alias) and never read; in a brace tensor shape it is
+     an axis of any extent;
+   - identifiers that begin with `__quidra_` are reserved for the compiler and are never
+     declared;
+   - `export` is contextual: it begins an export_decl only at top level and only when a
+     string literal follows it; elsewhere it is an ordinary identifier. The string is
+     "C". An export_decl prefixes a non-generic free function, never a method,
+     constructor or class member, and is not valid inside a block. When an exported
+     function has a prototype, the prototype and the definition both carry the prefix;
+   - an if-expression's condition and branches are or_expr: an if-expression nested there,
+     or used as an operand, is parenthesized, and a branch extends as far as an or_expr, so
+     `if c then 2 else 3 + 1` is `if c then 2 else (3 + 1)`; `else` is mandatory and
+     `else if` is written `elif`; a statement that begins with `if` is an if_stmt (or the
+     `if main` guard), never an expression statement; statement headers are or_expr, so an
+     if-expression there is parenthesized; outside brackets an if-expression ends with its
+     line; it gives a value, never a reference (no `&` before it, no reference binding to it,
+     no address as a branch); `then` is reserved;
+   - a slice item is `[start:end:step]`. Each side is inclusive (no marker) or exclusive
+     (a marker): the start side `s<:` (ascending) or `s>:` (descending), the end side
+     `:<e` (ascending) or `:>e` (descending). A marker is a `<` or `>` written directly
+     next to the first colon of the item, with no whitespace between; anywhere else `<`
+     and `>` are comparisons, and a comparison inside parentheses, brackets or an
+     argument list belongs to no slice. A marker after the final `else` branch of an
+     if-expression marks the whole if-expression. An exclusive marker needs its value
+     (`s<:`, `s>:`, `:<e`, `:>e`), and no marker belongs to the second colon (the step);
+     `<=` and `>=` are never markers;
+   - a slice's direction comes from its markers (`<` ascending, `>` descending), else from
+     its step's sign, else it ascends; two markers that point different ways, and a marker
+     against the step's sign, are errors, and so is a step of 0. The default step is +1
+     ascending and -1 descending. The start is the anchor of the progression
+     start, start + step, ...; an exclusive start drops the anchor itself;
    - safe address targets, exhaustive cases, field-level initialization, fixed shapes,
      argument ordering, value equality, and
      no-shadowing are checked statically.
    '&' forms safe storage addresses. print may observe the current raw machine
      address, and ==/!= may compare address identity; addresses are otherwise non-storable
      and do not support conversion, arithmetic, ordering, or dereference;
-   - const removes write authority through that binding/reference path. const value
-     bindings require initialization; const references require initialized stable storage
-     and cannot be rebound or promoted back to writable references. *)
+   - `const T` is an immutable value; `T &` is the only reference form, and `const T &`
+     is rejected (CONST_REFERENCE). const value bindings require initialization; a const
+     parameter takes a value at the call, never `&storage`. *)
+
+(* Tuple type and literal atoms: at least two elements, no trailing comma.
+   A single element in parentheses is a grouped type or expression. *)
+tuple_type = "(", type, ",", type, { ",", type }, ")" ;
+tuple_expr = "(", expression, ",", expression, { ",", expression }, ")" ;
+
+destructuring = pattern, "=", [ "&" ], expression, statement_end ;
+pattern = "(", pattern_element, ",", pattern_element, { ",", pattern_element }, ")" ;
+pattern_element = [ "const" ], ( type | "auto" ), [ "&" ], identifier
+                | "_" | pattern | assignable ;
+
+(* Collection for headers also accept a declaration, existing-place or reference
+   tuple pattern before = SOURCE[]. Reference patterns take &SOURCE[]. *)

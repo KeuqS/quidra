@@ -6,6 +6,7 @@
 #include <utility>
 
 #include "quidra/project.hpp"
+#include "quidra/standard_classes.hpp"
 
 namespace quidra {
 
@@ -14,21 +15,29 @@ struct BuiltinTypeName {
     std::string_view canonical;
 };
 
-inline constexpr std::array<BuiltinTypeName, 20> builtin_type_names{{
+// The spellings of the built-in types and the canonical name each one
+// denotes.
+inline constexpr std::array<BuiltinTypeName, 27> builtin_type_names{{
     {"int", "int"},
+    {"nat", "nat"},
     {"int8", "int8"},
     {"int16", "int16"},
     {"int32", "int32"},
-    {"int64", "int"},
-    {"uint8", "uint8"},
-    {"uint16", "uint16"},
-    {"uint32", "uint32"},
-    {"uint64", "uint64"},
-    {"bigint", "bigint"},
-    {"float", "float"},
-    {"float32", "float32"},
-    {"float64", "float"},
-    {"bigreal", "bigreal"},
+    {"int64", "int64"},
+    {"nat8", "nat8"},
+    {"nat16", "nat16"},
+    {"nat32", "nat32"},
+    {"nat64", "nat64"},
+    {"real16", "real16"},
+    {"real16b", "real16b"},
+    {"real32", "real32"},
+    {"real64", "real64"},
+    {"real", "real"},
+    {"com16", "com16"},
+    {"com16b", "com16b"},
+    {"com32", "com32"},
+    {"com64", "com64"},
+    {"com", "com"},
     {"bool", "bool"},
     {"string", "string"},
     {"bin", "bin"},
@@ -46,7 +55,7 @@ inline constexpr bool is_builtin_type_name(std::string_view name) {
 
 inline constexpr bool is_language_type_name(std::string_view name) {
     return is_builtin_type_name(name) || name == "tensor" ||
-           name == "fn" || name == "auto" || name == "union" ||
+           name == "func" || name == "auto" || name == "union" ||
            name == "extern";
 }
 
@@ -62,11 +71,11 @@ enum class BuiltinCallable {
     Scan,
     Flush,
     Exit,
-    Range,
     Array,
     Len,
     ExactAtom,
     ExactUnary,
+    ExactOp,
     CliArgument,
     CliArgumentOptional,
     CliOption,
@@ -95,8 +104,6 @@ enum class BuiltinCallable {
     TimeSeconds,
     TimeSleep,
     GpuSync,
-    TaskAll,
-    AtomicCounter,
     AutogradTarget,
     RandomGenerator,
     RandomInt,
@@ -112,7 +119,6 @@ enum class BuiltinCallable {
     JsonText,
     JsonInteger,
     JsonNumber,
-    JsonBigInt,
     JsonBigReal,
     JsonBoolean,
     JsonEncode,
@@ -124,6 +130,8 @@ enum class BuiltinCallable {
     TensorOnes,
     ReflectCollect,
     ReflectPaths,
+    ReflectEachPaths,
+    ReflectEach,
     ReflectTypeName,
 };
 
@@ -136,11 +144,10 @@ struct BuiltinCallableInfo {
 // monotonic name-resolution rule, adding an entry here reserves a previously
 // usable source name and is therefore a compatibility-breaking language change.
 // Prefer namespaced standard-library functions or value methods for new APIs.
-inline constexpr std::array<BuiltinCallableInfo, 7> builtin_callables{{
+inline constexpr std::array<BuiltinCallableInfo, 6> builtin_callables{{
     {"print", BuiltinCallable::Print},
     {"flush", BuiltinCallable::Flush},
     {"scan", BuiltinCallable::Scan},
-    {"range", BuiltinCallable::Range},
     {"array", BuiltinCallable::Array},
     {"len", BuiltinCallable::Len},
     {"tensor", BuiltinCallable::TensorCreate},
@@ -175,12 +182,10 @@ inline constexpr std::array<BuiltinCallableInfo, 60> intrinsic_callables{{
     {"$std.time.seconds", BuiltinCallable::TimeSeconds},
     {"$std.time.sleep", BuiltinCallable::TimeSleep},
     {"$std.gpu.sync", BuiltinCallable::GpuSync},
-    {"$std.task.all", BuiltinCallable::TaskAll},
-    {"$std.atomic.counter", BuiltinCallable::AtomicCounter},
     {"$std.autograd.target", BuiltinCallable::AutogradTarget},
     {"$std.random.generator", BuiltinCallable::RandomGenerator},
     {"$std.random.int", BuiltinCallable::RandomInt},
-    {"$std.random.float", BuiltinCallable::RandomFloat},
+    {"$std.random.real64", BuiltinCallable::RandomFloat},
     {"$std.random.bool", BuiltinCallable::RandomBool},
     {"$std.process.run", BuiltinCallable::ProcessRun},
     {"$std.process.shell", BuiltinCallable::ProcessShell},
@@ -193,8 +198,7 @@ inline constexpr std::array<BuiltinCallableInfo, 60> intrinsic_callables{{
     {"$std.json.text", BuiltinCallable::JsonText},
     {"$std.json.integer", BuiltinCallable::JsonInteger},
     {"$std.json.number", BuiltinCallable::JsonNumber},
-    {"$std.json.bigint", BuiltinCallable::JsonBigInt},
-    {"$std.json.bigreal", BuiltinCallable::JsonBigReal},
+    {"$std.json.real", BuiltinCallable::JsonBigReal},
     {"$std.json.boolean", BuiltinCallable::JsonBoolean},
     {"$std.json.encode", BuiltinCallable::JsonEncode},
     {"$std.json.equal", BuiltinCallable::JsonEqual},
@@ -202,10 +206,13 @@ inline constexpr std::array<BuiltinCallableInfo, 60> intrinsic_callables{{
     {"$std.http.header", BuiltinCallable::HttpHeader},
     {"$std.tensor.zeros", BuiltinCallable::TensorZeros},
     {"$std.tensor.ones", BuiltinCallable::TensorOnes},
-    {"$std.exact.atom", BuiltinCallable::ExactAtom},
-    {"$std.exact.unary", BuiltinCallable::ExactUnary},
+    {"$std.real.atom", BuiltinCallable::ExactAtom},
+    {"$std.real.unary", BuiltinCallable::ExactUnary},
+    {"$std.real.op", BuiltinCallable::ExactOp},
     {"$std.reflect.collect", BuiltinCallable::ReflectCollect},
     {"$std.reflect.paths", BuiltinCallable::ReflectPaths},
+    {"$std.reflect.each_paths", BuiltinCallable::ReflectEachPaths},
+    {"$std.reflect.each", BuiltinCallable::ReflectEach},
     {"$std.reflect.type_name", BuiltinCallable::ReflectTypeName},
 }};
 
@@ -219,9 +226,141 @@ inline constexpr std::optional<BuiltinCallable> builtin_callable(std::string_vie
     return std::nullopt;
 }
 
-inline constexpr std::array<std::string_view, 19> standard_modules{{
-    "cli", "file", "environment", "test", "time", "gpu", "task", "atomic", "autograd", "ref", "reflect", "random", "process",
-    "map", "set", "json", "http", "tensor", "exact"
+// ---- Effects of the built-ins (L1, L2) ------------------------------------
+// What the built-in callables and the methods of built-in types change or
+// use besides their `&` arguments. The effect summaries read these tables,
+// and a method that changes existing state needs the mutation marker at
+// every call (`.handle.write(text)`). External I/O is never such a change;
+// it only takes part in conflicts. The methods with a Quidra body
+// (map.Map, set.Set, random.Generator) declare their marker in that body.
+
+// The external resources, in the order of semantics::ResourceKind.
+enum class BuiltinResource : unsigned char {
+    Stdout,
+    Stdin,
+    Stderr,
+    FileSystem,
+    Process,
+    Network,
+    Clock,
+    Environment,
+};
+// Shared commutes with other shared uses of the resource; Exclusive does not.
+enum class BuiltinResourceUse : unsigned char { Shared, Exclusive };
+
+struct BuiltinResourceAccess {
+    BuiltinResource resource;
+    BuiltinResourceUse use;
+};
+
+struct BuiltinCallableEffect {
+    BuiltinCallable kind;
+    // At most four resource uses; `count` of them are valid.
+    std::array<BuiltinResourceAccess, 4> resources;
+    unsigned char count;
+    // A generator method's built-in: it advances the receiver's state.
+    bool advances_receiver;
+};
+
+inline constexpr std::array<BuiltinCallableEffect, 28> builtin_callable_effects{{
+    {BuiltinCallable::Print, {{{BuiltinResource::Stdout, BuiltinResourceUse::Exclusive}}}, 1, false},
+    {BuiltinCallable::Flush, {{{BuiltinResource::Stdout, BuiltinResourceUse::Exclusive}}}, 1, false},
+    {BuiltinCallable::Scan, {{{BuiltinResource::Stdin, BuiltinResourceUse::Exclusive}}}, 1, false},
+    {BuiltinCallable::FileRead, {{{BuiltinResource::FileSystem, BuiltinResourceUse::Shared}}}, 1, false},
+    {BuiltinCallable::FileReadBin, {{{BuiltinResource::FileSystem, BuiltinResourceUse::Shared}}}, 1, false},
+    {BuiltinCallable::FileExists, {{{BuiltinResource::FileSystem, BuiltinResourceUse::Shared}}}, 1, false},
+    {BuiltinCallable::FileIsDirectory, {{{BuiltinResource::FileSystem, BuiltinResourceUse::Shared}}}, 1, false},
+    {BuiltinCallable::FileList, {{{BuiltinResource::FileSystem, BuiltinResourceUse::Shared}}}, 1, false},
+    {BuiltinCallable::FileOpen, {{{BuiltinResource::FileSystem, BuiltinResourceUse::Shared}}}, 1, false},
+    {BuiltinCallable::FileWrite, {{{BuiltinResource::FileSystem, BuiltinResourceUse::Exclusive}}}, 1, false},
+    {BuiltinCallable::FileWriteBin, {{{BuiltinResource::FileSystem, BuiltinResourceUse::Exclusive}}}, 1, false},
+    {BuiltinCallable::FileRemove, {{{BuiltinResource::FileSystem, BuiltinResourceUse::Exclusive}}}, 1, false},
+    {BuiltinCallable::FileCopy, {{{BuiltinResource::FileSystem, BuiltinResourceUse::Exclusive}}}, 1, false},
+    {BuiltinCallable::FileMove, {{{BuiltinResource::FileSystem, BuiltinResourceUse::Exclusive}}}, 1, false},
+    {BuiltinCallable::FileMkdir, {{{BuiltinResource::FileSystem, BuiltinResourceUse::Exclusive}}}, 1, false},
+    {BuiltinCallable::FileCreate, {{{BuiltinResource::FileSystem, BuiltinResourceUse::Exclusive}}}, 1, false},
+    {BuiltinCallable::FileAppend, {{{BuiltinResource::FileSystem, BuiltinResourceUse::Exclusive}}}, 1, false},
+    {BuiltinCallable::ProcessRun,
+     {{{BuiltinResource::Process, BuiltinResourceUse::Exclusive},
+       {BuiltinResource::FileSystem, BuiltinResourceUse::Exclusive},
+       {BuiltinResource::Network, BuiltinResourceUse::Exclusive},
+       {BuiltinResource::Stdin, BuiltinResourceUse::Exclusive}}},
+     4, false},
+    {BuiltinCallable::ProcessShell,
+     {{{BuiltinResource::Process, BuiltinResourceUse::Exclusive},
+       {BuiltinResource::FileSystem, BuiltinResourceUse::Exclusive},
+       {BuiltinResource::Network, BuiltinResourceUse::Exclusive},
+       {BuiltinResource::Stdin, BuiltinResourceUse::Exclusive}}},
+     4, false},
+    {BuiltinCallable::HttpGet, {{{BuiltinResource::Network, BuiltinResourceUse::Exclusive}}}, 1, false},
+    {BuiltinCallable::TimeNow, {{{BuiltinResource::Clock, BuiltinResourceUse::Exclusive}}}, 1, false},
+    {BuiltinCallable::TimeSince, {{{BuiltinResource::Clock, BuiltinResourceUse::Exclusive}}}, 1, false},
+    {BuiltinCallable::TimeSleep, {{{BuiltinResource::Clock, BuiltinResourceUse::Shared}}}, 1, false},
+    {BuiltinCallable::EnvironmentGet, {{{BuiltinResource::Environment, BuiltinResourceUse::Shared}}}, 1, false},
+    {BuiltinCallable::EnvironmentHas, {{{BuiltinResource::Environment, BuiltinResourceUse::Shared}}}, 1, false},
+    {BuiltinCallable::RandomInt, {}, 0, true},
+    {BuiltinCallable::RandomFloat, {}, 0, true},
+    {BuiltinCallable::RandomBool, {}, 0, true},
+}};
+
+// The effects of `kind`, or null when it changes nothing and uses no
+// resource.
+inline constexpr const BuiltinCallableEffect* builtin_callable_effect(BuiltinCallable kind) {
+    for (const auto& effect : builtin_callable_effects) {
+        if (effect.kind == kind) return &effect;
+    }
+    return nullptr;
+}
+
+// What a method of a built-in type changes besides its arguments.
+enum class StandardMethodChange : unsigned char {
+    // The receiver's own value (a tensor or Target gradient).
+    Receiver,
+    // The shared state the receiver holds, which every copy of the receiver
+    // shares (a file position or close state).
+    SharedState,
+};
+// The file access of a file.Handle method, through that handle.
+enum class StandardMethodFileAccess : unsigned char { None, Read, Write };
+
+struct StandardMethodEffect {
+    // "tensor", or the standard class id (quidra/standard_classes.hpp).
+    std::string_view receiver;
+    std::string_view method;
+    StandardMethodChange change;
+    StandardMethodFileAccess file;
+};
+
+// Every method of a built-in type that changes existing state: each needs
+// the mutation marker. tensor.track(), retrack() and untrack() return a new
+// value and leave their receiver as it was, so they are not listed.
+inline constexpr std::array<StandardMethodEffect, 11> standard_method_effects{{
+    {"tensor", "clear_grad", StandardMethodChange::Receiver, StandardMethodFileAccess::None},
+    {"$std.file.Handle", "read", StandardMethodChange::SharedState, StandardMethodFileAccess::Read},
+    {"$std.file.Handle", "read_line", StandardMethodChange::SharedState, StandardMethodFileAccess::Read},
+    {"$std.file.Handle", "read_bin", StandardMethodChange::SharedState, StandardMethodFileAccess::Read},
+    {"$std.file.Handle", "seek", StandardMethodChange::SharedState, StandardMethodFileAccess::Read},
+    {"$std.file.Handle", "write", StandardMethodChange::SharedState, StandardMethodFileAccess::Write},
+    {"$std.file.Handle", "write_line", StandardMethodChange::SharedState, StandardMethodFileAccess::Write},
+    {"$std.file.Handle", "flush", StandardMethodChange::SharedState, StandardMethodFileAccess::Write},
+    {"$std.file.Handle", "close", StandardMethodChange::SharedState, StandardMethodFileAccess::Write},
+    {"$std.autograd.Target", "clear_grad", StandardMethodChange::Receiver, StandardMethodFileAccess::None},
+}};
+
+// The effect of the method `method` of a value whose type is `receiver`
+// ("tensor" or a standard class id), or null when the method changes
+// nothing besides its arguments.
+inline constexpr const StandardMethodEffect* standard_method_effect(std::string_view receiver,
+                                                                   std::string_view method) {
+    for (const auto& effect : standard_method_effects) {
+        if (effect.receiver == receiver && effect.method == method) return &effect;
+    }
+    return nullptr;
+}
+
+inline constexpr std::array<std::string_view, 18> standard_modules{{
+    "cli", "file", "environment", "test", "time", "gpu", "autograd", "reflect", "random", "process",
+    "map", "set", "json", "http", "tensor"
 }};
 
 inline constexpr bool is_standard_module(std::string_view name) {
@@ -264,14 +403,8 @@ inline constexpr std::optional<std::string_view> standard_function_target(
         if (member == "sync") return "$std.gpu.sync";
         return std::nullopt;
     }
-    if (module == "task") {
-        if (member == "all") return "$std.task.all";
-        return std::nullopt;
-    }
-    if (module == "atomic") {
-        if (member == "counter") return "$std.atomic.counter";
-        return std::nullopt;
-    }
+
+
     if (module == "autograd") {
         if (member == "target") return "$std.autograd.target";
         return std::nullopt;
@@ -279,6 +412,8 @@ inline constexpr std::optional<std::string_view> standard_function_target(
     if (module == "reflect") {
         if (member == "collect") return "$std.reflect.collect";
         if (member == "paths") return "$std.reflect.paths";
+        if (member == "each") return "$std.reflect.each";
+        if (member == "each_paths") return "$std.reflect.each_paths";
         if (member == "type_name") return "$std.reflect.type_name";
         return std::nullopt;
     }
@@ -305,11 +440,6 @@ inline constexpr std::optional<std::string_view> standard_function_target(
         if (member == "ones") return "$std.tensor.ones";
         return std::nullopt;
     }
-    if (module == "exact") {
-        if (member == "atom") return "$std.exact.atom";
-        if (member == "unary") return "$std.exact.unary";
-        return std::nullopt;
-    }
     if (module == "file") {
         if (member == "open") return "$std.file.open";
         if (member == "create") return "$std.file.create";
@@ -326,6 +456,19 @@ inline constexpr std::optional<std::string_view> standard_function_target(
         if (member == "mkdir") return "$std.file.mkdir";
         if (member == "list") return "$std.file.list";
         return std::nullopt;
+    }
+    return std::nullopt;
+}
+
+// The functions a built-in type name provides as a namespace:
+// real.atom(provider, opcode), real.unary(provider, opcode, value) and
+// real.op(provider, opcode, values...), the exact-real extension intrinsics.
+inline constexpr std::optional<std::string_view> standard_type_function_target(
+    std::string_view type, std::string_view member) {
+    if (type == "real") {
+        if (member == "atom") return "$std.real.atom";
+        if (member == "unary") return "$std.real.unary";
+        if (member == "op") return "$std.real.op";
     }
     return std::nullopt;
 }
@@ -380,19 +523,39 @@ inline constexpr std::string_view renamed_text_constant(std::string_view name) {
     return {};
 }
 
-// `Point point` creates the value at the declaration, with its declared
-// defaults, so fields can be assigned one by one. Standard-library value
-// types that user code cannot construct (file handles, generators, process
-// results and the like) stay uninitialized until the library supplies them.
-inline constexpr bool class_storage_established_at_declaration(std::string_view class_name) {
-    return !class_name.starts_with("$std.");
+// Ordinary class bindings need an explicitly supplied instance. Only standard
+// map/set bindings establish their compiler-owned empty storage at declaration.
+inline constexpr bool class_storage_established_at_declaration(
+    std::string_view class_name, bool standard_library) {
+    return standard_library &&
+        (class_name.starts_with(standard_class::map_instance_prefix) ||
+         class_name.starts_with(standard_class::set_instance_prefix));
+}
+
+// `_` is the discard name: where a construct binds a value it does not use,
+// `_` binds nothing. It therefore never names a declaration and can never be
+// read. The frontend and the checker report both with DISCARD.
+inline constexpr std::string_view discard_name = "_";
+inline constexpr bool is_discard_name(std::string_view name) { return name == discard_name; }
+inline constexpr char discard_declaration_message[] =
+    "'_' is the discard name; it cannot name a variable, parameter, field, function, "
+    "class, enum, module or type.";
+inline constexpr char discard_typed_message[] = "'_' takes no type; its type is inferred.";
+inline constexpr char discard_read_message[] = "'_' discards a value; it cannot be read.";
+
+// Names that start with "__quidra_" (abi::symbol_namespace::internal_prefix)
+// belong to the compiler: it gives them to the instances of generic
+// declarations and to its own helpers. No source declares one (SHADOWING).
+inline std::string compiler_name_message(std::string_view name) {
+    return "'" + std::string(name) +
+           "' starts with '__quidra_', which is reserved for the names the compiler makes.";
 }
 
 inline constexpr bool is_reserved_value_name(std::string_view name) {
     return is_builtin_text_constant(name) || is_builtin_callable(name) ||
            is_builtin_type_name(name) || is_standard_module(name) ||
-           name == "fn" || name == "auto" || name == "union" ||
-           name == "construct" || name == "main";
+           name == "func" || name == "fn" || name == "auto" || name == "union" ||
+           name == "main" || name == "parallel" || name == "local";
 }
 
 inline std::string builtin_types_json() {
@@ -403,7 +566,7 @@ inline std::string builtin_types_json() {
         first = false;
         out += "\"" + std::string(type.name) + "\"";
     }
-    out += ",\"fn<R>(A, B)\",\"T[]\",\"T[n]\",\"T | U\",\"class Name\"]";
+    out += ",\"func<R>(A, B)\",\"T[]\",\"T[n]\",\"T | U\",\"class Name\"]";
     return out;
 }
 

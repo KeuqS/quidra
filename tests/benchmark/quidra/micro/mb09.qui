@@ -6,60 +6,60 @@ cli args
     int iterations = argument(default = 7)
 
 // Lehmer / MINSTD generator, frozen for every language in the suite.
-class Lcg
+class Lcg(local int seed)
+
     int state
+    state = seed
 
-    construct(int seed)
-        state = seed
-
-    int next_int()
+    int .next_int()
         state = (48271 * state) % 2147483647
         return state
 
-    float next_unit()
-        return float(next_int()) / 2147483647.0
+    real64 .next_unit()
+        real64 value = real64(.next_int())
+        return value / 2147483647.0
 
-class Result
-    float mean
-    float var
-    float sd
-    float mn
-    float mx
-    float mad
-    float pearson
+class Result()
+    real64 mean
+    real64 var
+    real64 sd
+    real64 mn
+    real64 mx
+    real64 mad
+    real64 pearson
     int hist_chk
 
 // The whole workload body, generation included (methodology 06 section 4, MB-09).
 Result workload()
     int n = 2000000
     int rounds = 30
-    float count = 2000000.0
-    float scale = 0.64
+    real64 count = 2000000.0
+    real64 scale = 0.64
     Lcg g = Lcg(20269917)
-    float[] x = array(n, fill = 0.0)
-    float[] y = array(n, fill = 0.0)
-    for i in range(n)
-        x[i] = g.next_unit() * 100.0
-    for i in range(n)
-        y[i] = g.next_unit() * 100.0
+    real64[] x = array(nat(n), fill = 0.0)
+    real64[] y = array(nat(n), fill = 0.0)
+    for 0 <= int i < n
+        x[i] = .g.next_unit() * 100.0
+    for 0 <= int i < n
+        y[i] = .g.next_unit() * 100.0
 
-    float mean = 0.0
-    float var = 0.0
-    float sd = 0.0
-    float mn = 0.0
-    float mx = 0.0
-    float mad = 0.0
-    float pearson = 0.0
+    real64 mean = 0.0
+    real64 var = 0.0
+    real64 sd = 0.0
+    real64 mn = 0.0
+    real64 mx = 0.0
+    real64 mad = 0.0
+    real64 pearson = 0.0
     int hist_chk = 0
 
-    for r in range(rounds)
+    for 0 <= int r < rounds
         x[r] = x[r] + 1.0e-9
 
-        float s = 0.0
+        real64 s = 0.0
         mn = x[0]
         mx = x[0]
-        for i in range(n)
-            float v = x[i]
+        for 0 <= int i < n
+            real64 v = x[i]
             s = s + v
             if v < mn
                 mn = v
@@ -67,10 +67,10 @@ Result workload()
                 mx = v
         mean = s / count
 
-        float sq = 0.0
-        float ad = 0.0
-        for i in range(n)
-            float d = x[i] - mean
+        real64 sq = 0.0
+        real64 ad = 0.0
+        for 0 <= int i < n
+            real64 d = x[i] - mean
             sq = sq + d * d
             if d < 0.0
                 ad = ad + (0.0 - d)
@@ -80,24 +80,24 @@ Result workload()
         sd = math.sqrt(var)
         mad = ad / count
 
-        float sy = 0.0
-        for i in range(n)
+        real64 sy = 0.0
+        for 0 <= int i < n
             sy = sy + y[i]
-        float meany = sy / count
+        real64 meany = sy / count
 
-        float sxy = 0.0
-        float sxx = 0.0
-        float syy = 0.0
-        for i in range(n)
-            float dx = x[i] - mean
-            float dy = y[i] - meany
+        real64 sxy = 0.0
+        real64 sxx = 0.0
+        real64 syy = 0.0
+        for 0 <= int i < n
+            real64 dx = x[i] - mean
+            real64 dy = y[i] - meany
             sxy = sxy + dx * dy
             sxx = sxx + dx * dx
             syy = syy + dy * dy
         pearson = sxy / math.sqrt(sxx * syy)
 
         int[] hist = array(64, fill = 0)
-        for i in range(n)
+        for 0 <= int i < n
             int b = math.floor(x[i] * scale)
             if b < 0
                 b = 0
@@ -105,8 +105,8 @@ Result workload()
                 b = 63
             hist[b] = hist[b] + 1
         hist_chk = 0
-        for b in range(64)
-            hist_chk = hist_chk + (b + 1) * hist[b]
+        for 0 <= nat b < 64
+            hist_chk = hist_chk + (int(b) + 1) * hist[b]
 
     Result result
     result.mean = mean
@@ -133,7 +133,7 @@ Result result
 if args.mode == "steady"
     int k = math.max(args.iterations, 1)
     result = timed(0)
-    for i in range(1, k)
+    for 1 <= int i < k
         result = timed(i)
 else
     result = workload()

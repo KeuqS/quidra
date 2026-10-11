@@ -31,8 +31,8 @@ tagline = "Programming with maximum meaning per token."
 # abi = 1 and ir = 2.
 [compat]
 abi = 1
-ir = 1
-package_schema = 1
+ir = 5
+package_schema = 2
 lockfile_schema = 3
 
 # Package-manager layout and naming contracts. These are authored once here;

@@ -4,6 +4,7 @@ set -euo pipefail
 QUIDRA="$1"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
+export QUIDRA_CACHE_DIR="$TMP/quidra-cache"  # a run cache of this suite run only
 
 mkdir -p "$TMP/source" "$TMP/home"
 cat > "$TMP/source/main.qui" <<'QUI'
@@ -14,7 +15,7 @@ void announce()
     print("function-value")
     print(NL)
 
-void invoke(fn<void>() operation)
+void invoke(func<void>() operation)
     operation()
 
 int flush()

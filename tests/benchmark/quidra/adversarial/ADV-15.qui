@@ -3,7 +3,7 @@ print(NL)
 flush()
 int[] values = [1, 2, 3, 4, 5]
 int iterations = 0
-for v in values
+for auto v = values[]
     iterations = iterations + 1
     if v == 2
         values = values.append(99)

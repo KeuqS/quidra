@@ -8,31 +8,35 @@ bool fake_binary_backward(
     int operation, std::size_t count) {
 #ifdef QUIDRA_ENABLE_TEST_GPU_BACKEND
     for(std::size_t i=0;i<count;++i){
-        T g{},a{},b{},left_value{},right_value{};
-        std::memcpy(&g,gradient->test_data.data()+i*sizeof(T),sizeof(T));
-        std::memcpy(&a,left->test_data.data()+i*sizeof(T),sizeof(T));
-        std::memcpy(&b,right->test_data.data()+i*sizeof(T),sizeof(T));
-        if(operation==1){
+        using C=std::conditional_t<std::is_floating_point_v<T>,T,float>;
+        T gs{},as{},bs{};
+        C g{},a{},b{},left_value{},right_value{};
+        std::memcpy(&gs,gradient->test_data.data()+i*sizeof(T),sizeof(T));
+        std::memcpy(&as,left->test_data.data()+i*sizeof(T),sizeof(T));
+        std::memcpy(&bs,right->test_data.data()+i*sizeof(T),sizeof(T));
+        g=static_cast<C>(gs);a=static_cast<C>(as);b=static_cast<C>(bs);
+        if(operation==abi::tensor_binary_opcode::add){
             left_value=g;
             right_value=g;
-        }else if(operation==2){
+        }else if(operation==abi::tensor_binary_opcode::subtract){
             left_value=g;
-            right_value=static_cast<T>(-g);
-        }else if(operation==3){
-            left_value=static_cast<T>(g*b);
-            right_value=static_cast<T>(g*a);
+            right_value=static_cast<C>(-g);
+        }else if(operation==abi::tensor_binary_opcode::multiply){
+            left_value=static_cast<C>(g*b);
+            right_value=static_cast<C>(g*a);
         }else{
-            left_value=static_cast<T>(g/b);
-            const T ga=static_cast<T>(g*a);
-            const T bb=static_cast<T>(b*b);
-            right_value=static_cast<T>(-static_cast<T>(ga/bb));
+            left_value=static_cast<C>(g/b);
+            const C ga=static_cast<C>(g*a);
+            const C bb=static_cast<C>(b*b);
+            right_value=static_cast<C>(-static_cast<C>(ga/bb));
         }
+        const T lv=static_cast<T>(left_value),rv=static_cast<T>(right_value);
         if(left_gradient==right_gradient){
-            const T combined=static_cast<T>(left_value+right_value);
+            const T combined=static_cast<T>(lv+rv);
             std::memcpy(left_gradient->test_data.data()+i*sizeof(T),&combined,sizeof(T));
         }else{
-            std::memcpy(left_gradient->test_data.data()+i*sizeof(T),&left_value,sizeof(T));
-            std::memcpy(right_gradient->test_data.data()+i*sizeof(T),&right_value,sizeof(T));
+            std::memcpy(left_gradient->test_data.data()+i*sizeof(T),&lv,sizeof(T));
+            std::memcpy(right_gradient->test_data.data()+i*sizeof(T),&rv,sizeof(T));
         }
     }
     return true;
@@ -49,23 +53,30 @@ bool fake_scalar_backward(
     Buffer* output, const Buffer* gradient, const Buffer* input,
     int operation, bool scalar_left, double scalar, std::size_t count) {
 #ifdef QUIDRA_ENABLE_TEST_GPU_BACKEND
-    const T scalar_value=static_cast<T>(scalar);
+    using C=std::conditional_t<std::is_floating_point_v<T>,T,float>;
+    const C scalar_value=static_cast<C>(scalar);
     for(std::size_t i=0;i<count;++i){
-        T g{},x{},value{};
-        std::memcpy(&g,gradient->test_data.data()+i*sizeof(T),sizeof(T));
-        if(operation==4&&scalar_left)
-            std::memcpy(&x,input->test_data.data()+i*sizeof(T),sizeof(T));
-        if(operation==1)value=g;
-        else if(operation==2)value=scalar_left?static_cast<T>(-g):g;
-        else if(operation==3)value=static_cast<T>(g*scalar_value);
+        T stored_g{},stored_x{};
+        C g{},x{},value{};
+        std::memcpy(&stored_g,gradient->test_data.data()+i*sizeof(T),sizeof(T));
+        if((operation==abi::tensor_binary_opcode::divide&&scalar_left)||
+           operation==abi::tensor_binary_opcode::power)
+            std::memcpy(&stored_x,input->test_data.data()+i*sizeof(T),sizeof(T));
+        g=static_cast<C>(stored_g);x=static_cast<C>(stored_x);
+        if(operation==abi::tensor_binary_opcode::add)value=g;
+        else if(operation==abi::tensor_binary_opcode::subtract)value=scalar_left?static_cast<C>(-g):g;
+        else if(operation==abi::tensor_binary_opcode::multiply)value=static_cast<C>(g*scalar_value);
+        else if(operation==abi::tensor_binary_opcode::power)
+            value=static_cast<C>(g*scalar_value*std::pow(x,static_cast<C>(scalar_value-C{1})));
         else if(scalar_left){
-            const T gs=static_cast<T>(g*scalar_value);
-            const T xx=static_cast<T>(x*x);
-            value=static_cast<T>(-static_cast<T>(gs/xx));
+            const C gs=static_cast<C>(g*scalar_value);
+            const C xx=static_cast<C>(x*x);
+            value=static_cast<C>(-static_cast<C>(gs/xx));
         }else{
-            value=static_cast<T>(g/scalar_value);
+            value=static_cast<C>(g/scalar_value);
         }
-        std::memcpy(output->test_data.data()+i*sizeof(T),&value,sizeof(T));
+        const T result=static_cast<T>(value);
+        std::memcpy(output->test_data.data()+i*sizeof(T),&result,sizeof(T));
     }
     return true;
 #else
@@ -76,7 +87,7 @@ bool fake_scalar_backward(
 }
 
 std::string ptx_binary_backward_source(int dtype,int operation,bool shared_output) {
-    const bool f32=dtype==10;
+    const bool f32=dtype==QCORE_DTYPE_FLOAT32;
     const auto width=f32?4U:8U;
     std::ostringstream out;
     out<<ptx_thread_prologue(
@@ -107,11 +118,11 @@ std::string ptx_binary_backward_source(int dtype,int operation,bool shared_outpu
         out<<"  ld.global.f32 %f1,[%rd9];\n"
               "  ld.global.f32 %f2,[%rd10];\n"
               "  ld.global.f32 %f3,[%rd11];\n";
-        if(operation==1){
+        if(operation==abi::tensor_binary_opcode::add){
             out<<"  mov.f32 %f4,%f1;\n  mov.f32 %f5,%f1;\n";
-        }else if(operation==2){
+        }else if(operation==abi::tensor_binary_opcode::subtract){
             out<<"  mov.f32 %f4,%f1;\n  neg.f32 %f5,%f1;\n";
-        }else if(operation==3){
+        }else if(operation==abi::tensor_binary_opcode::multiply){
             out<<"  mul.f32 %f4,%f1,%f3;\n"
                   "  mul.f32 %f5,%f1,%f2;\n";
         }else{
@@ -130,11 +141,11 @@ std::string ptx_binary_backward_source(int dtype,int operation,bool shared_outpu
         out<<"  ld.global.f64 %fd1,[%rd9];\n"
               "  ld.global.f64 %fd2,[%rd10];\n"
               "  ld.global.f64 %fd3,[%rd11];\n";
-        if(operation==1){
+        if(operation==abi::tensor_binary_opcode::add){
             out<<"  mov.f64 %fd4,%fd1;\n  mov.f64 %fd5,%fd1;\n";
-        }else if(operation==2){
+        }else if(operation==abi::tensor_binary_opcode::subtract){
             out<<"  mov.f64 %fd4,%fd1;\n  neg.f64 %fd5,%fd1;\n";
-        }else if(operation==3){
+        }else if(operation==abi::tensor_binary_opcode::multiply){
             out<<"  mul.f64 %fd4,%fd1,%fd3;\n"
                   "  mul.f64 %fd5,%fd1,%fd2;\n";
         }else{
@@ -156,7 +167,7 @@ std::string ptx_binary_backward_source(int dtype,int operation,bool shared_outpu
 
 
 std::string ptx_scalar_backward_source(int dtype,int operation,bool scalar_left) {
-    const bool f32=dtype==10;
+    const bool f32=dtype==QCORE_DTYPE_FLOAT32;
     const auto width=f32?4U:8U;
     std::ostringstream out;
     out<<ptx_thread_prologue(
@@ -181,10 +192,10 @@ std::string ptx_scalar_backward_source(int dtype,int operation,bool scalar_left)
     if(f32){
         out<<"  ld.param.f32 %f1,[p_scalar];\n"
               "  ld.global.f32 %f2,[%rd10];\n";
-        if(operation==1) out<<"  mov.f32 %f4,%f2;\n";
-        else if(operation==2)
+        if(operation==abi::tensor_binary_opcode::add) out<<"  mov.f32 %f4,%f2;\n";
+        else if(operation==abi::tensor_binary_opcode::subtract)
             out<<(scalar_left?"  neg.f32 %f4,%f2;\n":"  mov.f32 %f4,%f2;\n");
-        else if(operation==3) out<<"  mul.f32 %f4,%f2,%f1;\n";
+        else if(operation==abi::tensor_binary_opcode::multiply) out<<"  mul.f32 %f4,%f2,%f1;\n";
         else if(scalar_left)
             out<<"  ld.global.f32 %f3,[%rd11];\n"
                   "  mul.f32 %f5,%f2,%f1;\n"
@@ -196,10 +207,10 @@ std::string ptx_scalar_backward_source(int dtype,int operation,bool scalar_left)
     }else{
         out<<"  ld.param.f64 %fd1,[p_scalar];\n"
               "  ld.global.f64 %fd2,[%rd10];\n";
-        if(operation==1) out<<"  mov.f64 %fd4,%fd2;\n";
-        else if(operation==2)
+        if(operation==abi::tensor_binary_opcode::add) out<<"  mov.f64 %fd4,%fd2;\n";
+        else if(operation==abi::tensor_binary_opcode::subtract)
             out<<(scalar_left?"  neg.f64 %fd4,%fd2;\n":"  mov.f64 %fd4,%fd2;\n");
-        else if(operation==3) out<<"  mul.f64 %fd4,%fd2,%fd1;\n";
+        else if(operation==abi::tensor_binary_opcode::multiply) out<<"  mul.f64 %fd4,%fd2,%fd1;\n";
         else if(scalar_left)
             out<<"  ld.global.f64 %fd3,[%rd11];\n"
                   "  mul.f64 %fd5,%fd2,%fd1;\n"
@@ -214,7 +225,7 @@ std::string ptx_scalar_backward_source(int dtype,int operation,bool scalar_left)
 }
 
 std::string hip_binary_backward_source(int dtype,int operation,bool shared_output) {
-    const auto type=dtype==10?"float":"double";
+    const auto type=dtype==QCORE_DTYPE_FLOAT32?"float":"double";
     std::ostringstream out;
     out<<"extern \"C\" __global__ void q_kernel("<<type<<"* left_gradient,"<<type
        <<"* right_gradient,const "<<type<<"* gradient,const "<<type
@@ -222,11 +233,11 @@ std::string hip_binary_backward_source(int dtype,int operation,bool shared_outpu
          "unsigned long long i=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;"
          "if(i>=count)return;"<<type<<" g=gradient[i],a=left[i],b=right[i],"
          "left_value,right_value;";
-    if(operation==1)
+    if(operation==abi::tensor_binary_opcode::add)
         out<<"left_value=g;right_value=g;";
-    else if(operation==2)
+    else if(operation==abi::tensor_binary_opcode::subtract)
         out<<"left_value=g;right_value=-g;";
-    else if(operation==3)
+    else if(operation==abi::tensor_binary_opcode::multiply)
         out<<"left_value=g*b;right_value=g*a;";
     else
         out<<type<<" ga=g*a,bb=b*b;"
@@ -241,15 +252,15 @@ std::string hip_binary_backward_source(int dtype,int operation,bool shared_outpu
 
 
 std::string hip_scalar_backward_source(int dtype,int operation,bool scalar_left) {
-    const auto type=dtype==10?"float":"double";
+    const auto type=dtype==QCORE_DTYPE_FLOAT32?"float":"double";
     std::ostringstream out;
     out<<"extern \"C\" __global__ void q_kernel("<<type<<"* output,const "<<type
        <<"* gradient,const "<<type<<"* input,unsigned long long count,"<<type<<" scalar){"
          "unsigned long long i=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;"
          "if(i>=count)return;"<<type<<" g=gradient[i],value;";
-    if(operation==1) out<<"value=g;";
-    else if(operation==2) out<<(scalar_left?"value=-g;":"value=g;");
-    else if(operation==3) out<<"value=g*scalar;";
+    if(operation==abi::tensor_binary_opcode::add) out<<"value=g;";
+    else if(operation==abi::tensor_binary_opcode::subtract) out<<(scalar_left?"value=-g;":"value=g;");
+    else if(operation==abi::tensor_binary_opcode::multiply) out<<"value=g*scalar;";
     else if(scalar_left)
         out<<type<<" x=input[i],gs=g*scalar,xx=x*x;value=-(gs/xx);";
     else out<<"value=g/scalar;";
@@ -271,11 +282,11 @@ std::string msl_binary_backward_source(int operation,bool shared_output) {
          "uint gid [[thread_position_in_grid]]) {"
          " ulong i=ulong(gid); if(i>=count)return;"
          " float g=gradient[i],a=left[i],b=right[i],left_value,right_value;";
-    if(operation==1)
+    if(operation==abi::tensor_binary_opcode::add)
         out<<" left_value=g; right_value=g;";
-    else if(operation==2)
+    else if(operation==abi::tensor_binary_opcode::subtract)
         out<<" left_value=g; right_value=-g;";
-    else if(operation==3)
+    else if(operation==abi::tensor_binary_opcode::multiply)
         out<<" left_value=g*b; right_value=g*a;";
     else
         out<<" float ga=g*a,bb=b*b;"
@@ -299,9 +310,10 @@ std::string msl_scalar_backward_source(int operation,bool scalar_left) {
          "constant float& scalar [[buffer(4)]],"
          "uint gid [[thread_position_in_grid]]) {"
          " ulong i=ulong(gid); if(i>=count)return; float g=gradient[i],value;";
-    if(operation==1) out<<" value=g;";
-    else if(operation==2) out<<(scalar_left?" value=-g;":" value=g;");
-    else if(operation==3) out<<" value=g*scalar;";
+    if(operation==abi::tensor_binary_opcode::add) out<<" value=g;";
+    else if(operation==abi::tensor_binary_opcode::subtract) out<<(scalar_left?" value=-g;":" value=g;");
+    else if(operation==abi::tensor_binary_opcode::multiply) out<<" value=g*scalar;";
+    else if(operation==abi::tensor_binary_opcode::power) out<<" float x=input[i]; value=g*scalar*precise::pow(x,scalar-1.0f);";
     else if(scalar_left) out<<" float x=input[i],gs=g*scalar,xx=x*x; value=-(gs/xx);";
     else out<<" value=g/scalar;";
     out<<" output[i]=value; }\n";
@@ -316,7 +328,7 @@ bool compute_binary_backward(
     Buffer* left_gradient,Buffer* right_gradient,
     const Buffer* gradient,const Buffer* left,const Buffer* right,
     int dtype,int operation,std::size_t count,std::string& error) {
-    if(operation<1||operation>4){
+    if(operation<abi::tensor_binary_opcode::add||operation>abi::tensor_binary_opcode::divide){
         error="invalid tensor binary backward operation";
         return false;
     }
@@ -334,15 +346,23 @@ bool compute_binary_backward(
         return false;
 #ifdef QUIDRA_ENABLE_TEST_GPU_BACKEND
     if(left_gradient->backend==Backend::Test){
-        if(dtype==10)return fake_binary_backward<float>(
+        counters::add(counters::Id::CoreDispatches); // qcount
+        if(dtype==QCORE_DTYPE_FLOAT32)return fake_binary_backward<float>(
             left_gradient,right_gradient,gradient,left,right,operation,count);
-        if(dtype==9)return fake_binary_backward<double>(
+        if(dtype==QCORE_DTYPE_FLOAT16)return fake_binary_backward<abi::half::Real16>(
+            left_gradient,right_gradient,gradient,left,right,operation,count);
+        if(dtype==QCORE_DTYPE_BFLOAT16)return fake_binary_backward<abi::half::Real16b>(
+            left_gradient,right_gradient,gradient,left,right,operation,count);
+        if(dtype==QCORE_DTYPE_FLOAT64)return fake_binary_backward<double>(
             left_gradient,right_gradient,gradient,left,right,operation,count);
         error="tensor binary backward requires a floating dtype";
         return false;
     }
 #endif
-    if((dtype==9||dtype==10)&&left_gradient->backend==Backend::Cuda){
+    if(half_dtype(dtype)&&numeric_gpu_backend(left_gradient))
+        return launch_numeric(left_gradient,{.other=right_gradient,.left=left,.right=right,
+            .gradient=gradient,.count=count,.dtype=dtype,.operation=operation,.mode=5},error);
+    if((dtype==QCORE_DTYPE_FLOAT64||dtype==QCORE_DTYPE_FLOAT32)&&left_gradient->backend==Backend::Cuda){
         auto ptx=ptx_binary_backward_source(dtype,operation,shared_output);
         auto lg=left_gradient->cuda_pointer,rg=right_gradient->cuda_pointer,
              g=gradient->cuda_pointer,a=left->cuda_pointer,b=right->cuda_pointer;
@@ -354,7 +374,7 @@ bool compute_binary_backward(
                  (shared_output?"-shared":"-split"),
             ptx,count,args,error);
     }
-    if((dtype==9||dtype==10)&&left_gradient->backend==Backend::Hip){
+    if((dtype==QCORE_DTYPE_FLOAT64||dtype==QCORE_DTYPE_FLOAT32)&&left_gradient->backend==Backend::Hip){
         auto source=hip_binary_backward_source(dtype,operation,shared_output);
         auto lg=left_gradient->pointer,rg=right_gradient->pointer,
              g=gradient->pointer,a=left->pointer,b=right->pointer;
@@ -367,21 +387,26 @@ bool compute_binary_backward(
             source,count,args,error);
     }
 #ifdef __APPLE__
-    if(dtype==10&&left_gradient->backend==Backend::Metal){
-        auto source=msl_binary_backward_source(operation,shared_output);
-        auto pipeline=cached_metal_pipeline(
-            [left_gradient->metal_buffer device],
-            "autograd-binary-backward-f32-"+std::to_string(operation)+
-                (shared_output?"-shared":"-split"),source,error);
+    if(metal_real_dtype(dtype)&&left_gradient->backend==Backend::Metal){
+        auto pipeline=metal_pipeline(
+            left_gradient,metal_pipeline_id(MetalKernel::BinaryBackwardF32,
+                static_cast<unsigned>(operation),shared_output?1u:0u,static_cast<unsigned>(dtype)),
+            [&]{auto source=msl_half_storage(msl_binary_backward_source(operation,shared_output),dtype);
+                if(half_dtype(dtype)){
+                    msl_replace(source,"left_gradient[i]=left_value+right_value;", "left_gradient[i]=qbits(qread(qbits(left_value))+qread(qbits(right_value)));");
+                    msl_replace(source,"left_gradient[i]=left_value;", "left_gradient[i]=qbits(left_value);");
+                    msl_replace(source,"right_gradient[i]=right_value;", "right_gradient[i]=qbits(right_value);");
+                }
+                return source;},error);
         if(!pipeline)return false;
         auto n=static_cast<std::uint64_t>(count);
         return dispatch_metal_1d(
             left_gradient,pipeline,count,[&](id<MTLComputeCommandEncoder> e){
-                [e setBuffer:left_gradient->metal_buffer offset:0 atIndex:0];
-                [e setBuffer:right_gradient->metal_buffer offset:0 atIndex:1];
-                [e setBuffer:gradient->metal_buffer offset:0 atIndex:2];
-                [e setBuffer:left->metal_buffer offset:0 atIndex:3];
-                [e setBuffer:right->metal_buffer offset:0 atIndex:4];
+                metal_bind(e,left_gradient,0,0);
+                metal_bind(e,right_gradient,0,1);
+                metal_bind(e,gradient,0,2);
+                metal_bind(e,left,0,3);
+                metal_bind(e,right,0,4);
                 [e setBytes:&n length:sizeof(n) atIndex:5];
             },error);
     }
@@ -395,9 +420,13 @@ bool compute_scalar_backward(
     Buffer* output,const Buffer* gradient,const Buffer* input,
     int dtype,int operation,bool scalar_left,double scalar,
     std::size_t count,std::string& error) {
-    if(operation<1||operation>4){
+    const bool half_power=half_dtype(dtype)&&operation==abi::tensor_binary_opcode::power&&!scalar_left;
+    if((operation<abi::tensor_binary_opcode::add||operation>abi::tensor_binary_opcode::divide)&&!half_power){
         error="invalid tensor scalar backward operation";
         return false;
+    }
+    if(half_power&&output&&output->backend==Backend::Cuda){
+        return real_compute_unavailable(output,"tensor arithmetic",dtype,error);
     }
     const auto bytes=compute_dtype_width(dtype);
     if(!compute_same_device(output,gradient,error)||
@@ -408,19 +437,30 @@ bool compute_scalar_backward(
         return false;
 #ifdef QUIDRA_ENABLE_TEST_GPU_BACKEND
     if(output->backend==Backend::Test){
-        if(dtype==10)return fake_scalar_backward<float>(
+        counters::add(counters::Id::CoreDispatches); // qcount
+        if(dtype==QCORE_DTYPE_FLOAT32)return fake_scalar_backward<float>(
             output,gradient,input,operation,scalar_left,scalar,count);
-        if(dtype==9)return fake_scalar_backward<double>(
+        if(dtype==QCORE_DTYPE_FLOAT16)return fake_scalar_backward<abi::half::Real16>(
+            output,gradient,input,operation,scalar_left,scalar,count);
+        if(dtype==QCORE_DTYPE_BFLOAT16)return fake_scalar_backward<abi::half::Real16b>(
+            output,gradient,input,operation,scalar_left,scalar,count);
+        if(dtype==QCORE_DTYPE_FLOAT64)return fake_scalar_backward<double>(
             output,gradient,input,operation,scalar_left,scalar,count);
         error="tensor scalar backward requires a floating dtype";
         return false;
     }
 #endif
-    if((dtype==9||dtype==10)&&output->backend==Backend::Cuda){
+    if(half_dtype(dtype)&&numeric_gpu_backend(output)) {
+        const auto stored=abi::half::round_to(scalar,dtype==QCORE_DTYPE_FLOAT16?abi::half::binary16:abi::half::bfloat16);
+        return launch_numeric(output,{.left=input,.gradient=gradient,.scalar=&stored,.scalar_width=sizeof(stored),
+            .count=count,.dtype=dtype,.operation=operation,.side=scalar_left?abi::scalar_side::left:abi::scalar_side::right,
+            .mode=6},error);
+    }
+    if((dtype==QCORE_DTYPE_FLOAT64||dtype==QCORE_DTYPE_FLOAT32)&&output->backend==Backend::Cuda){
         auto source=ptx_scalar_backward_source(dtype,operation,scalar_left);
         auto o=output->cuda_pointer,g=gradient->cuda_pointer,in=input->cuda_pointer;
         auto n=static_cast<std::uint64_t>(count);
-        if(dtype==10){
+        if(dtype==QCORE_DTYPE_FLOAT32){
             float s=static_cast<float>(scalar);
             void* args[]={&o,&g,&in,&n,&s};
             return launch_ptx_1d(
@@ -437,11 +477,11 @@ bool compute_scalar_backward(
                 (scalar_left?"left":"right"),
             source,count,args,error);
     }
-    if((dtype==9||dtype==10)&&output->backend==Backend::Hip){
+    if((dtype==QCORE_DTYPE_FLOAT64||dtype==QCORE_DTYPE_FLOAT32)&&output->backend==Backend::Hip){
         auto source=hip_scalar_backward_source(dtype,operation,scalar_left);
         auto o=output->pointer,g=gradient->pointer,in=input->pointer;
         auto n=static_cast<std::uint64_t>(count);
-        if(dtype==10){
+        if(dtype==QCORE_DTYPE_FLOAT32){
             float s=static_cast<float>(scalar);
             void* args[]={&o,&g,&in,&n,&s};
             return launch_hip_1d(
@@ -459,21 +499,21 @@ bool compute_scalar_backward(
             source,count,args,error);
     }
 #ifdef __APPLE__
-    if(dtype==10&&output->backend==Backend::Metal){
-        auto source=msl_scalar_backward_source(operation,scalar_left);
-        auto pipeline=cached_metal_pipeline(
-            [output->metal_buffer device],
-            "autograd-scalar-backward-f32-"+std::to_string(operation)+"-"+
-                (scalar_left?"left":"right"),
-            source,error);
+    if(metal_real_dtype(dtype)&&output->backend==Backend::Metal){
+        auto pipeline=metal_pipeline(
+            output,metal_pipeline_id(MetalKernel::ScalarBackwardF32,
+                static_cast<unsigned>(operation),scalar_left?1u:0u,static_cast<unsigned>(dtype)),
+            [&]{auto source=msl_half_storage(msl_scalar_backward_source(operation,scalar_left),dtype);
+                if(half_dtype(dtype))msl_replace(source,"output[i]=value;", "output[i]=qbits(value);");
+                return source;},error);
         if(!pipeline)return false;
         auto n=static_cast<std::uint64_t>(count);
         float s=static_cast<float>(scalar);
         return dispatch_metal_1d(
             output,pipeline,count,[&](id<MTLComputeCommandEncoder> e){
-                [e setBuffer:output->metal_buffer offset:0 atIndex:0];
-                [e setBuffer:gradient->metal_buffer offset:0 atIndex:1];
-                [e setBuffer:input->metal_buffer offset:0 atIndex:2];
+                metal_bind(e,output,0,0);
+                metal_bind(e,gradient,0,1);
+                metal_bind(e,input,0,2);
                 [e setBytes:&n length:sizeof(n) atIndex:3];
                 [e setBytes:&s length:sizeof(s) atIndex:4];
             },error);

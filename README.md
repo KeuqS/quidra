@@ -47,14 +47,16 @@ Common forms therefore have deliberately narrow jobs:
 | --- | --- |
 | `=` | independent value-oriented assignment |
 | `&x` | explicit access to existing storage |
-| `T &` | writable path to caller-visible storage |
-| `const T &` | live read-only path to storage |
+| `T &name` | writable path to existing storage |
+| `const T` | immutable value (passed without a copy where nothing can change it) |
 | `T \| none` | normal absence is part of the type |
 | `T \| error` | failure is part of the type |
 | `auto \| error` | retain an otherwise fail-fast failure channel |
 | `try` | propagate `error` |
 | `T(value)` | explicit representation conversion |
-| `tensor<T><3, _, _>` | element type plus exact rank/shape constraints |
+| `tensor<T>{3, _, _}` | element type plus exact rank/shape constraints |
+| `(T, U)` | a fixed tuple of independently typed values |
+| `.update()` | a visible call that changes existing state |
 | `and / or / not` | boolean logic |
 | `AND / OR / XOR / NOT / << / >>` | fixed-width integer bit operations |
 | `match` | exhaustive handling of alternatives |
@@ -73,25 +75,24 @@ ceremony:
 void increment(int &value)
     value += 1
 
-float32 first_sample(const tensor<float32><3, _, _> &pixels)
+real32 first_sample(const tensor<real32>{3, _, _} pixels)
     return pixels[0, 0, 0].item()
 
 int count = 7
 increment(&count)
 
-tensor<float32><3, _, _> pixels = tensor.zeros([3, 224, 224])
-float32 sample = first_sample(&pixels)
+tensor<real32>{3, _, _} pixels = tensor.zeros([3, 224, 224])
+real32 sample = first_sample(pixels)
 
-uint8 flags = 240
-uint8 selected = flags AND 15
+nat8 flags = 240
+nat8 selected = flags AND 15
 ```
 
 The surviving tokens carry concrete semantics:
 
 - `int &value` says the function may write caller-visible storage, while
   `&count` makes that authority visible at the call site.
-- `const tensor<float32><3, _, _> &pixels` says the function observes existing
-  storage without write authority, with `float32`, rank 3, and first extent 3
+- `const tensor<real32>{3, _, _} pixels` says the function observes a value without write authority, with `real32`, rank 3, and first extent 3
   fixed in the type.
 - `AND` cannot be confused with boolean `and`, storage `&`, or union `|`.
 - Ordinary `=` still means value semantics; none of these forms invents hidden
@@ -135,9 +136,10 @@ intent that cannot be inferred safely.
 ### Representation changes are explicit
 
 A typed numeric value never changes representation merely because a destination
-could hold it. Conversions use the destination type, such as `float32(value)`
-or `int8(value)`. Float-to-integer conversion requires the rounding choice to
-be named with `math.trunc`, `math.round`, `math.floor`, or `math.ceil`.
+could hold it. Conversions use the destination type, such as `real32(value)`
+or `int8(value)`. Real-to-integer conversion accepts only mathematically integral values in
+the destination range. Fractional values require a named rounding operation:
+`math.trunc`, `math.round`, `math.floor`, or `math.ceil`.
 
 A required result type is a constraint, not permission to convert.
 
@@ -156,7 +158,10 @@ flow without removing typed failure from the language.
 Reserved names are never reusable, and a visible user-defined name cannot be
 shadowed. Adding nearby code therefore cannot silently redirect an earlier bare
 reference. Standard-library growth normally happens behind namespaces or value
-methods instead of consuming new global names.
+methods instead of consuming new global names. A name the language removes,
+such as the old spelling of a renamed type, is released rather than kept
+reserved: it becomes an ordinary identifier, and code that still uses it gets
+the ordinary unknown-name diagnostic.
 
 ### Movement and differentiation are visible
 
@@ -199,49 +204,64 @@ auto inferred = source
 
 ### Numeric types
 
-Signed integers:
+Signed fixed-width integers:
 
 ```text
 int8
 int16
 int32
-int / int64
+int64
 ```
 
-Unsigned integers:
+Natural (unsigned) fixed-width integers:
 
 ```text
-uint8
-uint16
-uint32
-uint64
+nat8
+nat16
+nat32
+nat64
 ```
 
-Floating-point:
+IEEE reals:
 
 ```text
-float32
-float / float64
+real16
+real16b
+real32
+real64
+```
+
+Complex numbers, a real and an imaginary part of `real16`, `real16b`,
+`real32`, `real64` or exact `real` (`com64 z = 1.0 + 2.0i`, `z.real`,
+`z.imag`; no ordering):
+
+```text
+com16
+com16b
+com32
+com64
+com
 ```
 
 Exact numeric values:
 
 ```text
-bigint
-bigreal
+int
+nat
+real
 ```
 
-`int` is signed 64-bit. Fixed-width signed integers have a defined two's-complement bit representation. `float` is IEEE-754 binary64. `float32` is IEEE-754 binary32. `bigint` is an exact arbitrary-precision integer; `bigreal` represents exact rational and symbolic real values rather than a configurable floating-point precision.
+`int` is an exact arbitrary-precision integer and `nat` an exact arbitrary-precision natural number: they never overflow, and a `nat` result below zero is an error. Lengths, counts, shapes, sizes and the index values APIs return are `nat` (`len`, `size()`, `.shape()`, `find`); indexing accepts every integer kind, and `int(len(values)) - 1` is the signed form of `len(values) - 1`, which fails on an empty array. Fixed-width signed integers have a defined two's-complement bit representation. `real64` is IEEE-754 binary64. `real32` is IEEE-754 binary32. `real16` is IEEE-754 binary16 and `real16b` bfloat16; each of their operations rounds the exact result once. `real` represents exact rational and symbolic real values rather than a configurable floating-point precision.
 
 Fixed-width integers use explicit bitwise syntax:
 
 ```quidra
-uint8 flags = 240
-uint8 mask = 15
-uint8 selected = flags AND mask
-uint8 toggled = flags XOR mask
-uint8 inverted = NOT flags
-uint8 shifted = flags << 2
+nat8 flags = 240
+nat8 mask = 15
+nat8 selected = flags AND mask
+nat8 toggled = flags XOR mask
+nat8 inverted = NOT flags
+nat8 shifted = flags << 2
 ```
 
 Uppercase bitwise words are intentionally distinct from boolean `and` / `or` / `not`, safe storage `&`, and union `|`. Signed operations use the same defined N-bit two's-complement representation used by explicit binary conversion; signed `>>` preserves the sign bit. This is a small example of Quidra preferring one stable semantic role per spelling over familiar overloads.
@@ -249,7 +269,7 @@ Uppercase bitwise words are intentionally distinct from boolean `and` / `or` / `
 There is no `char` type:
 
 - text is `string`,
-- one byte as a number is `uint8`,
+- one byte as a number is `nat8`,
 - raw binary sequences are `bin`.
 
 Numeric parsing and standard text conversion use methods:
@@ -279,6 +299,14 @@ uninitialized with `array(n)` or fully initialized with
 `array(n, fill = value)`; initialization is tracked per element. Arrays have
 value semantics, including nested arrays. `append`, `concat`, and `sorted`
 return new array values rather than hiding mutation of another value.
+`sorted(descending = true)` returns a descending value.
+
+Slices make inclusion and direction explicit: `values[1:<3]` excludes the end,
+`values[len(values)>:0]` reverses, and `values[::2]` selects every second
+element. A slice is an independent value. Array slice assignment writes the
+selected elements in order and requires an equally sized value with exactly
+the same element type; overlapping sources are safe. Strings use the same
+code-point slice syntax and remain immutable.
 
 `bin` is mutable packed raw binary data:
 
@@ -291,7 +319,7 @@ bin parsed = bin.parse("0101")
 
 `len(data)` is the number of bits, indexing returns one-bit `bin`, and slicing
 returns another `bin`. Binary-to-numeric interpretation is explicit, for
-example `uint8(bits)`, and the bit length must match the destination width.
+example `nat8(bits)`, and the bit length must match the destination width.
 
 ### Strings
 
@@ -310,7 +338,7 @@ Backslash is literal rather than an escape introducer. The eight two-letter uppe
 
 Immutable backing storage may be shared internally because that sharing cannot change observable value semantics. For the same reason, `text = text + piece` in a loop is linear overall rather than quadratic: when the target is the sole owner of its storage, the append reuses it with geometric growth instead of copying the accumulated prefix each time.
 
-Strings are immutable UTF-8 text. `len(text)` counts Unicode code points, `text[index]` returns a one-code-point string, and text supports `contains`, `starts_with`, `ends_with`, `find`, `slice`, `trim`, and `split`. `text.utf8()` explicitly exposes the UTF-8 encoding as `bin`; `string.from_utf8(data)` explicitly validates byte-aligned binary data and returns `string | error`; `text.codepoints()` explicitly exposes Unicode scalar values; and `string[]` uses `join(separator)` for efficient assembly.
+Strings are immutable UTF-8 text. `len(text)` counts Unicode code points (a `nat`), `text[index]` returns a one-code-point string, slices such as `text[2:<5]` select code points, and text supports `contains`, `starts_with`, `ends_with`, `find`, `trim`, and `split`. `text.utf8()` explicitly exposes the UTF-8 encoding as `bin`; `string.from_utf8(data)` explicitly validates byte-aligned binary data and returns `string | error`; `text.codepoints()` explicitly exposes Unicode scalar values; and `string[]` uses `join(separator)` for efficient assembly.
 
 ### Functions and calls
 
@@ -329,15 +357,8 @@ Positional arguments come before named arguments. Parameters can have defaults; 
 ### Classes
 
 ```quidra
-class Point
-    float x
-    float y = 0.0
-
-    construct(float px, float py)
-        x = px
-        y = py
-
-    float length_squared()
+class Point(real64 x, real64 y)
+    real64 length_squared()
         return x * x + y * y
 
 Point point = Point(3.0, 4.0)
@@ -345,27 +366,68 @@ print(point.length_squared())
 print(NL)
 
 Point origin
-origin.x = 0.0
+origin = Point(0.0, 0.0)
 ```
 
-Fields and methods use one `class` construct. Methods access fields directly; there is no `self` or `this` syntax. A class may declare at most one `construct` member. Constructor call variants use default parameters rather than constructor overloads; `T(...)` runs that single constructor. A declaration without an initializer creates the value with its field defaults so fields can be assigned one at a time. A constructor that can fail is spelled `Point | error construct(...)`; `Point p = Point(...)` then fails fast on error and `try Point(...)` propagates it. Members are public by default; prefix a field, method, or constructor with `private` to restrict access to methods of that class.
+Every class header has an argument list, even `class Empty()`. Ordinary header parameters create members; `local` parameters are initialization-only. Header members initialize first, then direct statements and member initialization expressions execute in written order. Methods execute only when called. A bare typed declaration declares an uninitialized binding with no accessible instance. Use `Type name(args)` or `Type name = Type(args)` for generation, or assign a generated value later. Member reads, member writes, method calls and instance borrowing require an initialized instance; copying an existing initialized value does not rerun generation. Header defaults or ordinary factory functions provide alternate call forms; `construct` is an ordinary name.
+
+Members use bare names inside the class. An optional instance name, such as `class Point point(...)`, names the fixed whole instance and permits explicit value/reference use. It cannot be reassigned or escape while initialization is incomplete. `this` is an ordinary identifier and has no implicit receiver meaning. Members, instance names and locals cannot shadow one another. `local` declarations are visible after their declaration through inner control blocks, never across a function/class boundary.
 
 ```quidra
-class Counter
+class Counter()
     private int value = 0
 
-    private void increment_raw()
-        value = value + 1
+    private void .increment_raw()
+        value += 1
 
-    void increment()
-        increment_raw()
+    void .increment()
+        .increment_raw()
 ```
 
-Private fields cannot be read, written, or addressed outside their declaring class; a constructor initializes hidden state. Private methods cannot be called outside their declaring class.
+Members are public by default. Private members are accessible only from initialization and methods of their declaring class. A header `class Document(local string path) | error` makes generation fallible; success-only bindings fail fast and `try Document(path)` propagates the error. Failed generation releases initialized owned values without rolling back external effects. Fields not initialized on all paths retain the existing compile-time/runtime initialization checks. Class equality compares initialized field values; `&left == &right` explicitly compares storage addresses.
 
-Fields may remain uninitialized when no assignment or default supplies them, and the checker tracks that state field by field.
+### References and mutation markers
 
-Class equality is value equality and requires compared fields to be definitely initialized.
+A reference may be declared before it is bound. Bind or rebind it with
+`&name = &storage`; using an unbound reference fails with `UNBOUND_REFERENCE`.
+Reference fields keep their targets when their holder is copied. Stored targets
+are whole variables or field paths through class values; a holder cannot refer
+into the value that contains it.
+
+```quidra
+class Holder(local int &source)
+    int &value = &source
+
+int count = 1
+Holder first = Holder(&count)
+Holder second = first
+second.value = 7
+print(&first.value == &second.value)
+print(NL)
+```
+
+Passing `&storage` makes writes to that target visible. A call that changes
+other existing state carries `.` on its definition and call, as in
+`void .update()` and `.object.update()`. Class generation that changes such state
+uses `.T(...)`, inferred from its ordered initialization body. Output and writes only to fresh locals do
+not need a mutation marker. `const T` takes an immutable value; it is called
+with a value rather than `&storage`.
+
+### Tuples and patterns
+
+Tuples have a fixed shape and independent values at each position. Patterns can
+declare their elements, assign existing places, bind references, or discard
+unused elements with `_`. They also work in collection loops and match cases.
+Tuples compare and hash recursively; their printed string elements are quoted.
+
+```quidra
+(int, string) pair = (3, "three")
+(int number, string word) = pair
+(int &stored, string &label) = &pair
+stored = number + 1
+print(pair)
+print(NL)
+```
 
 ### Modules
 
@@ -380,7 +442,7 @@ an explicit import:
 
 ```quidra
 import math
-print(math.sqrt(float(16.0)))
+print(math.sqrt(real64(16.0)))
 print(NL)
 ```
 
@@ -401,12 +463,7 @@ Imported modules may export declarations and immutable compile-time `const` bind
 ### Generics
 
 ```quidra
-class Box<T>
-    T value
-
-    construct(T initial)
-        value = initial
-
+class Box<T>(T value)
     T get()
         return value
 
@@ -418,7 +475,7 @@ print(first<int>([4, 5]))
 print(NL)
 ```
 
-Generic class type arguments are explicit. Generic function and method type arguments are inferred when every generic parameter is uniquely determined by the call arguments; otherwise they must be written explicitly. Concrete instances are deterministically monomorphized before static checking and native code generation.
+Generic class type arguments are explicit in type positions. Class generation, generic function and method calls may infer them when every generic parameter is uniquely determined by typed call arguments; otherwise write them explicitly. Concrete instances are deterministically monomorphized before static checking and native code generation.
 
 Repeated function or method names are permitted only for a generic specialization family. Family members keep the same call shape: the same argument count, names, reference/const forms, default-argument positions, and generic type pattern. A concrete exact-type member may specialize that family. Generic members may differ by constraints such as `numeric` and the narrower `floating`; any number of generic parameters such as `<T1, T2>` is allowed. Exact concrete matches win over generic matches, narrower statically ordered constraints win over broader ones, and an overlap with no unique most-specific member is a compile error.
 
@@ -438,7 +495,7 @@ else
     print("no")
     print(NL)
 
-for i in range(0, 10)
+for 0 <= nat i < 10
     print(i)
     print(NL)
 
@@ -446,7 +503,42 @@ while condition
     work()
 ```
 
-Blocks use four-space indentation. Conditions are `bool`; numeric truthiness is not implicit.
+Blocks use four-space indentation. Conditions are `bool`; numeric truthiness is
+not implicit. Range boundaries, direction and inclusion are written in the
+header. `for nat i < end` abbreviates `for 0 <= nat i < end`; the descending
+form `for start > nat i` ends at inclusive zero. Real ranges require an explicit
+step and compute each value from the entry lattice rather than repeated
+rounded addition.
+
+```quidra
+int[] values = [2, 4, 6]
+for int &value = &values[nat index]
+    value += int(index)
+for real32 value <= 1.0 step 0.25
+    print(value)
+    print(NL)
+```
+
+A collection value loop takes a snapshot. A reference loop writes the current
+elements and checks operations that may replace its storage. Range variables
+and an optional `nat` index are readonly bindings. A collection value binding
+may be changed without changing the entry snapshot; a reference element allows
+writes to its target.
+
+Each direct statement of a `parallel` suite is a node. The compiler derives
+read-after-write dependencies and rejects unordered storage or resource
+conflicts. All started nodes join before execution continues; a failure is
+reported in source order.
+
+```quidra
+int first
+int second
+parallel
+    first = 20
+    second = first + 22
+print(second)
+print(NL)
+```
 
 Use `elif` for flat conditional chains:
 
@@ -484,22 +576,25 @@ scan("{&n} {&m}")
 ## Tensors and explicit devices
 
 Dense numeric tensors use `tensor<T>`. The element type is static; an optional
-second angle group states an exact-rank shape pattern. Each written axis exists,
-`_` leaves its extent unrestricted, and an integer expression constrains that
-extent.
+brace group states an exact-rank shape pattern. Each written axis exists,
+`_` leaves its extent unrestricted, and a `nat` expression constrains that
+extent. `{nat H, nat W}` declares readonly captured shape names, and
+`{nat H = rows * cols, nat W}` both captures an expression and names it. An
+existing bare `nat` name constrains the extent to that value; it does not bind
+a new name.
 
 ```quidra
 int batch = 3
-tensor<float32><batch * 2, 224> contextual = tensor.zeros()
+tensor<real32>{nat(batch * 2), 224} contextual = tensor.zeros()
 batch = 8 // the captured extent remains 6
 
-tensor<float32> matrix = tensor.zeros([2, 3])
-tensor<float32><3, _, _> pixels = tensor.zeros([3, 224, 224])
-tensor<float32><1, _, _> bias = tensor.ones([1, 224, 224])
-tensor<float32><3, _, _> result = pixels + bias
+tensor<real32> matrix = tensor.zeros([2, 3])
+tensor<real32>{3, _, _} pixels = tensor.zeros([3, 224, 224])
+tensor<real32>{1, _, _} bias = tensor.ones([1, 224, 224])
+tensor<real32>{3, _, _} result = pixels + bias
 
-auto crop = result[:, 10:20, 30:40]
-float32 value = result[0, 10, 20].item()
+auto crop = result[:, 10:<20, 30:<40]
+real32 value = result[0, 10, 20].item()
 ```
 
 `tensor<T>(shape)` creates uninitialized tensor storage; `tensor.zeros` and
@@ -510,11 +605,11 @@ facts the compiler already knows.
 Device movement is always visible:
 
 ```quidra
-tensor<float32> cpu = tensor.zeros([1024])
-tensor<float32> gpu0 = tensor.zeros([1024], gpu = 0)
+tensor<real32> cpu = tensor.zeros([1024])
+tensor<real32> gpu0 = tensor.zeros([1024], gpu = 0)
 
-tensor<float32> copied = cpu.gpu(0)
-tensor<float32> host = copied.cpu()
+tensor<real32> copied = cpu.gpu(0)
+tensor<real32> host = copied.cpu()
 ```
 
 CPU is the default. Quidra never inserts CPU↔GPU or GPU↔GPU transfers and never
@@ -535,7 +630,7 @@ call `.contiguous()` explicitly when a contiguous representation is required.
 
 Numeric representation changes use the same `T(value)` spelling as scalars and
 arrays. A tracked tensor must be explicitly disconnected before changing dtype,
-for example `float(x.untrack())`; representation change never silently cuts an
+for example `real64(x.untrack())`; representation change never silently cuts an
 autograd graph.
 
 ## Tensor autograd
@@ -554,10 +649,31 @@ window. Within one backward call, naming the same underlying gradient
 destination more than once still writes it once. A tensor can be a destination directly and exposes its local gradient
 through `.grad`, `.has_grad()`, and `.clear_grad()`. Ordinary tensor copies
 have independent gradient state even when their immutable/COW value storage is
-shared internally. `autograd.Target` is Core's generic explicit destination
-handle for abstractions that need a stable gradient identity without turning the
-tensor value itself into shared mutable state. Optional static shape contracts
-remain ordinary tensor contracts such as `tensor<float32><3, _, _>`.
+shared internally. `autograd.Target` is Core's explicit gradient
+destination for abstractions that need a gradient identity without turning the
+tensor value itself into shared mutable state. Copying a Target creates a new
+destination with an independent copy of any pending gradient. Optional static
+shape contracts remain ordinary tensor contracts such as `tensor<real32>{3, _, _}`.
+
+`reflect.each<T>(&root)` visits matching storage in class declaration order,
+array index order and tuple position order. It includes private user fields,
+skips reference fields, and treats standard-library values as leaves. A const
+field containing a matching destination is rejected for writable traversal.
+
+```quidra
+class Model()
+    private int weight = 1
+    int[] rest = [2, 3]
+Model model = Model()
+for int &value = &reflect.each<int>(&model)[nat index]
+    value += int(index)
+```
+
+The traversal is expanded at the loop header and creates no runtime list or
+dispatch. `reflect.each_paths<T>(root)` gives its structural paths. A named
+traversal function returns the pseudo-type `reflect.Each<T>` and can be used
+only in a traversal header. Backward uses this same plan and retains the
+model's original Targets; it does not copy gradient destinations.
 
 The official `nn` package owns architecture-independent learnable parameters,
 layers, losses, optimizers, and training semantics as ordinary
@@ -568,18 +684,17 @@ into concrete deep-neural-network model families.
 import nn
 import math
 
-class Scale
-    nn.Parameter<float32> value
+class Scale()
+    nn.Parameter<real32> value
 
-Scale model
-model.value = nn.Parameter<float32>(value = tensor.ones([1]))
-nn.Adam optimizer = nn.Adam()
-tensor<float32> prediction = model.value.track() * float32(2)
-tensor<float32> loss = math.mean(prediction * prediction)
+Scale model = Scale()
+model.value = nn.Parameter<real32>(value = tensor.ones([1]))
+nn.Adam<Scale> optimizer = nn.Adam<Scale>(&model)
+tensor<real32> prediction = .model.value.track() * real32(2)
+tensor<real32> loss = math.mean(prediction * prediction)
 
-optimizer.zero_grad(&model)
 loss.backward(&model)
-optimizer.step(&model)
+.optimizer.update()
 ```
 
 `nn.Parameter<T>` is implemented by the package with ordinary tensor values
@@ -587,7 +702,11 @@ plus a private Core `autograd.Target`; its gradient state is therefore NN-owned
 rather than hidden in the Parameter value tensor. `nn.State<T>` has no gradient
 destination. Neither abstraction is a compiler-special type. NN optimizer state,
 update equations, reusable layer kernels, and NN execution policy likewise live
-in the NN package. DNN may depend on NN but not the reverse.
+in the NN package. An optimizer binds a model reference at construction,
+validates its structure and gradients before committing an update, and clears
+gradients after that update. Half-precision weights and gradients are widened
+to real32 for optimizer arithmetic and narrowed once when stored; Adam keeps
+their moments in real32. DNN may depend on NN but not the reverse.
 
 
 ## Safety model
@@ -608,13 +727,14 @@ The native runtime checks invariant and safety failures that depend on runtime v
 
 - integer overflow at each supported integer width,
 - integer division and remainder by zero,
+- `real32` and `real64` operations, on scalars and tensor elements, whose result would be NaN or an infinity (an overflow or a division by zero),
 - array and bin bounds,
 - invalid allocation sizes,
 - zero range steps.
 
 These runtime safety failures terminate deterministically with status `101`. A range-checked numeric cast is different: an out-of-range value produces the cast's typed `error` alternative. Arrays and tensors use the whole converted container as the success alternative and expose no partial conversion when one leaf fails. The cast terminates only when a success-only context deliberately consumes that alternative via the ordinary fail-fast rule.
 
-Floating-point arithmetic follows IEEE-754 behavior for its width.
+Floating-point arithmetic follows IEEE-754 rounding for its width, but no scalar `real32` or `real64` value is ever NaN or an infinity: the operation that would produce one stops the program.
 
 ## Value equality
 
@@ -652,7 +772,7 @@ The current implementation includes:
 - indentation-aware lexing/parsing with a nesting safety budget,
 - typed AST checking and resolved call semantics,
 - definite-initialization analysis for bindings, fields, arrays, and tensors,
-- receiver and reference-parameter effect summaries, including read-only `const T &` paths,
+- receiver and reference-parameter effect summaries, and isolation of const arguments a call may change,
 - unions, exhaustive matching, and explicit `error` propagation,
 - fixed-width numeric checking with no implicit representation-changing conversion, range-checked explicit integer casts, and explicit fixed-width bitwise semantics,
 - partially initialized classes, explicit composition, and value equality,
@@ -738,7 +858,7 @@ Linux and macOS:
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build --parallel
+cmake --build build --parallel 4
 ctest --test-dir build --output-on-failure
 ./build/quidra run examples/hello.qui
 ```
@@ -747,20 +867,26 @@ Windows (PowerShell, with a CMake-visible libcurl installation; the project CI u
 
 ```powershell
 cmake -S . -B build -A x64
-cmake --build build --config Release --parallel
+cmake --build build --config Release --parallel 4
 ctest --test-dir build -C Release --output-on-failure
 .\build\Release\quidra.exe run examples\hello.qui
 ```
+
+`--parallel 4` runs four compile jobs at a time; adjust the number to the
+machine's cores and memory. With the Makefile generator, a bare `--parallel`
+sets no limit and can run the machine out of memory.
 
 Packaging is platform-specific: Linux produces DEB/TGZ, macOS produces TGZ, and Windows produces ZIP through CPack.
 
 Execution modes are intentionally split:
 
 - `quidra` → interactive REPL + LLVM ORC JIT
-- `quidra main.qui [ARGS...]` → AOT compile/link to a unique hidden native artifact beside `main.qui`, execute it, then delete it
+- `quidra main.qui [ARGS...]` → AOT compile/link (or reuse the run cache's executable) to a unique hidden native artifact beside `main.qui`, execute it, then delete it
 - `quidra build main.qui` → AOT compilation/linking and a persistent native executable artifact
 
-Direct file execution rebuilds on every invocation and never copies the source tree. Temporary direct-run artifacts are named `.quidra-run-*` in the source file's directory, so executable-relative behavior stays aligned with an ordinary local build. Normal completion removes the artifact immediately. Quidra also keeps a per-user lease registry and checks it on every later Quidra startup: stale unlocked artifacts left by a killed compiler process are removed from any project directory, while artifacts belonging to another still-running invocation are left untouched. On POSIX the execution child inherits the lease lock, so killing the parent compiler cannot make an active executable look stale; Windows additionally prevents deletion of the running executable itself.
+Direct file execution (`quidra main.qui`, `quidra run main.qui`) keeps the executables it builds in a per-user run cache and reuses one when nothing it was built from has changed: the sources and every module they import, the packages, their manifests and native inputs, `quidra.lock`, the `--link` inputs, the compiler itself, the native toolchain (clang, the linker, the SDK, the headers and libraries they read, pkg-config's output), the runtime library, the options, the working directory and the environment variables that change a build (`docs/development.md`, "Run cache key"). A reused executable runs exactly where a new one would, and the toolchain's warnings of its build are printed again, so a cached run and a fresh one behave and print the same; only the time differs. The cache lives in `~/Library/Caches/Quidra` on macOS, `$XDG_CACHE_HOME/quidra` or `~/.cache/quidra` on Linux and `%LOCALAPPDATA%\Quidra\Cache` on Windows, or in `QUIDRA_CACHE_DIR`; only the current user can write it, and a cache that cannot be used is skipped silently. `quidra --no-cache main.qui` and `quidra run main.qui --no-cache` build without it. `quidra build` never uses it. The cache keeps at most 1 GiB: a build that adds an entry sometimes scans it and removes the least recently used entries until 80 % of that is left (an entry used in the last minute stays). `quidra cache clean` removes every entry and prints how many it removed.
+
+Direct file execution never copies the source tree. Temporary direct-run artifacts are named `.quidra-run-*` in the source file's directory (a hard link to the cached executable, or a copy), so executable-relative behavior stays aligned with an ordinary local build. Normal completion removes the artifact immediately. Quidra also keeps a per-user lease registry and checks it on every later Quidra startup: stale unlocked artifacts left by a killed compiler process are removed from any project directory, while artifacts belonging to another still-running invocation are left untouched. On POSIX the execution child inherits the lease lock, so killing the parent compiler cannot make an active executable look stale; Windows additionally prevents deletion of the running executable itself.
 
 
 ## Interactive REPL
@@ -778,7 +904,7 @@ Quidra 0.5.0
 >>> x = 8
 >>> x
 8
->>> float y = 4.0
+>>> real64 y = 4.0
 >>> y
 4.0
 >>> int square(int value)
@@ -801,12 +927,14 @@ When standard input is not a TTY, bare `quidra` does not implicitly consume it a
 The core C FFI is intentionally narrow and explicit:
 
 ```quidra
-extern int c_abs(int value) = "llabs"
+extern int64 c_abs(int64 value) = "llabs"
 print(c_abs(-42))
 print(NL)
 ```
 
-Results are limited to ABI-stable scalar values or `void`. Scalar/bool parameters cross by value. Capture-free `fn` values can cross as explicit callback pointers when their signature uses only the ABI-stable callback scalar subset (`int32`, `uint32`, `int`, `uint64`, `float32`, `float`) and `void` where applicable; there is no hidden closure environment or callback allocation. Managed text/binary input uses explicit storage borrows: `const string &` and `const bin &` are read-only, while `bin &` is an explicit mutable byte borrow. Tensor input uses the same explicit authority model: `const tensor<T> &` is a read-only opaque tensor borrow and `tensor<T> &` is a mutable opaque tensor borrow. String/bin borrows lower to a `(data pointer, uint64 byte length)` pair; tensor borrows lower to one opaque handle defined by `quidra/native_extension.h`. Native code must not retain a borrowed pointer or tensor handle after the call. Mutation is permitted only through a mutable borrow and the corresponding native-extension API; tracked tensors deliberately reject raw mutable CPU access so native code cannot bypass autograd silently. A borrowed `bin` must be byte-aligned (`len(value) % 8 == 0`); otherwise the call fails deterministically. Quidra does not expose a pointer-only C-string contract, infer ownership transfer, or infer foreign failure from `errno`/null. Each external C symbol may be bound by only one `extern` declaration in a compilation. `main`, the compiler-owned `n_*` mangling namespace, and the implementation-owned `quidra_*` / `__quidra_*` C symbol namespaces are reserved.
+Results are limited to ABI-stable scalar values or `void`. Scalar/bool parameters cross by value. Capture-free `func` values can cross as explicit callback pointers when their signature uses only the ABI-stable callback scalar subset (`int32`, `nat32`, `int64`, `nat64`, `real32`, `real64`) and `void` where applicable; there is no hidden closure environment or callback allocation. Managed text/binary input uses explicit borrows: `const string` and `const bin` parameters are read-only and take a value at the call, while `bin &` is an explicit mutable byte borrow passed as `&storage`. Tensor input uses the same explicit authority model: `const tensor<T>` is a read-only opaque tensor borrow and `tensor<T> &` is a mutable opaque tensor borrow. String/bin borrows lower to a `(data pointer, nat64 byte length)` pair; tensor borrows lower to one opaque handle defined by `quidra/native_extension.h`. Native code must not retain a borrowed pointer or tensor handle after the call. Mutation is permitted only through a mutable borrow and the corresponding native-extension API; tracked tensors deliberately reject raw mutable CPU access so native code cannot bypass autograd silently. A borrowed `bin` must be byte-aligned (`len(value) % 8 == 0`); otherwise the call fails deterministically. Quidra does not expose a pointer-only C-string contract, infer ownership transfer, or infer foreign failure from `errno`/null. Each external C symbol may be bound by only one `extern` declaration in a compilation. `main`, the compiler-owned `n_*` mangling namespace, and the implementation-owned `quidra_*` / `__quidra_*` C symbol namespaces are reserved.
+
+The outbound direction is `export "C"`: a top-level function with fixed-width scalar parameters and result (`int8`..`int64`, `nat8`..`nat64`, `real32`, `real64`, or a `void` result) becomes callable from C under its own name. `quidra build lib.qui --lib -o libname.a --print-link-flags` builds a self-contained static archive for a C program and prints the system link flags it needs; a runtime failure inside an exported function is reported at its Quidra source and ends the process with status 101.
 
 Packages may own native implementation components instead of moving performance-sensitive domain code into Core. Package metadata can declare package-owned native sources and a platform-selected native library; AOT/direct/run build paths consume them automatically, while REPL/JIT loads package native libraries and compiles declared native sources to temporary objects before resolving package externs. Native package code uses the installed `quidra/native_extension.h` API and treats Quidra tensor handles as opaque. Core-private runtime/device structs are not a package ABI.
 
@@ -884,7 +1012,7 @@ unstable global names. They are reserved, always visible, and are not imported.
 Source-file imports stay explicit: quoted targets are source modules and
 unquoted non-standard targets are installed packages.
 
-The reserved standard namespaces are `cli`, `file`, `environment`, `test`, `time`, `gpu`, `task`, `atomic`, `autograd`, `ref`, `reflect`, `random`, `process`, `map`, `set`, `json`, `http`, `tensor`, `exact`. Generic mathematical semantics are provided by the explicit `math` package and therefore require `import math`.
+The reserved standard namespaces are `cli`, `file`, `environment`, `test`, `time`, `gpu`, `autograd`, `reflect`, `random`, `process`, `map`, `set`, `json`, `http`, `tensor`. Generic mathematical semantics are provided by the explicit `math` package and therefore require `import math`.
 
 Only referenced standard implementations are linked into a program. The
 namespaces are grouped by semantic role rather than exposed as unrelated global
@@ -894,10 +1022,18 @@ functions:
 | --- | --- |
 | Tensor execution | `tensor`, `autograd`, `gpu` |
 | Exact numeric extension | `exact` |
-| Structured data | `map`, `set`, `json`, `ref` |
+| Structured data | `map`, `set`, `json` |
 | I/O and host interaction | `file`, `environment`, `process`, `http` |
-| Explicit state and coordination | `random`, `time`, `task`, `atomic` |
+| Explicit state and coordination | `random`, `time`; `parallel` blocks |
 | Tooling and program structure | `cli`, `test`, `reflect` |
+
+Numeric standard APIs keep their stated representation: `json.integer()` and
+`json.real()` preserve exact values, while `json.number()` and
+`random.Generator.real64()` return `real64`. `Generator.int(start, end)` uses
+arbitrary-precision `int` bounds. `time.seconds(value)` accepts finite integer
+and real values, explicitly converting internally to `real64`; complex values
+are rejected. CLI scalar fields accept every integer and real kind, as well as
+`string` and `bool`.
 
 The same semantic-compression rule applies here: stateful or effectful behavior
 is named by its owning namespace, representation changes stay explicit, and

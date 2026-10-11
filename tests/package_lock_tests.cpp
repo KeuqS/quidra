@@ -1,3 +1,6 @@
+#ifdef NDEBUG
+#undef NDEBUG
+#endif
 #include "quidra/package_lock.hpp"
 #include "quidra/project.hpp"
 

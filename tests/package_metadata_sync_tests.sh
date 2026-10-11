@@ -39,7 +39,7 @@ extern "C" int sample_native_identity(int value) { return value; }
 CPP
 cat >"$PKG/compiler/graph.toml" <<'TOML'
 [extension]
-version = 1
+version = 2
 phase = "tensor-region"
 TOML
 

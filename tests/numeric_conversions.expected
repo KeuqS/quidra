@@ -1,0 +1,10 @@
+7.0+0.0i 7.0+0.0i 9.0+0.0i 7.0+0.0i 9.0+0.0i
+2.0+0.0i 2.0+0.0i 2.0+0.0i
+1.0009765625 1.0078125 1.0009765625
+1.0009765625 1.0078125 2.0-3.0i 2.0-3.0i
+3.0+0.0i
+numeric conversion out of range: array element cannot be represented as real16
+70000.0
+numeric conversion out of range: array element cannot be represented as com16
+1.0+0.0i 2.0+0.0i
+4.0+0.0i

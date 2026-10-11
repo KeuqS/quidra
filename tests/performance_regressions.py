@@ -25,6 +25,11 @@ if os.environ.get("ASAN_OPTIONS") or os.environ.get("UBSAN_OPTIONS"):
     print("skipped: sanitizer build")
     raise SystemExit(0)
 
+# `quidra run` keeps the programs it builds in a run cache of this suite run
+# only, so every run of the suite sees the same hits and misses.
+RUN_CACHE = tempfile.TemporaryDirectory(prefix="quidra-cache-")
+os.environ["QUIDRA_CACHE_DIR"] = RUN_CACHE.name
+
 # A quadratic implementation costs ~4x when the input doubles and a linear one
 # ~2x. Keep the 3x boundary: measurement quality must improve rather than making
 # the regression threshold less meaningful.
@@ -267,11 +272,11 @@ def check_scaling(name, template, small, large, expect, allow_too_fast=False):
 check_correctness_regression(
     "MB08 loop-local string stack regression",
     """int total = 0
-for outer in range(0, 2048)
+for 0 <= nat outer < 2048
     string row = ""
-    for inner in range(0, 512)
+    for 0 <= nat inner < 512
         row = row + "x"
-    total += len(row)
+    total += int(len(row))
 print(total)
 """,
     "1048576",
@@ -284,7 +289,7 @@ check_scaling(
     "string append in a loop",
     """int n = {n}
 string acc = ""
-for i in range(0, n)
+for 0 <= int i < n
     acc = acc + "abcdefghij"
 print(len(acc))
 """,
@@ -297,10 +302,10 @@ check_scaling(
     "string starts_with reuses validation metadata",
     """int n = {n}
 string source = "x"
-for i in range(0, n)
+for 0 <= int i < n
     source = source + "x"
 int matches = 0
-for i in range(0, n)
+for 0 <= int i < n
     if source.starts_with("x")
         matches += 1
 print(matches)
@@ -311,11 +316,11 @@ check_scaling(
     "short string slice does not scan the full source",
     """int n = {n}
 string source = "x"
-for i in range(0, n)
+for 0 <= int i < n
     source = source + "x"
 int total = 0
-for i in range(0, n)
-    total += len(source.slice(0, 1))
+for 0 <= int i < n
+    total += int(len(source[0:<1]))
 print(total)
 """,
     3000, 6000, lambda n: str(n), allow_too_fast=True)
@@ -326,13 +331,13 @@ print(total)
 check_scaling(
     "explicit UTF-8 bin decoding",
     """int n = {n}
-string source = string.repeat("a", n)
+string source = string.repeat("a", nat(n))
 bin data = source.utf8()
 int total = 0
-for pass in range(0, 8)
+for 0 <= nat pass < 8
     match string.from_utf8(data)
         string text
-            total += len(text)
+            total += int(len(text))
         error problem
             process.exit(1)
 print(total)
@@ -347,10 +352,10 @@ check_scaling(
     "map removal and compaction",
     """int n = {n}
 map.Map<int, int> values = map.Map<int, int>()
-for i in range(0, n)
-    values.set(i, i)
-for i in range(0, n, 2)
-    values.remove(i)
+for 0 <= int i < n
+    .values.set(i, i)
+for 0 <= int i < n step 2
+    .values.remove(i)
 int[] remaining = values.keys()
 print(len(remaining))
 """,
@@ -363,23 +368,23 @@ print(len(remaining))
 check_ratio(
     "fully initialized array reference fast path",
     """int n = 400000
-int[] values = array(n, fill = 1)
+int[] values = array(nat(n), fill = 1)
 int total = 0
-for pass in range(0, 8)
-    for i in range(0, n)
+for 0 <= nat pass < 8
+    for 0 <= int i < n
         total += values[i]
 print(total)
 """,
-    """int sum_all(const int[] &values, int n)
+    """int sum_all(const int[] values, int n)
     int total = 0
-    for pass in range(0, 8)
-        for i in range(0, n)
+    for 0 <= nat pass < 8
+        for 0 <= int i < n
             total += values[i]
     return total
 
 int n = 400000
-int[] values = array(n, fill = 1)
-print(sum_all(&values, n))
+int[] values = array(nat(n), fill = 1)
+print(sum_all(values, n))
 """,
     "3200000", "3200000")
 
@@ -392,23 +397,23 @@ print(sum_all(&values, n))
 check_ratio(
     "two-array vs one-array access through &",
     """void scale(int[] &v, int n)
-    for i in range(0, n)
+    for 0 <= int i < n
         v[i] = v[i] + 1
 
 int n = 400000
-int[] v = array(n, fill = 0)
-for pass in range(0, 8)
+int[] v = array(nat(n), fill = 0)
+for 0 <= nat pass < 8
     scale(&v, n)
 print(v[0])
 """,
     """void copy_into(int[] &destination, int[] &source, int n)
-    for i in range(0, n)
+    for 0 <= int i < n
         destination[i] = source[i] + 1
 
 int n = 400000
-int[] source = array(n, fill = 0)
-int[] destination = array(n, fill = 0)
-for pass in range(0, 8)
+int[] source = array(nat(n), fill = 0)
+int[] destination = array(nat(n), fill = 0)
+for 0 <= nat pass < 8
     copy_into(&destination, &source, n)
 print(destination[0])
 """,

@@ -1,6 +1,7 @@
 #include "quidra/parser.hpp"
 #include "quidra/language.hpp"
 #include "quidra/lexer.hpp"
+#include "class_initialization.hpp"
 #include <algorithm>
 #include <charconv>
 #include <cctype>
@@ -12,6 +13,37 @@
 
 namespace quidra {
 namespace {
+
+// Sets a parser flag for one nested construct and restores it afterwards.
+class FlagScope {
+public:
+    FlagScope(bool& flag, bool value) : flag_(flag), saved_(flag) { flag_ = value; }
+    ~FlagScope() { flag_ = saved_; }
+    FlagScope(const FlagScope&) = delete;
+    FlagScope& operator=(const FlagScope&) = delete;
+private:
+    bool& flag_;
+    bool saved_;
+};
+
+constexpr const char* slice_marker_spacing_message =
+    "A slice marker is written next to its colon: '<:', '>:', ':<' or ':>'.";
+constexpr char braces_outside_shape_message[] = "Braces appear only in tensor shapes.";
+
+void reject_reference_type(const Token& token) {
+    if (token.kind == TokenKind::Ampersand)
+        throw CompileError(Diagnostic{"PARSE_ERROR",
+            "'&' is not part of a type: references are local variables and class fields, 'T &name'.",
+            token.span});
+}
+
+void reject_reference_result(const Token& token) {
+    if (token.kind == TokenKind::Ampersand)
+        throw CompileError(Diagnostic{"PARSE_ERROR",
+            "A function cannot return a reference; return a value, or keep the reference in a field.",
+            token.span});
+}
+
 class ParseDepthGuard {
 public:
     ParseDepthGuard(std::size_t& depth, std::size_t limit, const Token& token, const char* what)
@@ -40,8 +72,31 @@ void relocate_span(SourceSpan& span, const SourcePos& base) {
     span.end = relocated_position(span.end, base);
 }
 
+// Skips a balanced group that starts at `index` with `open` and ends with
+// its matching `close`; parentheses, brackets and braces nest inside it.
+bool skip_balanced(const std::vector<Token>& tokens, std::size_t& index,
+                   TokenKind open, TokenKind close) {
+    if (index >= tokens.size() || tokens[index].kind != open) return false;
+    std::vector<TokenKind> closers{close};
+    ++index;
+    while (index < tokens.size() && !closers.empty()) {
+        const auto kind = tokens[index].kind;
+        if (kind == TokenKind::Eof || kind == TokenKind::Newline) return false;
+        if (kind == TokenKind::LParen) closers.push_back(TokenKind::RParen);
+        else if (kind == TokenKind::LBracket) closers.push_back(TokenKind::RBracket);
+        else if (kind == TokenKind::LBrace) closers.push_back(TokenKind::RBrace);
+        else if (kind == TokenKind::RParen || kind == TokenKind::RBracket ||
+                 kind == TokenKind::RBrace) {
+            if (kind != closers.back()) return false;
+            closers.pop_back();
+        }
+        ++index;
+    }
+    return closers.empty();
+}
+
 bool scan_type_lookahead(const std::vector<Token>& tokens, std::size_t& index,
-                         std::size_t depth, std::size_t limit) {
+                         std::size_t depth, std::size_t limit, bool call_scan=false) {
     if (tokens.empty()) return false;
     if (depth > limit) {
         const auto& token = tokens[std::min(index, tokens.size() - 1)];
@@ -50,10 +105,34 @@ bool scan_type_lookahead(const std::vector<Token>& tokens, std::size_t& index,
             "Type nesting exceeds the parser limit.",
             token.span});
     }
-    if (index >= tokens.size() || tokens[index].kind != TokenKind::Identifier) return false;
-    const auto root_name = tokens[index++].text;
+    if(index>=tokens.size()) return false;
+    std::string root_name;
+    if(tokens[index].kind==TokenKind::LParen) {
+        const auto begin=++index;
+        if(!scan_type_lookahead(tokens,index,depth+1,limit,call_scan)) return false;
+        bool comma=false;
+        while(index<tokens.size() && tokens[index].kind==TokenKind::Comma) {
+            comma=true;++index;
+            if(!scan_type_lookahead(tokens,index,depth+1,limit,call_scan)) return false;
+        }
+        if(index>=tokens.size() || tokens[index].kind!=TokenKind::RParen) return false;
+        bool union_group=false;std::size_t nesting=0;
+        for(std::size_t i=begin;i<index;++i) {
+            if(tokens[i].kind==TokenKind::LParen) ++nesting;
+            else if(tokens[i].kind==TokenKind::RParen) --nesting;
+            else if(!nesting && tokens[i].kind==TokenKind::Pipe) union_group=true;
+        }
+        if(call_scan && !comma && !union_group) return false;
+        ++index;
+    } else {
+        if(tokens[index].kind!=TokenKind::Identifier || tokens[index].text=="_") return false;
+        root_name=tokens[index++].text;
+    }
     bool qualified = false;
-    while (index < tokens.size() && tokens[index].kind == TokenKind::Dot) {
+    // A qualified name's '.' touches the name before it; a '.' after a gap
+    // is a definition's mutation marker (`void .update()`).
+    while (index < tokens.size() && tokens[index].kind == TokenKind::Dot &&
+           tokens[index - 1].span.end.offset == tokens[index].span.start.offset) {
         qualified = true;
         ++index;
         if (index >= tokens.size() || tokens[index++].kind != TokenKind::Identifier) return false;
@@ -71,8 +150,38 @@ bool scan_type_lookahead(const std::vector<Token>& tokens, std::size_t& index,
                     ++index;
                     continue;
                 }
-                if (kind == TokenKind::Integer || kind == TokenKind::Identifier) {
+                if (kind == TokenKind::Integer) {
                     ++index;
+                    any = true;
+                    expect_operand = false;
+                    continue;
+                }
+                if (kind == TokenKind::Identifier) {
+                    ++index;
+                    // A member chain and calls (`nat(n)`, `len(v)`,
+                    // `v.size()`): an array extent is a whole expression.
+                    while (index < tokens.size()) {
+                        if (tokens[index].kind == TokenKind::Dot && index + 1 < tokens.size() &&
+                            tokens[index + 1].kind == TokenKind::Identifier) {
+                            index += 2;
+                            continue;
+                        }
+                        if (tokens[index].kind == TokenKind::LParen) {
+                            if (!skip_balanced(tokens, index, TokenKind::LParen, TokenKind::RParen))
+                                return false;
+                            continue;
+                        }
+                        break;
+                    }
+                    any = true;
+                    expect_operand = false;
+                    continue;
+                }
+                // `this.NAME`: a receiver field in an extent expression.
+                if (kind == TokenKind::KwThis && index + 2 < tokens.size() &&
+                    tokens[index + 1].kind == TokenKind::Dot &&
+                    tokens[index + 2].kind == TokenKind::Identifier) {
+                    index += 3;
                     any = true;
                     expect_operand = false;
                     continue;
@@ -128,36 +237,52 @@ bool scan_type_lookahead(const std::vector<Token>& tokens, std::size_t& index,
         return any && index < tokens.size() && tokens[index++].kind == TokenKind::Greater;
     };
 
+    if (!qualified && root_name == "tensor" && index < tokens.size() &&
+        tokens[index].kind == TokenKind::LBrace &&
+        !skip_balanced(tokens, index, TokenKind::LBrace, TokenKind::RBrace)) return false;
     if (index < tokens.size() && tokens[index].kind == TokenKind::Less) {
-        if (!qualified && root_name == "fn") {
+        if (!qualified && (root_name == "func" || root_name == "fn")) {
             ++index;
-            if (!scan_type_lookahead(tokens, index, depth + 1, limit)) return false;
+            if (!scan_type_lookahead(tokens, index, depth + 1, limit,call_scan)) return false;
             if (index >= tokens.size() || tokens[index++].kind != TokenKind::Greater) return false;
             if (index >= tokens.size() || tokens[index++].kind != TokenKind::LParen) return false;
             if (index < tokens.size() && tokens[index].kind != TokenKind::RParen) {
-                if (!scan_type_lookahead(tokens, index, depth + 1, limit)) return false;
+                if (!scan_type_lookahead(tokens, index, depth + 1, limit,call_scan)) return false;
                 while (index < tokens.size() && tokens[index].kind == TokenKind::Comma) {
                     ++index;
-                    if (!scan_type_lookahead(tokens, index, depth + 1, limit)) return false;
+                    if (!scan_type_lookahead(tokens, index, depth + 1, limit,call_scan)) return false;
                 }
             }
             if (index >= tokens.size() || tokens[index++].kind != TokenKind::RParen) return false;
         } else if (!qualified && root_name == "tensor") {
             ++index;
-            if (!scan_type_lookahead(tokens, index, depth + 1, limit)) return false;
+            if (!scan_type_lookahead(tokens, index, depth + 1, limit,call_scan)) return false;
             if (index >= tokens.size() || tokens[index++].kind != TokenKind::Greater) return false;
             if (index < tokens.size() && tokens[index].kind == TokenKind::Less &&
                 !scan_shape()) return false;
+            // A brace shape: the parser classifies its axes.
+            if (index < tokens.size() && tokens[index].kind == TokenKind::LBrace &&
+                !skip_balanced(tokens, index, TokenKind::LBrace, TokenKind::RBrace)) return false;
         } else {
             ++index;
-            if (!scan_type_lookahead(tokens, index, depth + 1, limit)) return false;
+            if (!scan_type_lookahead(tokens, index, depth + 1, limit,call_scan)) return false;
             while (index < tokens.size() && tokens[index].kind == TokenKind::Comma) {
                 ++index;
-                if (!scan_type_lookahead(tokens, index, depth + 1, limit)) return false;
+                if (!scan_type_lookahead(tokens, index, depth + 1, limit,call_scan)) return false;
             }
             if (index >= tokens.size() || tokens[index++].kind != TokenKind::Greater) return false;
         }
     }
+    // Recognize malformed nested reference types as declarations too, so
+    // type_name can report the reference-specific diagnostic at '&'.
+    const auto skip_nested_reference = [&]() {
+        if (index < tokens.size() && tokens[index].kind == TokenKind::Ampersand &&
+            (depth > 1 || call_scan ||
+             (index + 1 < tokens.size() &&
+              (tokens[index + 1].kind == TokenKind::LBracket ||
+               tokens[index + 1].kind == TokenKind::Pipe)))) ++index;
+    };
+    skip_nested_reference();
     while (index < tokens.size() && tokens[index].kind == TokenKind::LBracket) {
         ++index;
         if (index < tokens.size() && tokens[index].kind != TokenKind::RBracket) {
@@ -165,9 +290,10 @@ bool scan_type_lookahead(const std::vector<Token>& tokens, std::size_t& index,
         }
         if (index >= tokens.size() || tokens[index++].kind != TokenKind::RBracket) return false;
     }
+    skip_nested_reference();
     if (index < tokens.size() && tokens[index].kind == TokenKind::Pipe) {
         ++index;
-        return scan_type_lookahead(tokens, index, depth + 1, limit);
+        return scan_type_lookahead(tokens, index, depth + 1, limit,call_scan);
     }
     return true;
 }
@@ -183,6 +309,13 @@ void relocate_type(TypeName& type, const SourcePos& base) {
     for (auto& expression : type.tensor_shape_expressions) {
         if (expression) relocate_expr(*expression, base);
     }
+    for (auto& axis : type.shape_axes) {
+        relocate_span(axis.span, base);
+        // A literal axis shares its expression with tensor_shape_expressions.
+        if (axis.value && axis.kind != ShapeAxisKind::Unnamed) relocate_expr(*axis.value, base);
+        else if (axis.value && !std::holds_alternative<IntegerExpr>(axis.value->data))
+            relocate_expr(*axis.value, base);
+    }
 }
 
 void relocate_arg(CallArg& argument, const SourcePos& base) {
@@ -192,8 +325,16 @@ void relocate_arg(CallArg& argument, const SourcePos& base) {
 
 void relocate_expr(Expr& expression, const SourcePos& base) {
     relocate_span(expression.span, base);
-    if (auto* node = std::get_if<StringTemplateExpr>(&expression.data)) {
+    if (auto* node = std::get_if<NameExpr>(&expression.data)) {
+        if (node->this_qualifier) relocate_span(*node->this_qualifier, base);
+    } else if (auto* node = std::get_if<StringTemplateExpr>(&expression.data)) {
         for (auto& child : node->expressions) relocate_expr(*child, base);
+    } else if (auto* node = std::get_if<TupleExpr>(&expression.data)) {
+        for (auto& child : node->elements) relocate_expr(*child, base);
+    } else if (auto* node = std::get_if<ArrayComprehensionExpr>(&expression.data)) {
+        relocate_span(node->binding_span, base);
+        if (node->type) relocate_type(*node->type, base);
+        visit_array_comprehension(*node, [&](Expr& child) { relocate_expr(child, base); });
     } else if (auto* node = std::get_if<ArrayExpr>(&expression.data)) {
         for (auto& child : node->elements) relocate_expr(*child, base);
     } else if (auto* node = std::get_if<IndexExpr>(&expression.data)) {
@@ -210,8 +351,12 @@ void relocate_expr(Expr& expression, const SourcePos& base) {
     } else if (auto* node = std::get_if<UnaryExpr>(&expression.data)) {
         relocate_expr(*node->operand, base);
     } else if (auto* node = std::get_if<BinaryExpr>(&expression.data)) {
+        relocate_span(node->op_span, base);
         relocate_expr(*node->left, base);
         relocate_expr(*node->right, base);
+    } else if (auto* node = std::get_if<ComparisonChainExpr>(&expression.data)) {
+        for (auto& operand : node->operands) relocate_expr(*operand, base);
+        for (auto& span : node->op_spans) relocate_span(span, base);
     } else if (auto* node = std::get_if<CallExpr>(&expression.data)) {
         for (auto& argument : node->args) relocate_arg(argument, base);
         for (auto& argument : node->type_arguments) relocate_type(argument, base);
@@ -221,6 +366,10 @@ void relocate_expr(Expr& expression, const SourcePos& base) {
         for (auto& argument : node->type_arguments) relocate_type(argument, base);
     } else if (auto* node = std::get_if<TryExpr>(&expression.data)) {
         relocate_expr(*node->value, base);
+    } else if (auto* node = std::get_if<IfExpr>(&expression.data)) {
+        for (auto& condition : node->conditions) relocate_expr(*condition, base);
+        for (auto& value : node->values) relocate_expr(*value, base);
+        relocate_expr(*node->otherwise, base);
     }
 }
 
@@ -248,6 +397,7 @@ bool Parser::match(TokenKind kind) { if (!at(kind)) return false; ++current_; re
 
 const Token& Parser::consume(TokenKind kind, const char* message) {
     if (at(kind)) return tokens_[current_++];
+    if (at(TokenKind::LBrace) || at(TokenKind::RBrace)) error(peek(), braces_outside_shape_message);
     error(peek(), message);
 }
 
@@ -274,14 +424,25 @@ void Parser::synchronize_statement() {
 void Parser::end_statement(const char* context) {
     if (match(TokenKind::Newline)) { consume_newlines(); return; }
     if (at(TokenKind::Eof) || at(TokenKind::Dedent)) return;
+    if (at(TokenKind::LBrace) || at(TokenKind::RBrace)) error(peek(), braces_outside_shape_message);
     error(peek(), std::string("Expected newline after ") + context + ".");
 }
 
 bool Parser::looks_like_declaration(bool function) const {
     std::size_t i = current_;
+    if (!function && i < tokens_.size() && tokens_[i].kind == TokenKind::KwLocal) ++i;
     if (!function && i < tokens_.size() && tokens_[i].kind == TokenKind::KwConst) ++i;
     if (!scan_type_lookahead(tokens_, i, 1, max_parse_depth)) return false;
-    if (!function && i < tokens_.size() && tokens_[i].kind == TokenKind::Ampersand) ++i;
+    if (i < tokens_.size() && tokens_[i].kind == TokenKind::Ampersand) ++i;
+    // A definition's mutation marker: `void .update()`. A statement such as
+    // `counter .increment()` scans the same way, so a marked head counts as a
+    // definition only when its parameter list is followed by a body or by
+    // the prototype's ';'.
+    bool marked = false;
+    if (function && i < tokens_.size() && tokens_[i].kind == TokenKind::Dot) {
+        marked = true;
+        ++i;
+    }
     if (i >= tokens_.size() || tokens_[i++].kind != TokenKind::Identifier) return false;
 
     if (function && i < tokens_.size() && tokens_[i].kind == TokenKind::Less) {
@@ -303,17 +464,29 @@ bool Parser::looks_like_declaration(bool function) const {
     }
 
     if (i >= tokens_.size()) return false;
-    return function ? tokens_[i].kind == TokenKind::LParen : tokens_[i].kind != TokenKind::LParen;
+    if (tokens_[i].kind != TokenKind::LParen) return !function;
+    std::size_t depth = 0;
+    for (; i < tokens_.size(); ++i) {
+        if (tokens_[i].kind == TokenKind::LParen) ++depth;
+        else if (tokens_[i].kind == TokenKind::RParen && --depth == 0) break;
+        else if (tokens_[i].kind == TokenKind::Eof) return false;
+    }
+    if (++i >= tokens_.size()) return false;
+    if (tokens_[i].kind == TokenKind::Semicolon) return function;
+    if (tokens_[i].kind != TokenKind::Newline) return !function && !marked;
+    while (i < tokens_.size() && tokens_[i].kind == TokenKind::Newline) ++i;
+    const bool definition = i < tokens_.size() && tokens_[i].kind == TokenKind::Indent;
+    return function ? definition : !definition;
 }
 
 bool Parser::looks_like_type_argument_call() const {
     if (!at(TokenKind::Less)) return false;
 
     std::size_t i = current_ + 1;
-    if (!scan_type_lookahead(tokens_, i, 1, max_parse_depth)) return false;
+    if (!scan_type_lookahead(tokens_, i, 1, max_parse_depth,true)) return false;
     while (i < tokens_.size() && tokens_[i].kind == TokenKind::Comma) {
         ++i;
-        if (!scan_type_lookahead(tokens_, i, 1, max_parse_depth)) return false;
+        if (!scan_type_lookahead(tokens_, i, 1, max_parse_depth,true)) return false;
     }
     return i + 1 < tokens_.size() &&
            tokens_[i].kind == TokenKind::Greater &&
@@ -324,6 +497,13 @@ bool Parser::looks_like_cli_decl() const {
     return at(TokenKind::Identifier) && peek().text == "cli" &&
            peek(1).kind == TokenKind::Identifier &&
            peek(2).kind == TokenKind::Newline;
+}
+
+// `export` is contextual: it starts an export prefix only when a string
+// literal follows it, so `export` stays an ordinary identifier elsewhere.
+bool Parser::looks_like_export_prefix() const {
+    return at(TokenKind::Identifier) && peek().text == "export" &&
+           peek(1).kind == TokenKind::String;
 }
 
 Program Parser::parse() {
@@ -339,7 +519,9 @@ Program Parser::parse() {
                 declaration.is_public = true;
                 p.imports.push_back(std::move(declaration));
             }
+            else if (at(TokenKind::KwPrivate)) private_declaration(p);
             else if (at(TokenKind::Identifier) && peek().text == "extern") p.functions.push_back(external_function_decl());
+            else if (looks_like_export_prefix()) p.functions.push_back(export_function_decl());
             else if (looks_like_cli_decl()) cli_decl(p);
             else if (at(TokenKind::KwEnum)) p.enums.push_back(enum_decl());
             else if (at(TokenKind::KwClass)) p.classes.push_back(class_decl());
@@ -355,82 +537,229 @@ Program Parser::parse() {
         consume_newlines();
     }
     if (!diagnostics_.empty()) throw CompileErrors(std::move(diagnostics_));
+    p.mutation_markers = std::move(mutation_markers_);
+    std::sort(p.mutation_markers.begin(), p.mutation_markers.end());
     return p;
+}
+
+bool Parser::definition_marker() {
+    if (!at(TokenKind::Dot)) return false;
+    mutation_markers_.push_back(peek().span.start.offset);
+    ++current_;
+    return true;
+}
+
+// `private` before a top-level declaration (L3): a function or prototype,
+// an extern declaration, a class, an enum or a `const` binding is then
+// usable only inside its module. An exported C function is public, and
+// `private` before anything else (an import, a cli block, a statement) is
+// an error.
+void Parser::private_declaration(Program& program) {
+    const auto keyword = consume(TokenKind::KwPrivate, "Expected private.");
+    if (looks_like_export_prefix()) {
+        throw CompileError(Diagnostic{
+            "FFI_EXPORT", "Exported C functions are public; remove 'private'.", keyword.span});
+    }
+    if (at(TokenKind::Identifier) && peek().text == "extern") {
+        auto declaration = external_function_decl();
+        declaration.is_private = true;
+        program.functions.push_back(std::move(declaration));
+    } else if (at(TokenKind::KwEnum)) {
+        auto declaration = enum_decl();
+        declaration.is_private = true;
+        program.enums.push_back(std::move(declaration));
+    } else if (at(TokenKind::KwClass)) {
+        auto declaration = class_decl();
+        declaration.is_private = true;
+        program.classes.push_back(std::move(declaration));
+    } else if (looks_like_declaration(true)) {
+        auto declaration = function_decl();
+        declaration.is_private = true;
+        program.functions.push_back(std::move(declaration));
+    } else if (at(TokenKind::KwConst) && looks_like_declaration(false)) {
+        auto statement = binding_stmt();
+        std::get<BindingStmt>(statement->data).is_private = true;
+        program.statements.push_back(std::move(statement));
+    } else {
+        error(keyword, "private applies to declarations.");
+    }
 }
 
 TypeName Parser::type_name() {
     ParseDepthGuard depth(type_depth_, max_parse_depth, peek(), "Type");
     TypeName t;
-    const auto first = consume(TokenKind::Identifier, "Expected an explicit type.");
-    t.name = first.text;
-    t.span = first.span;
+    const bool grouped=at(TokenKind::LParen);
+    if(match(TokenKind::LParen)) {
+        const auto start=previous().span.start;
+        if(at(TokenKind::RParen)) throw CompileError(Diagnostic{"TUPLE","A tuple type has at least two elements.",peek().span});
+        auto first=type_name();
+        if(at(TokenKind::Ampersand)) {
+            if(peek(1).kind == TokenKind::Comma)
+                throw CompileError(Diagnostic{"TUPLE","Tuple types hold values, never references.",peek().span});
+            reject_reference_type(peek());
+        }
+        if(match(TokenKind::Comma)) {
+            t.name="$tuple";t.span.start=start;t.arguments.push_back(std::move(first));
+            do {
+                if(at(TokenKind::RParen)) throw CompileError(Diagnostic{"TUPLE","Trailing comma is not allowed in a tuple.",peek().span});
+                t.arguments.push_back(type_name());
+                if(at(TokenKind::Ampersand)) throw CompileError(Diagnostic{"TUPLE","Tuple types hold values, never references.",peek().span});
+            } while(match(TokenKind::Comma));
+        } else t=std::move(first);
+        t.span.start=start;t.span.end=consume(TokenKind::RParen,"Expected ')' after tuple type.").span.end;
+    } else {
+        const auto first = consume(TokenKind::Identifier, "Expected an explicit type.");
+        t.name = first.text;t.span = first.span;
+    }
 
-    while (match(TokenKind::Dot)) {
+    // A '.' after a gap is a definition's mutation marker, not a part of
+    // the qualified name (`void .update()`).
+    while (at(TokenKind::Dot) && previous().span.end.offset == peek().span.start.offset) {
+        ++current_;
         const auto part = consume(TokenKind::Identifier, "Expected type name after '.'.");
         t.name += "." + part.text;
         t.span.end = part.span.end;
     }
 
-    const auto parse_shape_pattern = [&]() {
-        consume(TokenKind::Less, "Expected '<' before shape pattern.");
-        if (at(TokenKind::Greater)) error(peek(), "Shape pattern requires at least one axis.");
+    const auto reject_old_tensor_shape = [&]() {
+        const auto first_axis = peek();
+        try {
+            consume(TokenKind::Less, "Expected '<' before shape pattern.");
+            if (!at(TokenKind::Greater)) {
+                (void)type_integer_expression();
+                while (match(TokenKind::Comma)) (void)type_integer_expression();
+            }
+            consume(TokenKind::Greater, "Expected '>' after shape pattern.");
+        } catch (const CompileError&) {
+            // Statement recovery still proceeds from the consumed old pattern.
+        }
+        throw CompileError(Diagnostic{"TENSOR_TYPE",
+            "Tensor shapes are written in braces: write 'tensor<real32>{2, 3}'.",
+            first_axis.span});
+    };
+
+    // A brace shape: each axis is classified on tokens before anything is
+    // parsed, because the expression parser drops parentheses (`(n)` and
+    // `n` would give the same NameExpr).
+    const auto parse_brace_shape = [&]() {
+        consume(TokenKind::LBrace, "Expected '{' before shape pattern.");
+        t.brace_shape = true;
+        if (at(TokenKind::RBrace)) error(peek(), "Shape pattern requires at least one axis.");
+        const auto axis_end = [&](std::size_t n) {
+            const auto kind = peek(n).kind;
+            return kind == TokenKind::Comma || kind == TokenKind::RBrace;
+        };
         while (true) {
-            if (at(TokenKind::Identifier) && peek().text == "_" &&
-                (peek(1).kind == TokenKind::Comma || peek(1).kind == TokenKind::Greater)) {
+            ShapeAxis axis;
+            axis.span = peek().span;
+            long long code = -2;
+            std::shared_ptr<Expr> literal;
+            if (at(TokenKind::Identifier) && peek().text == "_" && axis_end(1)) {
                 consume(TokenKind::Identifier, "Expected '_'.");
-                t.tensor_shape_prefix.push_back(-1);
-                t.tensor_shape_expressions.push_back(nullptr);
+                axis.kind = ShapeAxisKind::Discard;
+                code = -1;
+            } else if (at(TokenKind::Identifier) && peek(1).kind == TokenKind::Identifier &&
+                       (axis_end(2) || peek(2).kind == TokenKind::Assign)) {
+                const auto type_token = consume(TokenKind::Identifier, "Expected 'nat'.");
+                if (type_token.text != "nat") {
+                    throw CompileError(Diagnostic{
+                        "SHAPE_VARIABLE", "A shape variable is nat: write 'nat " +
+                                              peek().text + "'.",
+                        type_token.span});
+                }
+                const auto name = consume(TokenKind::Identifier, "Expected a shape variable name.");
+                axis.name = name.text;
+                axis.span.end = name.span.end;
+                if (match(TokenKind::Assign)) {
+                    axis.kind = ShapeAxisKind::DeclareEqual;
+                    auto value = expression();
+                    axis.span.end = value->span.end;
+                    axis.value.reset(value.release());
+                } else {
+                    axis.kind = ShapeAxisKind::Declare;
+                    code = -1;
+                }
+            } else if (at(TokenKind::Identifier) && axis_end(1)) {
+                const auto name = consume(TokenKind::Identifier, "Expected an axis name.");
+                axis.kind = ShapeAxisKind::Bare;
+                axis.name = name.text;
+                auto reference = std::make_shared<Expr>();
+                reference->span = name.span;
+                reference->data = NameExpr{name.text};
+                axis.value = std::move(reference);
             } else {
-                auto parsed = type_integer_expression();
-                long long static_extent = -2;
-                if (const auto* literal = std::get_if<IntegerExpr>(&parsed->data)) {
-                    if (literal->value >
-                        static_cast<unsigned long long>(std::numeric_limits<long long>::max())) {
+                axis.kind = ShapeAxisKind::Unnamed;
+                auto value = expression();
+                axis.span.end = value->span.end;
+                if (const auto* integer = std::get_if<IntegerExpr>(&value->data)) {
+                    if (!integer->fits_u64 ||
+                        integer->value >
+                            static_cast<unsigned long long>(std::numeric_limits<long long>::max())) {
                         error(previous(), "Shape extent is too large.");
                     }
-                    static_extent = static_cast<long long>(literal->value);
+                    code = static_cast<long long>(integer->value);
                 }
-                t.tensor_shape_prefix.push_back(static_extent);
-                t.tensor_shape_expressions.emplace_back(parsed.release());
+                axis.value.reset(value.release());
+                if (code >= 0) literal = axis.value;
             }
+            t.tensor_shape_prefix.push_back(code);
+            t.tensor_shape_expressions.push_back(std::move(literal));
+            t.shape_axes.push_back(std::move(axis));
             if (!match(TokenKind::Comma)) break;
-            if (at(TokenKind::Greater)) error(peek(), "Trailing comma is not allowed in a shape pattern.");
+            if (at(TokenKind::RBrace)) error(peek(), "Trailing comma is not allowed in a shape pattern.");
         }
-        consume(TokenKind::Greater, "Expected '>' after shape pattern.");
+        consume(TokenKind::RBrace, "Expected '}' after shape pattern.");
         t.tensor_rank = static_cast<long long>(t.tensor_shape_prefix.size());
         t.span.end = previous().span.end;
     };
 
-    if (t.name == "fn") {
-        consume(TokenKind::Less, "fn requires '<Result>' before its parameter list.");
-        if (at(TokenKind::Greater)) error(peek(), "fn requires a result type.");
+    if (t.name == "tensor" && at(TokenKind::LBrace)) {
+        throw CompileError(Diagnostic{
+            "TENSOR_TYPE",
+            "A tensor type names its element type: write 'tensor<real32>{2, 3}' or use 'auto'.",
+            peek().span});
+    }
+
+    if (!grouped && t.name == "fn") t.name = "func";
+    if (!grouped && t.name == "func") {
+        consume(TokenKind::Less, "func requires '<Result>' before its parameter list.");
+        if (at(TokenKind::Greater)) error(peek(), "func requires a result type.");
         t.arguments.push_back(type_name());
-        consume(TokenKind::Greater, "Expected '>' after fn result type.");
-        consume(TokenKind::LParen, "Expected '(' after fn result type.");
+        reject_reference_type(peek());
+        consume(TokenKind::Greater, "Expected '>' after func result type.");
+        consume(TokenKind::LParen, "Expected '(' after func result type.");
         if (!at(TokenKind::RParen)) {
             do {
                 t.function_parameters.push_back(type_name());
+                reject_reference_type(peek());
             } while (match(TokenKind::Comma));
         }
-        t.span.end = consume(TokenKind::RParen, "Expected ')' after fn parameter types.").span.end;
-    } else if (at(TokenKind::Less)) {
+        t.span.end = consume(TokenKind::RParen, "Expected ')' after func parameter types.").span.end;
+    } else if (!grouped && at(TokenKind::Less)) {
         if (t.name == "tensor") {
             consume(TokenKind::Less, "Expected '<' before tensor element type.");
             if (at(TokenKind::Greater)) error(peek(), "tensor requires an element type.");
             t.arguments.push_back(type_name());
+            reject_reference_type(peek());
             consume(TokenKind::Greater, "Expected '>' after tensor element type.");
             t.span.end = previous().span.end;
-            if (at(TokenKind::Less)) parse_shape_pattern();
+            if (at(TokenKind::Less)) reject_old_tensor_shape();
+            else if (at(TokenKind::LBrace)) parse_brace_shape();
         } else {
             t.arguments = type_argument_list();
             t.span.end = previous().span.end;
         }
     }
+    if (at(TokenKind::Ampersand) &&
+        (peek(1).kind == TokenKind::LBracket || peek(1).kind == TokenKind::Pipe))
+        reject_reference_type(peek());
     while (match(TokenKind::LBracket)) {
         long long length = -1;
         std::shared_ptr<Expr> dimension;
         if (!at(TokenKind::RBracket)) {
-            auto parsed = type_integer_expression();
+            // A whole expression (`int[nat(n)]`, `int[len(v)]`): the
+            // brackets delimit it.
+            auto parsed = expression();
             length = -2;
             if (const auto* literal = std::get_if<IntegerExpr>(&parsed->data)) {
                 if (literal->value >
@@ -447,6 +776,8 @@ TypeName Parser::type_name() {
         ++t.array_depth;
     }
 
+    if (at(TokenKind::Ampersand) && peek(1).kind == TokenKind::Pipe)
+        reject_reference_type(peek());
     if (match(TokenKind::Pipe)) {
         TypeName u;
         u.name = "union";
@@ -486,11 +817,10 @@ ExprPtr Parser::type_integer_factor() {
         return result;
     }
 
+    if (at(TokenKind::KwThis)) return this_field();
+
     if (match(TokenKind::Identifier)) {
         const auto token = previous();
-        if (token.text == "_") {
-            error(token, "'_' is only valid as a tensor wildcard axis.");
-        }
         auto result = std::make_unique<Expr>();
         result->span = token.span;
         result->data = NameExpr{token.text};
@@ -535,6 +865,7 @@ std::vector<TypeName> Parser::type_argument_list() {
     if (at(TokenKind::Greater)) error(peek(), "Generic type argument list cannot be empty.");
     do {
         arguments.push_back(type_name());
+        reject_reference_type(peek());
     } while (match(TokenKind::Comma));
     consume(TokenKind::Greater, "Expected '>' after type arguments.");
     return arguments;
@@ -626,6 +957,9 @@ void Parser::cli_decl(Program& program) {
     while (!at(TokenKind::Dedent) && !at(TokenKind::Eof)) {
         const auto field_start = peek().span.start;
         auto type = type_name();
+        if (at(TokenKind::Ampersand))
+            throw CompileError(Diagnostic{"REFERENCE_BINDING",
+                "A cli field holds a value from the command line; remove '&'.", peek().span});
         const auto field = consume(TokenKind::Identifier, "Expected CLI field name.");
         consume(TokenKind::Assign, "CLI fields require '= argument()', '= argument(default = ...)', '= option(default = ...)', or '= flag()'.");
         auto declaration = expression();
@@ -684,7 +1018,7 @@ void Parser::cli_decl(Program& program) {
 
     auto binding_stmt = std::make_unique<Stmt>();
     binding_stmt->span = SourceSpan{cli_token.span.start, end};
-    binding_stmt->data = BindingStmt{std::move(cli_type), binding.text, std::move(constructor), false, false};
+    binding_stmt->data = BindingStmt{std::move(cli_type), binding.text, std::move(constructor), false, false, false, false, false, {}};
     program.statements.push_back(std::move(binding_stmt));
 
     auto finish_expr = std::make_unique<Expr>();
@@ -732,73 +1066,141 @@ ClassDecl Parser::class_decl() {
     }
     std::vector<std::string> type_constraints;
     auto type_parameters = type_parameter_list(&type_constraints);
-
-    if (match(TokenKind::Semicolon)) {
-        const auto end = previous().span.end;
-        end_statement("class prototype");
-        ClassDecl declaration{name, {}, {}, {}, {start, end},
-                              std::move(type_parameters), std::move(type_constraints)};
-        declaration.is_prototype = true;
-        return declaration;
+    std::string self_name;
+    std::optional<SourceSpan> self_span;
+    if (at(TokenKind::Identifier)) {
+        const auto instance = consume(TokenKind::Identifier, "Expected instance name.");
+        self_name = instance.text;
+        self_span = instance.span;
     }
-
-    end_statement("class signature");
-    consume(TokenKind::Indent, "Expected class body indented by four spaces.");
-
+    if (!match(TokenKind::LParen)) {
+        throw CompileError(Diagnostic{"CONSTRUCTOR_SIGNATURE", "A class definition requires its argument list, including '()' for no arguments.", peek().span});
+    }
+    std::vector<Parameter> parameters;
     std::vector<FieldDecl> fields;
-    std::vector<FunctionDecl> methods;
-    consume_newlines();
-    while (!at(TokenKind::Dedent) && !at(TokenKind::Eof)) {
-        if (at(TokenKind::KwClass)) error(peek(), "Nested classes are prohibited.");
-        if (at(TokenKind::KwImport)) error(peek(), "import is only valid at top level.");
-        if (at(TokenKind::KwPublic)) error(peek(), "public is only valid as 'public import' at top level.");
-        const bool is_private = match(TokenKind::KwPrivate);
-        if (at(TokenKind::Identifier) && peek().text == "construct" &&
-            peek(1).kind == TokenKind::LParen) {
-            auto constructor = constructor_decl(name, type_parameters);
-            constructor.is_private = is_private;
-            methods.push_back(std::move(constructor));
-        } else if (looks_like_declaration(true)) {
-            auto method = function_decl();
-            method.is_private = is_private;
-            if (method.name == "construct") {
-                method.is_constructor = true;
-                method.constructor_typed = true;
-            }
-            methods.push_back(std::move(method));
-        } else if (looks_like_declaration(false)) {
-            const auto field_start = is_private ? previous().span.start : peek().span.start;
-            const bool is_const = match(TokenKind::KwConst);
-            auto type = type_name();
-            const auto field = consume(TokenKind::Identifier, "Expected field name.");
-            ExprPtr default_value;
-            if (match(TokenKind::Assign)) default_value = expression();
-            const auto field_end = default_value ? default_value->span.end : field.span.end;
-            auto span = SourceSpan{field_start, field_end};
-            end_statement("class field");
-            fields.push_back(FieldDecl{field.text, std::move(type), span, std::move(default_value), is_const, is_private});
-        } else {
-            error(peek(), "Expected a field or method declaration in class body.");
-        }
-        consume_newlines();
+    while (!at(TokenKind::RParen)) {
+        const bool local = match(TokenKind::KwLocal);
+        const bool is_const = match(TokenKind::KwConst);
+        auto type = type_name();
+        const bool reference = match(TokenKind::Ampersand);
+        reject_const_reference(is_const, reference);
+        const auto parameter = consume(TokenKind::Identifier, "Expected class argument name.");
+        ExprPtr value;
+        if (match(TokenKind::Assign)) value = expression();
+        if (!local) fields.push_back(FieldDecl{parameter.text, type, parameter.span, {}, is_const, false, reference});
+        parameters.push_back(Parameter{parameter.text, std::move(type), reference, parameter.span, std::move(value), is_const, local});
+        if (!match(TokenKind::Comma)) break;
     }
-    const auto end = consume(TokenKind::Dedent, "Expected end of class body.").span.end;
-    return ClassDecl{name, {}, std::move(fields), std::move(methods),
-                     {start, end}, std::move(type_parameters), std::move(type_constraints)};
+    consume(TokenKind::RParen, "Expected ')' after class arguments.");
+    TypeName result;
+    result.name = name;
+    result.span = first_name.span;
+    for (const auto& parameter : type_parameters) {
+        TypeName argument;
+        argument.name = parameter;
+        argument.span = first_name.span;
+        result.arguments.push_back(std::move(argument));
+    }
+    if (match(TokenKind::Pipe)) {
+        const auto contract = consume(TokenKind::Identifier, "A class generation error contract must be '| error'.");
+        if (contract.text != "error") error(contract, "A class generation error contract must be '| error'.");
+        TypeName fallible;
+        fallible.name = "union";
+        fallible.span = {first_name.span.start, contract.span.end};
+        fallible.arguments.push_back(std::move(result));
+        TypeName error_type;
+        error_type.name = "error";
+        error_type.span = contract.span;
+        fallible.arguments.push_back(std::move(error_type));
+        result = std::move(fallible);
+    }
+    FunctionDecl initializer;
+    initializer.name = "$initialize";
+    initializer.parameters = std::move(parameters);
+    initializer.return_type = std::move(result);
+    initializer.is_constructor = true;
+    std::vector<FunctionDecl> methods;
+    auto end = previous().span.end;
+    const bool prototype = match(TokenKind::Semicolon);
+    if (prototype) end = previous().span.end;
+    end_statement(prototype ? "class prototype" : "class signature");
+    if (!prototype && match(TokenKind::Indent)) {
+        consume_newlines();
+        while (!at(TokenKind::Dedent) && !at(TokenKind::Eof)) {
+            if (at(TokenKind::KwClass)) error(peek(), "Nested classes are prohibited.");
+            if (at(TokenKind::KwImport)) error(peek(), "import is only valid at top level.");
+            if (at(TokenKind::KwPublic)) error(peek(), "public is only valid as 'public import' at top level.");
+            const bool is_private = match(TokenKind::KwPrivate);
+            std::optional<ForeignExport> foreign_export;
+            if (looks_like_export_prefix()) foreign_export = foreign_export_prefix();
+            if (looks_like_declaration(true)) {
+                auto method = function_decl();
+                method.is_private = is_private;
+                method.foreign_export = std::move(foreign_export);
+                methods.push_back(std::move(method));
+            } else if (foreign_export) {
+                error(peek(), "export \"C\" must precede a function declaration.");
+            } else if (looks_like_declaration(false) && !at(TokenKind::KwLocal)) {
+                const auto field_start = peek().span.start;
+                const bool is_const = match(TokenKind::KwConst);
+                auto type = type_name();
+                const bool reference = match(TokenKind::Ampersand);
+                reject_const_reference(is_const, reference);
+                const auto field = consume(TokenKind::Identifier, "Expected member name.");
+                ExprPtr value;
+                bool reference_value = false;
+                if (match(TokenKind::Assign)) {
+                    reference_value = reference && match(TokenKind::Ampersand);
+                    value = expression();
+                    if (reference && !reference_value) throw CompileError(Diagnostic{"REFERENCE_BINDING", "Initialize a reference member with an explicit '&' storage reference.", field.span});
+                }
+                const auto field_end = value ? value->span.end : field.span.end;
+                const SourceSpan span{field_start, field_end};
+                end_statement("class member");
+                fields.push_back(FieldDecl{field.text, std::move(type), span, {}, is_const, is_private, reference});
+                if (value) {
+                    auto statement = std::make_unique<Stmt>();
+                    statement->span = span;
+                    auto target = std::make_unique<Expr>();
+                    target->span = field.span;
+                    target->data = NameExpr{field.text, field.span};
+                    if (reference) statement->data = RebindStmt{field.text, std::move(value), std::move(target)};
+                    else statement->data = AssignStmt{std::move(target), std::move(value), {}, {}, nullptr};
+                    initializer.body.push_back(std::move(statement));
+                }
+            } else {
+                if (is_private) error(peek(), "private applies to class members and methods.");
+                initializer.body.push_back(statement());
+            }
+            consume_newlines();
+        }
+        end = consume(TokenKind::Dedent, "Expected end of class body.").span.end;
+    }
+    initializer.span = {start, end};
+    methods.insert(methods.begin(), std::move(initializer));
+    ClassDecl declaration{name, {}, std::move(fields), std::move(methods), {start, end}, std::move(type_parameters), std::move(type_constraints)};
+    declaration.self_name = std::move(self_name);
+    declaration.self_span = self_span;
+    declaration.is_prototype = prototype;
+    elaborate_class_initialization(declaration);
+    return declaration;
 }
 
 FunctionDecl Parser::function_decl() {
     const auto declaration_start = peek().span.start;
     auto result=type_name();auto start=declaration_start;
+    reject_reference_result(peek());
+    const bool marked=definition_marker();
     auto name=consume(TokenKind::Identifier,"Expected function name.");
     std::vector<std::string> type_constraints;
     auto type_parameters=type_parameter_list(&type_constraints);
     consume(TokenKind::LParen,"Expected '('."); std::vector<Parameter> params;
     while(!at(TokenKind::RParen)) {
+        const bool is_local=match(TokenKind::KwLocal);
         const bool is_const=match(TokenKind::KwConst);
-        auto type=type_name();bool write=match(TokenKind::Ampersand);auto p=consume(TokenKind::Identifier,"Expected parameter name.");
+        auto type=type_name();bool write=match(TokenKind::Ampersand);reject_const_reference(is_const,write);auto p=consume(TokenKind::Identifier,"Expected parameter name.");
         ExprPtr value; if(match(TokenKind::Assign)) value=expression();
-        params.push_back(Parameter{p.text,std::move(type),write,p.span,std::move(value),is_const});
+        params.push_back(Parameter{p.text,std::move(type),write,p.span,std::move(value),is_const,is_local});
         if(!match(TokenKind::Comma)) break;
     }
     consume(TokenKind::RParen,"Expected ')'.");
@@ -809,73 +1211,41 @@ FunctionDecl Parser::function_decl() {
                                  {start, end}, false, std::move(type_parameters), std::nullopt,
                                  std::move(type_constraints)};
         declaration.is_prototype = true;
+        declaration.mutation_marker = marked;
         return declaration;
     }
     end_statement("function signature");auto body=block_until(false);
     auto end=previous().span.end;
-    return FunctionDecl{name.text, {}, std::move(params), std::move(result), std::move(body),
-                        {start, end}, false, std::move(type_parameters), std::nullopt,
-                        std::move(type_constraints)};
-}
-
-
-// `construct(...)` inside a class body. The member has no spelled return type:
-// it constructs the enclosing class, so the parser fills that type in, with the
-// class's own type parameters as arguments so a generic class instantiates it
-// like any other member.
-FunctionDecl Parser::constructor_decl(const std::string& class_name,
-                                      const std::vector<std::string>& type_parameters) {
-    const auto start = peek().span.start;
-    const auto name = consume(TokenKind::Identifier, "Expected construct.");
-    TypeName result;
-    result.name = class_name;
-    result.span = name.span;
-    for (const auto& parameter : type_parameters) {
-        TypeName argument;
-        argument.name = parameter;
-        argument.span = name.span;
-        result.arguments.push_back(std::move(argument));
-    }
-    consume(TokenKind::LParen, "Expected '(' after construct.");
-    std::vector<Parameter> params;
-    while (!at(TokenKind::RParen)) {
-        const bool is_const = match(TokenKind::KwConst);
-        auto type = type_name();
-        const bool write = match(TokenKind::Ampersand);
-        const auto p = consume(TokenKind::Identifier, "Expected parameter name.");
-        ExprPtr value;
-        if (match(TokenKind::Assign)) value = expression();
-        params.push_back(Parameter{p.text, std::move(type), write, p.span, std::move(value), is_const});
-        if (!match(TokenKind::Comma)) break;
-    }
-    consume(TokenKind::RParen, "Expected ')'.");
-    end_statement("constructor signature");
-    auto body = block_until(false);
-    const auto end = previous().span.end;
     FunctionDecl declaration{name.text, {}, std::move(params), std::move(result), std::move(body),
-                             {start, end}, false, {}, std::nullopt, {}};
-    declaration.is_constructor = true;
+                             {start, end}, false, std::move(type_parameters), std::nullopt,
+                             std::move(type_constraints)};
+    declaration.mutation_marker = marked;
     return declaration;
 }
+
 
 FunctionDecl Parser::external_function_decl() {
     const auto start=consume(TokenKind::Identifier,"Expected extern.").span.start;
     auto result=type_name();
+    reject_reference_result(peek());
+    const bool marked=definition_marker();
     const auto name=consume(TokenKind::Identifier,"Expected external function name.");
     std::vector<std::string> type_constraints;
     auto type_parameters=type_parameter_list(&type_constraints);
     consume(TokenKind::LParen,"Expected '(' after external function name.");
     std::vector<Parameter> parameters;
     while(!at(TokenKind::RParen)) {
+        const bool is_local=match(TokenKind::KwLocal);
         const bool is_const=match(TokenKind::KwConst);
         auto type=type_name();
         const bool reference=match(TokenKind::Ampersand);
+        reject_const_reference(is_const,reference);
         const auto parameter=consume(TokenKind::Identifier,"Expected external parameter name.");
         ExprPtr default_value;
         if(match(TokenKind::Assign)) default_value=expression();
         parameters.push_back(Parameter{
             parameter.text,std::move(type),reference,parameter.span,
-            std::move(default_value),is_const});
+            std::move(default_value),is_const,is_local});
         if(!match(TokenKind::Comma)) break;
     }
     consume(TokenKind::RParen,"Expected ')' after external parameters.");
@@ -890,6 +1260,28 @@ FunctionDecl Parser::external_function_decl() {
     declaration.type_parameters=std::move(type_parameters);
     declaration.type_constraints=std::move(type_constraints);
     declaration.external_symbol=symbol.text;
+    declaration.mutation_marker=marked;
+    return declaration;
+}
+
+ForeignExport Parser::foreign_export_prefix() {
+    const auto keyword = consume(TokenKind::Identifier, "Expected export.");
+    const auto abi = consume(TokenKind::String, "Expected the ABI string after export.");
+    ForeignExport prefix;
+    prefix.abi = abi.text;
+    prefix.span = {keyword.span.start, abi.span.end};
+    return prefix;
+}
+
+// `export "C"` before a top-level function prototype or definition. The
+// frontend validates the ABI string and the target.
+FunctionDecl Parser::export_function_decl() {
+    auto prefix = foreign_export_prefix();
+    if (!looks_like_declaration(true))
+        error(peek(), "export \"C\" must precede a function declaration.");
+    auto declaration = function_decl();
+    declaration.span.start = prefix.span.start;
+    declaration.foreign_export = std::move(prefix);
     return declaration;
 }
 
@@ -902,6 +1294,7 @@ std::vector<StmtPtr> Parser::block_until(bool) {
             if (at(TokenKind::KwEnum)) error(peek(), "Nested enums are prohibited.");
             if (at(TokenKind::KwImport)) error(peek(), "import is only valid at top level.");
             if (at(TokenKind::Identifier) && peek().text == "extern") error(peek(), "extern declarations are only valid at top level.");
+            if (looks_like_export_prefix()) error(peek(), "export declarations are only valid at top level.");
             if (looks_like_declaration(true)) error(peek(), "Nested functions are prohibited.");
             body.push_back(statement());
         } catch (const CompileError& error) {
@@ -919,6 +1312,7 @@ StmtPtr Parser::statement() {
     if (at(TokenKind::KwReturn)) return return_stmt();
     if (at(TokenKind::KwBreak) || at(TokenKind::KwContinue)) return loop_control_stmt();
     if (at(TokenKind::KwIf)) return if_stmt();
+    if (at(TokenKind::KwParallel)) return parallel_stmt();
     if (at(TokenKind::KwWhile)) return while_stmt();
     if (at(TokenKind::KwFor)) return for_stmt();
     if (at(TokenKind::KwMatch)) return match_stmt();
@@ -927,27 +1321,151 @@ StmtPtr Parser::statement() {
     if (at(TokenKind::KwClass) || at(TokenKind::KwEnum))
         error(peek(),"class and enum are only valid at declaration boundaries.");
     if (looks_like_declaration(false)) return binding_stmt();
-    if (at(TokenKind::Ampersand) && peek(1).kind == TokenKind::Identifier &&
-        peek(2).kind == TokenKind::Assign && peek(3).kind == TokenKind::Ampersand)
+    if (at(TokenKind::KwLocal)) {
+        const auto prefix = tokens_[current_++];
+        if (!pattern_followed_by_assignment()) error(prefix, "local requires a declaration.");
+        auto result = destructuring_stmt();
+        auto* binding = std::get_if<BindingStmt>(&result->data);
+        if (!binding) error(prefix, "local requires a declaration, not an assignment.");
+        binding->is_local = true;
+        result->span.start = prefix.span.start;
+        return result;
+    }
+    if (pattern_followed_by_assignment()) return destructuring_stmt();
+    if (at(TokenKind::Ampersand) &&
+        ((peek(1).kind == TokenKind::Identifier &&
+          peek(2).kind == TokenKind::Assign && peek(3).kind == TokenKind::Ampersand) ||
+         (peek(1).kind == TokenKind::KwThis && peek(2).kind == TokenKind::Dot &&
+          peek(3).kind == TokenKind::Identifier && peek(4).kind == TokenKind::Assign &&
+          peek(5).kind == TokenKind::Ampersand)))
         return rebind_stmt();
     return expr_or_assign_stmt();
 }
 
+// D12: there are no read-only references. `const T &` is CONST_REFERENCE
+// at the '&', in a parameter, an extern parameter and a binding.
+void Parser::reject_const_reference(bool is_const, bool reference) const {
+    if (!is_const || !reference) return;
+    throw CompileError(Diagnostic{
+        "CONST_REFERENCE",
+        "Const references do not exist; write 'const T name' for a read-only value.",
+        previous().span});
+}
+
+bool Parser::pattern_followed_by_assignment() const {
+    if(!at(TokenKind::LParen)) return false;
+    auto i=current_;std::vector<TokenKind> closes;bool comma=false;
+    for(;i<tokens_.size();++i){const auto kind=tokens_[i].kind;
+        if(kind==TokenKind::LParen)closes.push_back(TokenKind::RParen);
+        else if(kind==TokenKind::LBracket)closes.push_back(TokenKind::RBracket);
+        else if(kind==TokenKind::LBrace)closes.push_back(TokenKind::RBrace);
+        else if(kind==TokenKind::RParen || kind==TokenKind::RBracket || kind==TokenKind::RBrace){if(closes.empty()||closes.back()!=kind)return false;closes.pop_back();if(closes.empty()){++i;break;}}
+        else if(kind==TokenKind::Comma && closes.size()==1)comma=true;
+        else if(kind==TokenKind::Eof || kind==TokenKind::Newline)return false;
+    }
+    if(!comma || i>=tokens_.size()) return false;
+    auto next=tokens_[i].kind;
+    return next==TokenKind::Assign || next==TokenKind::PlusAssign || next==TokenKind::MinusAssign ||
+           next==TokenKind::StarAssign || next==TokenKind::SlashAssign || next==TokenKind::PercentAssign;
+}
+
+Pattern Parser::parse_pattern(bool match_case) {
+    Pattern result;result.span.start=consume(TokenKind::LParen,"Expected tuple pattern.").span.start;
+    for(;;) {
+        if(at(TokenKind::RParen)) throw CompileError(Diagnostic{"TUPLE","Trailing comma is not allowed in a tuple.",peek().span});
+        Pattern item;item.span.start=peek().span.start;
+        if(at(TokenKind::Identifier) && peek().text=="_" &&
+           (peek(1).kind==TokenKind::Comma || peek(1).kind==TokenKind::RParen)) {
+            item.kind=Pattern::Kind::Discard;item.span=consume(TokenKind::Identifier,"Expected '_'.").span;
+        } else {
+            auto scan=current_;bool constant=tokens_[scan].kind==TokenKind::KwConst;if(constant)++scan;
+            const bool typed=scan_type_lookahead(tokens_,scan,1,max_parse_depth) &&
+                ((scan<tokens_.size() && tokens_[scan].kind==TokenKind::Identifier) ||
+                 (scan+1<tokens_.size() && tokens_[scan].kind==TokenKind::Ampersand && tokens_[scan+1].kind==TokenKind::Identifier) ||
+                 (match_case && scan<tokens_.size() && (tokens_[scan].kind==TokenKind::Comma || tokens_[scan].kind==TokenKind::RParen)));
+            if(typed) {
+                item.is_const=match(TokenKind::KwConst);item.type=type_name();item.reference=match(TokenKind::Ampersand);
+                reject_const_reference(item.is_const,item.reference);
+                if(at(TokenKind::Identifier)) {item.kind=Pattern::Kind::Declare;item.name=consume(TokenKind::Identifier,"Expected pattern binding name.").text;}
+                else item.kind=Pattern::Kind::TypeOnly;
+            } else if(at(TokenKind::LParen)) {
+                auto group=current_;unsigned depth=0;bool comma=false;
+                for(;group<tokens_.size();++group) {auto k=tokens_[group].kind;if(k==TokenKind::LParen)++depth;else if(k==TokenKind::RParen && --depth==0)break;else if(k==TokenKind::Comma && depth==1)comma=true;}
+                if(comma) item=parse_pattern(match_case);else {item.kind=Pattern::Kind::Place;item.place=postfix();}
+            } else {item.kind=Pattern::Kind::Place;item.place=postfix();}
+            item.span.end=previous().span.end;
+        }
+        result.elements.push_back(std::move(item));
+        if(!match(TokenKind::Comma))break;
+    }
+    result.span.end=consume(TokenKind::RParen,"Expected ')' after tuple pattern.").span.end;
+    if(result.elements.size()<2) throw CompileError(Diagnostic{match_case?"MATCH_CASE":"TUPLE",match_case?"A case beginning with '(' that is not a type is a tuple pattern, which has at least two elements.":"A tuple pattern has at least two elements.",result.span});
+    return result;
+}
+
+StmtPtr Parser::destructuring_stmt() {
+    auto pattern=parse_pattern();const auto start=pattern.span.start;
+    if(!match(TokenKind::Assign)) throw CompileError(Diagnostic{"TUPLE","A pattern is assigned with '='.",peek().span});
+    const bool reference=match(TokenKind::Ampersand);auto value=expression();auto end=value->span.end;
+    bool declares=false,places=false;visit_pattern(pattern,[&](const Pattern& p){declares|=p.kind==Pattern::Kind::Declare;places|=p.kind==Pattern::Kind::Place;});
+    if(declares && places) throw CompileError(Diagnostic{"TUPLE","A pattern cannot mix declarations and existing places.",pattern.span});
+    if(reference && !declares) throw CompileError(Diagnostic{"TUPLE","A reference pattern declares references only.",pattern.span});
+    auto out=std::make_unique<Stmt>();out->span={start,end};
+    if(declares) {BindingStmt binding;binding.declared_type.name="auto";binding.value=std::move(value);binding.reference=reference;binding.reference_initializer=reference;binding.pattern=std::move(pattern);out->data=std::move(binding);}
+    else {AssignStmt assignment;assignment.target=std::make_unique<Expr>();assignment.target->data=TupleExpr{};assignment.value=std::move(value);assignment.pattern=std::move(pattern);out->data=std::move(assignment);}
+    end_statement("destructuring");return out;
+}
+
 StmtPtr Parser::binding_stmt() {
     const auto start=peek().span.start;
+    const bool is_local=match(TokenKind::KwLocal);
     const bool is_const=match(TokenKind::KwConst);
+    // `const literal T NAME`: `literal` is a keyword only here, between
+    // `const` and a type that a name follows; elsewhere it is an identifier.
+    const bool literal_constant=is_const&&at(TokenKind::Identifier)&&peek().text=="literal"&&
+        peek(1).kind==TokenKind::Identifier&&
+        (peek(2).kind==TokenKind::Identifier||peek(2).kind==TokenKind::Less||
+         peek(2).kind==TokenKind::LBracket);
+    if(literal_constant)consume(TokenKind::Identifier,"Expected literal.");
     auto type=type_name();
     const bool reference=match(TokenKind::Ampersand);
+    reject_const_reference(is_const, reference);
     auto name=consume(TokenKind::Identifier,"Expected binding name.");
     ExprPtr value; bool reference_initializer=false;
     if(match(TokenKind::Assign)) {
         reference_initializer=reference && match(TokenKind::Ampersand);
         value=expression();
+    } else if (at(TokenKind::LParen)) {
+        if (reference || is_language_type_name(type.name) || type.array_depth || type.brace_shape)
+            error(peek(), "Direct initialization requires a class value binding; use '= expression' for other bindings.");
+        auto args = call_arguments();
+        value = std::make_unique<Expr>();
+        value->span = SourceSpan{type.span.start, previous().span.end};
+        const auto separator = type.name.rfind('.');
+        if (separator == std::string::npos) {
+            value->data = CallExpr{type.name, std::move(args), type.arguments};
+        } else {
+            auto receiver = std::make_unique<Expr>();
+            receiver->span = type.span;
+            const auto first = type.name.find('.');
+            receiver->data = NameExpr{type.name.substr(0, first)};
+            for (auto begin = first + 1; begin < separator;) {
+                const auto end = type.name.find('.', begin);
+                auto member = std::make_unique<Expr>();
+                member->span = type.span;
+                member->data = MemberExpr{std::move(receiver), type.name.substr(begin, end - begin)};
+                receiver = std::move(member);
+                begin = end + 1;
+            }
+            value->data = MethodCallExpr{std::move(receiver), type.name.substr(separator + 1),
+                                        std::move(args), type.arguments};
+        }
     }
     auto end=value?value->span.end:name.span.end;
     end_statement("binding");
     auto s=std::make_unique<Stmt>();s->span={start,end};
-    s->data=BindingStmt{std::move(type),name.text,std::move(value),reference,reference_initializer,is_const};
+    s->data=BindingStmt{std::move(type),name.text,std::move(value),reference,reference_initializer,is_const,
+                        literal_constant, false, {}, is_local};
     return s;
 }
 
@@ -969,7 +1487,15 @@ StmtPtr Parser::if_stmt() {
     std::function<StmtPtr(TokenKind)> parse_branch = [&](TokenKind keyword) -> StmtPtr {
         const auto start = consume(
             keyword, keyword == TokenKind::KwIf ? "Expected if." : "Expected elif.").span.start;
-        auto condition = expression();
+        // A statement header is an or_expr, so an if-expression there is
+        // written in parentheses.
+        auto condition = or_expr();
+        if (at(TokenKind::KwThen)) {
+            throw CompileError(Diagnostic{
+                "IF_EXPRESSION",
+                "An if statement has no 'then'; its body follows on indented lines.",
+                peek().span});
+        }
         end_statement("condition");
         auto then_body = block_until(false);
         std::vector<StmtPtr> else_body;
@@ -1008,15 +1534,252 @@ StmtPtr Parser::main_guard_stmt() {
     statement->data = MainGuardStmt{std::move(body), true, {}};
     return statement;
 }
+StmtPtr Parser::parallel_stmt() {
+    const auto start=consume(TokenKind::KwParallel,"Expected parallel.").span.start;
+    if(at(TokenKind::KwFor)) {
+        auto statement=for_stmt();
+        auto& loop=std::get<ForStmt>(statement->data);
+        loop.parallel=true;
+        if(loop.range && !loop.type && !loop.discards()) loop.declares=true;
+        loop.parallel_span={start,statement->span.start};
+        statement->span.start=start;
+        return statement;
+    }
+    end_statement("parallel block");
+    auto body=block_until(false);
+    auto statement=std::make_unique<Stmt>();
+    statement->span={start,previous().span.end};
+    statement->data=ParallelStmt{std::move(body)};
+    return statement;
+}
+
 StmtPtr Parser::while_stmt() {
-    auto start=consume(TokenKind::KwWhile,"Expected while.").span.start;auto cond=expression();end_statement("condition");auto body=block_until(false);auto s=std::make_unique<Stmt>();s->span={start,previous().span.end};s->data=WhileStmt{std::move(cond),std::move(body)};return s;
+    auto start=consume(TokenKind::KwWhile,"Expected while.").span.start;auto cond=or_expr();end_statement("condition");auto body=block_until(false);auto s=std::make_unique<Stmt>();s->span={start,previous().span.end};s->data=WhileStmt{std::move(cond),std::move(body)};return s;
 }
+bool Parser::at_collection_suffix() const {
+    if(!at(TokenKind::LBracket)) return false;
+    if(peek(1).kind==TokenKind::RBracket)
+        return peek(2).kind!=TokenKind::LParen;
+    auto cursor=current_+1;
+    if(!scan_type_lookahead(tokens_,cursor,0,max_parse_depth)) return false;
+    return cursor+2<tokens_.size() &&
+        tokens_[cursor].kind==TokenKind::Identifier &&
+        tokens_[cursor+1].kind==TokenKind::RBracket &&
+        (tokens_[cursor+2].kind==TokenKind::Newline || tokens_[cursor+2].kind==TokenKind::Comma);
+}
+
 StmtPtr Parser::for_stmt() {
-    auto start=consume(TokenKind::KwFor,"Expected for.").span.start;bool write=match(TokenKind::Ampersand);auto name=consume(TokenKind::Identifier,"Expected iteration name.");consume(TokenKind::KwIn,"Expected in.");auto value=expression();end_statement("iterable");auto body=block_until(false);auto s=std::make_unique<Stmt>();s->span={start,previous().span.end};s->data=ForStmt{name.text,write,std::move(value),std::move(body)};return s;
+    const auto start=consume(TokenKind::KwFor,"Expected for.").span.start;
+    const auto fail=[&](const char* code,const std::string& message) {
+        throw CompileError(Diagnostic{code,message,peek().span});
+    };
+    ForStmt node;
+    {
+        node.legacy=false;
+        auto cursor=current_;
+        const bool typed=scan_type_lookahead(tokens_,cursor,0,max_parse_depth) &&
+            ((cursor+1<tokens_.size() && tokens_[cursor].kind==TokenKind::Identifier &&
+              tokens_[cursor+1].kind==TokenKind::Assign) ||
+             (cursor+2<tokens_.size() && tokens_[cursor].kind==TokenKind::Ampersand &&
+              tokens_[cursor+1].kind==TokenKind::Identifier &&
+              tokens_[cursor+2].kind==TokenKind::Assign));
+        const bool existing=(at(TokenKind::Identifier) && peek(1).kind==TokenKind::Assign) ||
+            (at(TokenKind::Ampersand) && peek(1).kind==TokenKind::Identifier &&
+             peek(2).kind==TokenKind::Assign);
+        const bool pattern=!typed && pattern_followed_by_assignment();
+        if(typed || existing || pattern) {
+            node.declares=typed || pattern;
+            if(typed) {
+                auto type=type_name();
+                node.is_auto=type.name=="auto" && type.dimensions.empty();
+                if(!node.is_auto) node.type=std::move(type);
+            }
+            if(pattern){node.pattern=parse_pattern();bool declarations=false,places=false;visit_pattern(*node.pattern,[&](const Pattern& p){declarations|=p.kind==Pattern::Kind::Declare;places|=p.kind==Pattern::Kind::Place;node.writable|=p.reference;});if(declarations&&places)fail("TUPLE","A pattern cannot mix declarations and existing places.");node.declares=declarations;node.name="$for.pattern";}
+            else {node.writable=match(TokenKind::Ampersand);node.name=consume(TokenKind::Identifier,"Expected iteration name.").text;}
+            consume(TokenKind::Assign,"Expected '=' in collection loop.");
+            const bool address=match(TokenKind::Ampersand);
+            if(node.writable && node.name=="_")
+                fail("DISCARD","'_' binds nothing; write '_' without '&'.");
+            if(node.writable && !typed && !pattern)
+                fail("FOR_HEADER","There is no existing-variable reference form: declare 'for T &x = &values[]'.");
+            if(node.writable && !address)
+                fail("FOR_HEADER","A reference loop iterates storage: write '&values[]'.");
+            if(!node.writable && address)
+                fail("FOR_HEADER","A value loop takes element values: remove '&'.");
+            if(at(TokenKind::Dot))
+                fail("FOR_HEADER","A marked call is iterated in parentheses: write 'for auto x = (.gen.batch())[]'.");
+            {
+                FlagScope header(collection_header_source_,true);
+                node.iterable=postfix();
+            }
+            if(!at(TokenKind::LBracket)) {
+                if(const auto* index=std::get_if<IndexExpr>(&node.iterable->data);
+                   index && index->items.size()==1 && !index->items[0].slice) {
+                    const auto* name=std::get_if<NameExpr>(&index->items[0].index->data);
+                    if(name && name->name=="_")
+                        fail("DISCARD","Write 'values[]' when the index is not used.");
+                    fail("FOR_HEADER","Only a new nat index can be declared in '[]': write 'values[]' or 'values[nat i]'.");
+                }
+                fail("FOR_HEADER","A collection loop iterates elements: write 'values[]'.");
+            }
+            consume(TokenKind::LBracket,"Expected '['.");
+            if(!at(TokenKind::RBracket)) {
+                const auto type=type_name();
+                const auto index=consume(TokenKind::Identifier,"Expected a new nat index name.");
+                if(index.text=="_")
+                    fail("DISCARD","Write 'values[]' when the index is not used.");
+                if((type.name!="nat" && type.name!="auto") || !type.dimensions.empty())
+                    fail("FOR_HEADER","The index of a collection loop is nat: write '[nat i]' and convert in the body, e.g. int(i).");
+                node.index=ForIndexBinding{index.text,{type.span.start,index.span.end}};
+            }
+            consume(TokenKind::RBracket,"Expected ']' after collection suffix.");
+            if(at(TokenKind::LBracket))
+                fail("ELEMENT_ITERATION","One '[]' iterates one level; iterate 'row[]' in a nested for.");
+            while(match(TokenKind::Comma)) {
+                if(node.writable || node.pattern || node.index)
+                    fail("FOR_HEADER","Multiple collections use array value bindings without patterns or indices.");
+                ForCollectionBinding binding;
+                const auto binding_start=peek().span.start;
+                cursor=current_;
+                binding.declares=scan_type_lookahead(tokens_,cursor,0,max_parse_depth) &&
+                    cursor+1<tokens_.size() && tokens_[cursor].kind==TokenKind::Identifier &&
+                    tokens_[cursor+1].kind==TokenKind::Assign;
+                if(binding.declares) {
+                    auto type=type_name();
+                    binding.is_auto=type.name=="auto" && type.dimensions.empty();
+                    if(!binding.is_auto) binding.type=std::move(type);
+                }
+                if(at(TokenKind::Ampersand) || at(TokenKind::LParen))
+                    fail("FOR_HEADER","Multiple collections use array value bindings, not references or patterns.");
+                binding.name=consume(TokenKind::Identifier,"Expected an array value binding.").text;
+                if(!at(TokenKind::Assign)) fail("FOR_HEADER","Each collection binding requires '=' and an array followed by '[]'.");
+                consume(TokenKind::Assign,"Expected '='.");
+                if(at(TokenKind::Ampersand) || at(TokenKind::Dot))
+                    fail("FOR_HEADER","Multiple collections take array values; parenthesize a marked call.");
+                {
+                    FlagScope header(collection_header_source_,true);
+                    binding.iterable=postfix();
+                }
+                if(!at(TokenKind::LBracket) || peek(1).kind!=TokenKind::RBracket)
+                    fail("FOR_HEADER","Each collection source must be an array followed by empty '[]'.");
+                consume(TokenKind::LBracket,"Expected '['.");
+                consume(TokenKind::RBracket,"Expected ']'.");
+                if(at(TokenKind::LBracket))
+                    fail("ELEMENT_ITERATION","One '[]' iterates one level; iterate 'row[]' in a nested for.");
+                binding.span={binding_start,previous().span.end};
+                node.collections.push_back(std::move(binding));
+            }
+        } else {
+            const auto relation=[](TokenKind kind) {
+                return kind==TokenKind::Less || kind==TokenKind::LessEq ||
+                       kind==TokenKind::Greater || kind==TokenKind::GreaterEq;
+            };
+            const auto zero=[&](SourceSpan span) {
+                auto value=std::make_unique<Expr>();
+                value->span=span;
+                value->data=IntegerExpr{0,"0",true};
+                return value;
+            };
+            node.range.emplace();
+            auto& range=*node.range;
+            cursor=current_;
+            const bool typed_left=scan_type_lookahead(tokens_,cursor,0,max_parse_depth) &&
+                cursor+1<tokens_.size() && tokens_[cursor].kind==TokenKind::Identifier &&
+                (tokens_[cursor+1].kind==TokenKind::Less || tokens_[cursor+1].kind==TokenKind::LessEq);
+            if(typed_left) {
+                node.type=type_name();
+                if(node.type->name=="auto") {
+                    if(at(TokenKind::Identifier)&&peek().text=="_")
+                        fail("DISCARD","'_' takes no type; its type is inferred.");
+                    fail("FOR_HEADER","'auto' is allowed only in collection loops.");
+                }
+                const auto variable=consume(TokenKind::Identifier,"Expected iteration name.");
+                node.name=variable.text;
+                node.declares=true;
+                const auto op=peek().kind; ++current_;
+                node.iterable=zero(variable.span);
+                range.implicit_start_zero=true;
+                range.start_inclusive=true;
+                range.end_inclusive=op==TokenKind::LessEq;
+                range.end=bit_or_expr();
+            } else {
+                node.iterable=bit_or_expr();
+                if(!relation(peek().kind))
+                    fail("FOR_HEADER","Expected '<', '<=', '>' or '>=' after the start of a for range.");
+                const auto first=peek().kind; ++current_;
+                const auto right_start=current_;
+                range.start_inclusive=first==TokenKind::LessEq || first==TokenKind::GreaterEq;
+                range.descending=first==TokenKind::Greater || first==TokenKind::GreaterEq;
+                cursor=current_;
+                const bool typed_right=scan_type_lookahead(tokens_,cursor,0,max_parse_depth) &&
+                    cursor+1<tokens_.size() && tokens_[cursor].kind==TokenKind::Identifier &&
+                    (relation(tokens_[cursor+1].kind) ||
+                     (range.descending && (tokens_[cursor+1].kind==TokenKind::Newline ||
+                      (tokens_[cursor+1].kind==TokenKind::Identifier && tokens_[cursor+1].text=="step"))));
+                const bool full=typed_right?relation(tokens_[cursor+1].kind):
+                    at(TokenKind::Identifier) && relation(peek(1).kind);
+                if(full || range.descending) {
+                    node.declares=typed_right;
+                    if(typed_right) {
+                        node.type=type_name();
+                        if(node.type->name=="auto")
+                            fail("FOR_HEADER","'auto' is allowed only in collection loops.");
+                    }
+                    if(!at(TokenKind::Identifier))
+                        fail("FOR_HEADER","A for range needs a variable and an upper bound.");
+                    const auto variable=consume(TokenKind::Identifier,"Expected loop variable.");
+                    node.name=variable.text;
+                    if(full) {
+                        const auto second=peek().kind; ++current_;
+                        if(range.descending!=(second==TokenKind::Greater || second==TokenKind::GreaterEq))
+                            fail("FOR_HEADER","A for range keeps one direction: '<' and '<=' (ascending), or '>' and '>=' (descending).");
+                        range.end_inclusive=second==TokenKind::LessEq || second==TokenKind::GreaterEq;
+                        range.end=bit_or_expr();
+                    } else {
+                        // The omitted lower end is inclusive zero. This has
+                        // exactly the semantics of START > [T] x >= 0.
+                        range.end_inclusive=true;
+                        range.end=zero(variable.span);
+                        range.implicit_end_zero=true;
+                    }
+                } else {
+                    const auto* variable=std::get_if<NameExpr>(&node.iterable->data);
+                    if(!variable || variable->this_qualifier)
+                        fail("FOR_HEADER","A for range needs a variable and an upper bound.");
+                    node.name=variable->name;
+                    node.declares=false;
+                    const auto span=node.iterable->span;
+                    current_=right_start;
+                    range.end=bit_or_expr();
+                    range.end_inclusive=first==TokenKind::LessEq;
+                    range.start_inclusive=true;
+                    node.iterable=zero(span);
+                    range.implicit_start_zero=true;
+                }
+            }
+            if(at(TokenKind::Identifier) && peek().text=="step") {
+                ++current_; range.step=bit_or_expr();
+            }
+        }
+    }
+    if(at(TokenKind::Comma)) fail("FOR_HEADER","Multiple collections cannot be mixed with a range header.");
+    end_statement("for header");
+    node.body=block_until(false);
+    auto statement=std::make_unique<Stmt>();
+    statement->span={start,previous().span.end};
+    statement->data=std::move(node);
+    return statement;
 }
+
 StmtPtr Parser::match_stmt() {
-    auto start=consume(TokenKind::KwMatch,"Expected match.").span.start;auto value=expression();end_statement("match value");consume(TokenKind::Indent,"Expected indented typed cases.");std::vector<MatchCase> cases;
+    auto start=consume(TokenKind::KwMatch,"Expected match.").span.start;auto value=or_expr();end_statement("match value");consume(TokenKind::Indent,"Expected indented typed cases.");std::vector<MatchCase> cases;
     while(!at(TokenKind::Dedent)&&!at(TokenKind::Eof)) {
+        if(at(TokenKind::LParen)) {
+            auto scan=current_;const bool type_scan=scan_type_lookahead(tokens_,scan,1,max_parse_depth);auto group=current_;unsigned depth=0;for(;group<tokens_.size();++group){if(tokens_[group].kind==TokenKind::LParen)++depth;else if(tokens_[group].kind==TokenKind::RParen && --depth==0){++group;break;}}
+            const auto follower=group<tokens_.size()?tokens_[group].kind:TokenKind::Eof;
+            const bool type_case=type_scan && (follower==TokenKind::Identifier || follower==TokenKind::LBracket || follower==TokenKind::Pipe || follower==TokenKind::Newline);
+            if(!type_case){auto pattern=parse_pattern(true);visit_pattern(pattern,[&](const Pattern& p){if(p.reference)throw CompileError(Diagnostic{"MATCH_CASE","Reference patterns are not used in match cases; bind the element by value.",p.span});if(p.kind==Pattern::Kind::Place)throw CompileError(Diagnostic{"MATCH_CASE","A match element is a type, a new binding, '_' or a nested pattern.",p.span});});if(at(TokenKind::Identifier))throw CompileError(Diagnostic{"MATCH_CASE","A tuple pattern binds its elements; to bind the whole tuple, write its type and a name, e.g. '(int, real64) p'.",peek().span});if(!at(TokenKind::Newline))throw CompileError(Diagnostic{"MATCH_CASE","A tuple pattern takes no suffix after ')'.",peek().span});auto span=pattern.span;end_statement("match case");auto body=block_until(false);MatchCase c;c.span=span;c.body=std::move(body);c.pattern=std::move(pattern);cases.push_back(std::move(c));continue;}
+        }
         auto type=type_name();auto span=type.span;std::string tag;std::optional<std::string> binder;
         if(match(TokenKind::LParen)){
             tag=type.name;
@@ -1025,21 +1788,31 @@ StmtPtr Parser::match_stmt() {
             consume(TokenKind::RParen,"Expected ')' after enum payload binder.");span.end=previous().span.end;
         }else if(at(TokenKind::Identifier)){auto n=consume(TokenKind::Identifier,"Expected binder.");binder=n.text;span.end=n.span.end;}
         end_statement("match case");auto body=block_until(false);
-        cases.push_back(MatchCase{std::move(type),std::move(tag),std::move(binder),std::move(body),span});
+        cases.push_back(MatchCase{std::move(type),std::move(tag),std::move(binder),std::move(body),span,{}});
     }
     consume(TokenKind::Dedent,"Expected end of match.");auto result=std::make_unique<Stmt>();result->span={start,previous().span.end};result->data=MatchStmt{std::move(value),std::move(cases)};return result;
 }
 
 StmtPtr Parser::rebind_stmt() {
     const auto start=consume(TokenKind::Ampersand,"Expected '&'.").span.start;
-    const auto name=consume(TokenKind::Identifier,"Expected reference binding name after '&'.");
+    const bool field_binding = at(TokenKind::KwThis);
+    const auto name=consume(field_binding ? TokenKind::KwThis : TokenKind::Identifier,
+                            "Expected reference binding name after '&'.");
+    ExprPtr place;
+    if (field_binding) {
+        consume(TokenKind::Dot,"Expected '.' after 'this'.");
+        const auto field=consume(TokenKind::Identifier,"Expected reference field name after 'this.'.");
+        place=std::make_unique<Expr>();
+        place->span={name.span.start,field.span.end};
+        place->data=NameExpr{field.text,name.span};
+    }
     consume(TokenKind::Assign,"Expected '=' in address assignment.");
     consume(TokenKind::Ampersand,"Address assignment requires '&' on the right-hand side.");
     auto target=expression();
     const auto end=target->span.end;
     end_statement("address assignment");
     auto stmt=std::make_unique<Stmt>();stmt->span={start,end};
-    stmt->data=RebindStmt{name.text,std::move(target)};
+    stmt->data=RebindStmt{name.text,std::move(target),std::move(place)};
     return stmt;
 }
 
@@ -1061,7 +1834,7 @@ StmtPtr Parser::expr_or_assign_stmt() {
         const auto end = value->span.end;
         end_statement(compound_op.empty() ? "assignment" : "compound assignment");
         auto stmt = std::make_unique<Stmt>(); stmt->span = SourceSpan{start, end};
-        stmt->data = AssignStmt{std::move(left), std::move(value), std::move(compound_op)}; return stmt;
+        stmt->data = AssignStmt{std::move(left), std::move(value), std::move(compound_op), {}, nullptr}; return stmt;
     }
     const auto span = left->span;
     end_statement("expression");
@@ -1069,6 +1842,8 @@ StmtPtr Parser::expr_or_assign_stmt() {
 }
 
 std::vector<CallArg> Parser::call_arguments(bool address_values) {
+    FlagScope header_stop(collection_header_source_, false);
+    FlagScope marker_stop(slice_start_marker_stop_, false);
     consume(TokenKind::LParen,"Expected '('.");
     std::vector<CallArg> args;
     if (!at(TokenKind::RParen)) {
@@ -1109,6 +1884,68 @@ std::vector<CallArg> Parser::call_arguments(bool address_values) {
 
 ExprPtr Parser::expression() {
     ParseDepthGuard depth(expression_depth_, max_parse_depth, peek(), "Expression");
+    if (at(TokenKind::KwIf)) return if_expression();
+    return or_expr();
+}
+
+// An IF_EXPRESSION error that does not stop the parse: the if-expression is
+// read on, so the diagnostics after it stay meaningful.
+void Parser::report_if_expression(const Token& token, std::string message) {
+    record(CompileError(Diagnostic{"IF_EXPRESSION", std::move(message), token.span}));
+}
+
+// if_expr = "if", or_expr, "then", or_expr,
+//           { "elif", or_expr, "then", or_expr }, "else", or_expr
+ExprPtr Parser::if_expression() {
+    ParseDepthGuard depth(expression_depth_, max_parse_depth, peek(), "Expression");
+    const auto start = consume(TokenKind::KwIf, "Expected if.").span.start;
+    IfExpr node;
+    for (;;) {
+        // A condition or a then-branch ends at 'then', 'elif' or 'else',
+        // never at a slice colon, so no slice marker belongs to it; the final
+        // else branch keeps the item's marker rule.
+        {
+            FlagScope header_stop(collection_header_source_, false);
+    FlagScope marker_stop(slice_start_marker_stop_, false);
+            node.conditions.push_back(if_expression_part());
+        }
+        if (!match(TokenKind::KwThen)) {
+            throw CompileError(Diagnostic{
+                "IF_EXPRESSION", "An if-expression continues with 'then' after its condition.",
+                peek().span});
+        }
+        {
+            FlagScope header_stop(collection_header_source_, false);
+    FlagScope marker_stop(slice_start_marker_stop_, false);
+            node.values.push_back(if_expression_part());
+        }
+        if (match(TokenKind::KwElif)) continue;
+        if (at(TokenKind::KwElse) && peek(1).kind == TokenKind::KwIf) {
+            report_if_expression(peek(1), "'else if' is not used in an if-expression; write 'elif'.");
+            current_ += 2;
+            continue;
+        }
+        break;
+    }
+    if (!match(TokenKind::KwElse)) {
+        throw CompileError(Diagnostic{
+            "IF_EXPRESSION", "An if-expression needs 'else': every path must give a value.",
+            peek().span});
+    }
+    node.otherwise = if_expression_part();
+    auto result = std::make_unique<Expr>();
+    result->span = SourceSpan{start, node.otherwise->span.end};
+    result->data = std::move(node);
+    return result;
+}
+
+// A condition or a branch of an if-expression: an or_expr, so an
+// if-expression nested there is written in parentheses.
+ExprPtr Parser::if_expression_part() {
+    if (at(TokenKind::KwIf)) {
+        report_if_expression(peek(), "A nested if-expression must be parenthesized.");
+        return if_expression();
+    }
     return or_expr();
 }
 
@@ -1117,6 +1954,7 @@ ExprPtr Parser::inline_expression() {
     auto result = expression();
     consume_newlines();
     if (!at(TokenKind::Eof)) error(peek(), "Unexpected token inside string interpolation.");
+    if (!diagnostics_.empty()) throw CompileErrors(std::move(diagnostics_));
     return result;
 }
 
@@ -1190,25 +2028,30 @@ ExprPtr Parser::string_expression(const Token& token) {
             if (i + 1 < token.text.size() && token.text[i + 1] == '{') { literal.push_back('{'); i += 2; continue; }
             literals.push_back(std::move(literal)); literal.clear();
             const auto expression_start = i + 1;
-            std::size_t j = expression_start; int paren = 0, bracket = 0; bool in_string = false;
+            // Braces nest too: a braced type argument
+            // ("{first<tensor<real32>{2, 3}>(xs)}") is part of the expression.
+            std::size_t j = expression_start; int paren = 0, bracket = 0, brace = 0; bool in_string = false;
             for (; j < token.text.size(); ++j) {
                 const char c = token.text[j];
                 if (in_string) { if (c=='"') in_string=false; continue; }
                 if (c=='"') { in_string=true; continue; }
                 if (c=='(') ++paren; else if (c==')') --paren; else if (c=='[') ++bracket; else if (c==']') --bracket;
+                else if (c=='{') ++brace;
+                else if (c=='}' && brace > 0) --brace;
                 else if (c=='}' && paren==0 && bracket==0) break;
             }
             if (j >= token.text.size()) error(token, "Unclosed '{' in string interpolation.");
 
             const auto inner = std::string_view(token.text).substr(expression_start, j-expression_start);
             std::size_t colon = std::string_view::npos;
-            paren = 0; bracket = 0; in_string = false;
+            paren = 0; bracket = 0; brace = 0; in_string = false;
             for (std::size_t k = 0; k < inner.size(); ++k) {
                 const char c = inner[k];
                 if (in_string) { if (c=='"') in_string=false; continue; }
                 if (c=='"') { in_string=true; continue; }
                 if (c=='(') ++paren; else if (c==')') --paren; else if (c=='[') ++bracket; else if (c==']') --bracket;
-                else if (c==':' && paren==0 && bracket==0) { colon = k; break; }
+                else if (c=='{') ++brace; else if (c=='}') --brace;
+                else if (c==':' && paren==0 && bracket==0 && brace==0) { colon = k; break; }
             }
             auto expression_text = colon == std::string_view::npos ? inner : inner.substr(0, colon);
             if (trim(expression_text).empty()) error(token, "String interpolation cannot be empty.");
@@ -1265,12 +2108,112 @@ ExprPtr Parser::string_expression(const Token& token) {
 
 ExprPtr Parser::make_binary(ExprPtr left, const Token& op, ExprPtr right) {
     auto expr = std::make_unique<Expr>(); expr->span = SourceSpan{left->span.start, right->span.end};
-    expr->data = BinaryExpr{op.text, std::move(left), std::move(right)}; return expr;
+    expr->data = BinaryExpr{op.text, std::move(left), std::move(right), op.span}; return expr;
 }
 ExprPtr Parser::or_expr() { auto e=and_expr(); while(match(TokenKind::KwOr)){auto op=previous(); e=make_binary(std::move(e),op,and_expr());} return e; }
 ExprPtr Parser::and_expr() { auto e=equality(); while(match(TokenKind::KwAnd)){auto op=previous(); e=make_binary(std::move(e),op,equality());} return e; }
-ExprPtr Parser::equality() { auto e=comparison(); while(match(TokenKind::EqEq)||match(TokenKind::NotEq)){auto op=previous(); e=make_binary(std::move(e),op,comparison());} return e; }
-ExprPtr Parser::comparison() { auto e=bit_or_expr(); while(match(TokenKind::Less)||match(TokenKind::LessEq)||match(TokenKind::Greater)||match(TokenKind::GreaterEq)){auto op=previous(); e=make_binary(std::move(e),op,bit_or_expr());} return e; }
+// The equality level (L14). One '==' or '!=' between operands that are not
+// relational comparisons gives a BinaryExpr, as before. Two or more, or one
+// next to an unparenthesized relational comparison, give one
+// ComparisonChainExpr whose operators come from both levels, so that
+// `a == b == c` is a chain and the checker sees and rejects `a < b == c`
+// and every '!=' chain instead of reading them by precedence.
+ExprPtr Parser::equality() {
+    auto first = comparison();
+    if (!at(TokenKind::EqEq) && !at(TokenKind::NotEq)) return first;
+    struct Item {
+        ExprPtr expression;
+        bool relational{};
+        std::vector<SourceSpan> op_spans;
+    };
+    std::vector<Item> items;
+    items.push_back(Item{std::move(first), comparison_relational_, comparison_op_spans_});
+    std::vector<Token> operators;
+    while (match(TokenKind::EqEq) || match(TokenKind::NotEq)) {
+        operators.push_back(previous());
+        auto operand = comparison();
+        items.push_back(Item{std::move(operand), comparison_relational_, comparison_op_spans_});
+    }
+    comparison_relational_ = false;
+    comparison_op_spans_.clear();
+    const bool relational = std::any_of(items.begin(), items.end(),
+                                        [](const Item& item) { return item.relational; });
+    if (operators.size() == 1 && !relational)
+        return make_binary(std::move(items[0].expression), operators[0],
+                           std::move(items[1].expression));
+    ComparisonChainExpr chain;
+    for (std::size_t i = 0; i < items.size(); ++i) {
+        if (i) {
+            chain.ops.push_back(operators[i - 1].text);
+            chain.op_spans.push_back(operators[i - 1].span);
+        }
+        auto& item = items[i];
+        if (!item.relational) {
+            chain.operands.push_back(std::move(item.expression));
+        } else if (auto* binary = std::get_if<BinaryExpr>(&item.expression->data)) {
+            chain.operands.push_back(std::move(binary->left));
+            chain.ops.push_back(binary->op);
+            chain.op_spans.push_back(item.op_spans.empty() ? binary->op_span : item.op_spans[0]);
+            chain.operands.push_back(std::move(binary->right));
+        } else if (auto* inner = std::get_if<ComparisonChainExpr>(&item.expression->data)) {
+            for (auto& operand : inner->operands) chain.operands.push_back(std::move(operand));
+            for (auto& op : inner->ops) chain.ops.push_back(std::move(op));
+            for (const auto& span : inner->op_spans) chain.op_spans.push_back(span);
+        } else {
+            chain.operands.push_back(std::move(item.expression));
+        }
+    }
+    auto e = std::make_unique<Expr>();
+    e->span = SourceSpan{chain.operands.front()->span.start, chain.operands.back()->span.end};
+    e->data = std::move(chain);
+    return e;
+}
+// A '<' or '>' whose end touches the ':' that follows it.
+bool Parser::at_marker_touching_colon() const {
+    return (at(TokenKind::Less) || at(TokenKind::Greater)) &&
+           peek(1).kind == TokenKind::Colon &&
+           peek().span.end.offset == peek(1).span.start.offset;
+}
+
+// The relational level (L14). One operator gives a BinaryExpr, as before;
+// two or more give a ComparisonChainExpr over the operands in order. The
+// direction rule is the checker's, so inspect still sees the node.
+ExprPtr Parser::comparison() {
+    auto e = bit_or_expr();
+    std::vector<ExprPtr> operands;
+    std::vector<Token> operators;
+    for (;;) {
+        if (slice_start_marker_stop_ && (at(TokenKind::Less) || at(TokenKind::Greater)) &&
+            peek(1).kind == TokenKind::Colon) {
+            // A slice marker of the item being parsed: the item parser
+            // takes it with its colon. Separated from the colon, it cannot
+            // be a comparison either (':' starts no operand).
+            if (at_marker_touching_colon()) break;
+            error(peek(), slice_marker_spacing_message);
+        }
+        if (!(match(TokenKind::Less) || match(TokenKind::LessEq) ||
+              match(TokenKind::Greater) || match(TokenKind::GreaterEq))) break;
+        operators.push_back(previous());
+        if (operands.empty()) operands.push_back(std::move(e));
+        operands.push_back(bit_or_expr());
+    }
+    comparison_relational_ = !operators.empty();
+    comparison_op_spans_.clear();
+    for (const auto& op : operators) comparison_op_spans_.push_back(op.span);
+    if (operators.empty()) return e;
+    if (operators.size() == 1)
+        return make_binary(std::move(operands[0]), operators[0], std::move(operands[1]));
+    ComparisonChainExpr chain;
+    for (const auto& op : operators) {
+        chain.ops.push_back(op.text);
+        chain.op_spans.push_back(op.span);
+    }
+    chain.operands = std::move(operands);
+    auto chained = std::make_unique<Expr>();
+    chained->span = SourceSpan{chain.operands.front()->span.start, chain.operands.back()->span.end};
+    chained->data = std::move(chain);
+    return chained;
+}
 ExprPtr Parser::bit_or_expr() { auto e=bit_xor_expr(); while(match(TokenKind::KwBitOr)){auto op=previous(); e=make_binary(std::move(e),op,bit_xor_expr());} return e; }
 ExprPtr Parser::bit_xor_expr() { auto e=bit_and_expr(); while(match(TokenKind::KwBitXor)){auto op=previous(); e=make_binary(std::move(e),op,bit_and_expr());} return e; }
 ExprPtr Parser::bit_and_expr() { auto e=shift_expr(); while(match(TokenKind::KwBitAnd)){auto op=previous(); e=make_binary(std::move(e),op,shift_expr());} return e; }
@@ -1320,7 +2263,7 @@ ExprPtr Parser::unary() {
 }
 
 ExprPtr Parser::power() {
-    auto e = postfix();
+    auto e = at(TokenKind::Dot) ? marked_call() : postfix();
     if (match(TokenKind::Caret)) {
         const auto op = previous();
         e = make_binary(std::move(e), op, unary());
@@ -1328,13 +2271,35 @@ ExprPtr Parser::power() {
     return e;
 }
 
+// `.f()`, `.obj.f()`, `.mod.T(...)`: the mutation marker before a postfix
+// chain (L1). A '.' where an operand starts is a marker, never a member
+// access, which always follows a complete operand. The chain must end in a
+// call; the marker is recorded on that outermost call and covers the calls
+// of the chain, not the calls nested in its arguments. A marked call is not
+// a postfix, so it takes no further suffix.
+ExprPtr Parser::marked_call() {
+    const auto marker = consume(TokenKind::Dot, "Expected '.'.");
+    auto e = postfix();
+    if (auto* call = std::get_if<CallExpr>(&e->data)) {
+        call->mutation_marker = true;
+    } else if (auto* method = std::get_if<MethodCallExpr>(&e->data)) {
+        method->mutation_marker = true;
+    } else {
+        error(marker, "'.' marks a call.");
+    }
+    mutation_markers_.push_back(marker.span.start.offset);
+    e->span.start = marker.span.start;
+    return e;
+}
+
 ExprPtr Parser::postfix() {
     auto e = primary();
     for (;;) {
+        if(collection_header_source_ && at_collection_suffix()) break;
         if (at(TokenKind::LBracket) && peek(1).kind == TokenKind::RBracket &&
             peek(2).kind == TokenKind::LParen) {
             auto* name = std::get_if<NameExpr>(&e->data);
-            if (name) {
+            if (name && !name->this_qualifier) {
                 const auto start = e->span.start;
                 consume(TokenKind::LBracket, "Expected '['.");
                 consume(TokenKind::RBracket, "Expected ']'.");
@@ -1381,6 +2346,7 @@ ExprPtr Parser::postfix() {
 
         if (match(TokenKind::Dot)) {
             const auto start = e->span.start;
+            if (at(TokenKind::Integer)) throw CompileError(Diagnostic{"TUPLE", "Tuples have no positional access; destructure the tuple instead.", peek().span});
             const auto member = consume(TokenKind::Identifier, "Expected member name after '.'.");
 
             std::vector<TypeName> type_arguments;
@@ -1407,42 +2373,16 @@ ExprPtr Parser::postfix() {
 
         if (match(TokenKind::LBracket)) {
             const auto start = e->span.start;
-            if (at(TokenKind::RBracket)) error(peek(), "Index list cannot be empty.");
+            if (at(TokenKind::RBracket))
+                throw CompileError(Diagnostic{"ELEMENT_ITERATION","'[]' element iteration is only valid in a for header.",peek().span});
+            auto cursor=current_;
+            if(scan_type_lookahead(tokens_,cursor,0,max_parse_depth) &&
+               cursor+1<tokens_.size() && tokens_[cursor].kind==TokenKind::Identifier &&
+               tokens_[cursor+1].kind==TokenKind::RBracket)
+                throw CompileError(Diagnostic{"ELEMENT_ITERATION","'[nat i]' binds an index only in a for header.",peek().span});
             std::vector<IndexPart> items;
             for (;;) {
-                IndexPart item;
-                const auto item_start = peek().span.start;
-                if (match(TokenKind::Colon)) {
-                    item.slice = true;
-                    if (!at(TokenKind::Colon) && !at(TokenKind::Comma) &&
-                        !at(TokenKind::RBracket)) {
-                        item.stop = expression();
-                    }
-                    if (match(TokenKind::Colon)) {
-                        if (!at(TokenKind::Comma) && !at(TokenKind::RBracket)) {
-                            item.step = expression();
-                        }
-                    }
-                } else {
-                    auto first = expression();
-                    if (match(TokenKind::Colon)) {
-                        item.slice = true;
-                        item.start = std::move(first);
-                        if (!at(TokenKind::Colon) && !at(TokenKind::Comma) &&
-                            !at(TokenKind::RBracket)) {
-                            item.stop = expression();
-                        }
-                        if (match(TokenKind::Colon)) {
-                            if (!at(TokenKind::Comma) && !at(TokenKind::RBracket)) {
-                                item.step = expression();
-                            }
-                        }
-                    } else {
-                        item.index = std::move(first);
-                    }
-                }
-                item.span = SourceSpan{item_start, previous().span.end};
-                items.push_back(std::move(item));
+                items.push_back(index_item());
                 if (!match(TokenKind::Comma)) break;
                 if (at(TokenKind::RBracket)) {
                     error(peek(), "Trailing comma is not allowed in an index list.");
@@ -1461,6 +2401,139 @@ ExprPtr Parser::postfix() {
     return e;
 }
 
+// One item of an index list: an index, or a slice
+// `[start][marker]:[marker][end][:step]`. A marker is a '<' or '>'
+// that touches the first colon; it makes its side exclusive and gives the
+// direction ('<' ascending, '>' descending).
+IndexPart Parser::index_item() {
+    IndexPart item;
+    const auto item_start = peek().span.start;
+    if (at_marker_touching_colon()) {
+        error(peek(), "An exclusive start needs a start value: write 's<:' or 's>:'.");
+    }
+    // After the first colon: an end marker touches it, and a marker on the
+    // second colon is an error.
+    const auto slice_tail = [&]() {
+        item.slice = true;
+        const auto& colon = previous();
+        if (at(TokenKind::Less) || at(TokenKind::Greater)) {
+            if (colon.span.end.offset != peek().span.start.offset)
+                error(peek(), slice_marker_spacing_message);
+            item.end_form = at(TokenKind::Less) ? SliceEnd::exclusive_ascending
+                                                : SliceEnd::exclusive_descending;
+            ++current_;
+            if (at(TokenKind::Colon) || at(TokenKind::Comma) || at(TokenKind::RBracket) ||
+                at(TokenKind::Eof) || at(TokenKind::Newline)) {
+                error(peek(), "An exclusive end needs an end value: write ':<e' or ':>e'.");
+            }
+        }
+        if (!at(TokenKind::Colon) && !at(TokenKind::Comma) && !at(TokenKind::RBracket)) {
+            FlagScope marker_stop(slice_start_marker_stop_, true);
+            item.stop = expression();
+            if (item.end_form == SliceEnd::omitted) item.end_form = SliceEnd::inclusive;
+            if (at_marker_touching_colon())
+                error(peek(), "Slice markers belong to the first colon.");
+        }
+        if (match(TokenKind::Colon)) {
+            if ((at(TokenKind::Less) || at(TokenKind::Greater)) &&
+                previous().span.end.offset == peek().span.start.offset) {
+                error(peek(), "Slice markers belong to the first colon.");
+            }
+            if (!at(TokenKind::Comma) && !at(TokenKind::RBracket)) {
+                item.step = expression();
+            }
+        }
+    };
+    if (match(TokenKind::Colon)) {
+        slice_tail();
+    } else {
+        ExprPtr first;
+        {
+            FlagScope marker_stop(slice_start_marker_stop_, true);
+            first = expression();
+        }
+        // comparison() left a marker that touches the colon unconsumed.
+        std::optional<SliceStart> marked;
+        if (at_marker_touching_colon()) {
+            marked = at(TokenKind::Less) ? SliceStart::exclusive_ascending
+                                         : SliceStart::exclusive_descending;
+            ++current_;
+        }
+        if (match(TokenKind::Colon)) {
+            item.start = std::move(first);
+            item.start_form = marked.value_or(SliceStart::inclusive);
+            slice_tail();
+        } else {
+            item.index = std::move(first);
+        }
+    }
+    item.span = SourceSpan{item_start, previous().span.end};
+    return item;
+}
+
+// `this.NAME`: a field of the receiver. `this` is only a field qualifier,
+// so every other use of it, and a call through it, is rejected here. The
+// expression's span is the field name's, so every location recorded for the
+// field is the same as for a bare name.
+ExprPtr Parser::this_field() {
+    const auto qualifier = consume(TokenKind::KwThis, "Expected this.");
+    if (!at(TokenKind::Dot) || peek(1).kind != TokenKind::Identifier) {
+        throw CompileError(Diagnostic{
+            "THIS_QUALIFIER", "'this' only qualifies a field: write 'this.<field>'.", qualifier.span});
+    }
+    const auto dot = consume(TokenKind::Dot, "Expected '.' after this.");
+    const auto name = consume(TokenKind::Identifier, "Expected a field name after 'this.'.");
+    if (at(TokenKind::LParen) || looks_like_type_argument_call()) {
+        throw CompileError(Diagnostic{
+            "THIS_QUALIFIER",
+            "Methods are called without 'this.': write '" + name.text +
+                "(...)'; a function value held in a field is copied into a local first.",
+            SourceSpan{qualifier.span.start, name.span.end}});
+    }
+    auto e = std::make_unique<Expr>();
+    e->span = name.span;
+    e->data = NameExpr{name.text, SourceSpan{qualifier.span.start, dot.span.end}};
+    return e;
+}
+
+ExprPtr Parser::array_comprehension(SourcePos start) {
+    const auto fail = [&](const std::string& message) {
+        throw CompileError(Diagnostic{"ARRAY_COMPREHENSION", message, peek().span});
+    };
+    consume(TokenKind::KwFor, "Expected for.");
+    auto cursor = current_;
+    if (!scan_type_lookahead(tokens_, cursor, 0, max_parse_depth) ||
+        cursor + 1 >= tokens_.size() || tokens_[cursor].kind != TokenKind::Identifier ||
+        tokens_[cursor + 1].kind != TokenKind::Assign)
+        fail("A generation expression declares one value binding: '[for auto x = values[] then x]'.");
+    ArrayComprehensionExpr node;
+    auto type = type_name();
+    const auto name = consume(TokenKind::Identifier, "Expected generation binding name.");
+    node.name = name.text;
+    node.binding_span = {type.span.start, name.span.end};
+    if (type.name != "auto" || !type.dimensions.empty()) node.type = std::move(type);
+    if (node.name == "_") fail("A generation expression binds an element name.");
+    consume(TokenKind::Assign, "Expected '=' before the generation source.");
+    if (at(TokenKind::Ampersand)) fail("A generation expression takes values, not a reference source.");
+    {
+        FlagScope header(collection_header_source_, true);
+        node.source = postfix();
+    }
+    if (!match(TokenKind::LBracket) || !match(TokenKind::RBracket))
+        fail("A generation expression has one Array source ending in '[]'.");
+    if (at(TokenKind::LBracket) || at(TokenKind::Comma) || at(TokenKind::KwFor))
+        fail("A generation expression has exactly one source.");
+    if (match(TokenKind::KwIf)) node.condition = expression();
+    if (!match(TokenKind::KwThen)) fail("A generation expression requires 'then' and one value expression.");
+    node.value = expression();
+    if (!at(TokenKind::RBracket)) fail("A generation expression ends after its one value expression.");
+    const auto end = consume(TokenKind::RBracket, "Expected ']' after generation expression.").span.end;
+    auto result = std::make_unique<Expr>();
+    result->span = {start, end};
+    result->data = std::move(node);
+    return result;
+}
+
 ExprPtr Parser::primary() {
     if (match(TokenKind::Integer)) {
         const auto t=previous(); std::uint64_t value{}; const auto* b=t.text.data(); const auto* end=b+t.text.size();
@@ -1471,20 +2544,52 @@ ExprPtr Parser::primary() {
         auto e=std::make_unique<Expr>(); e->span=t.span;
         e->data=IntegerExpr{fits?value:0,t.text,fits}; return e;
     }
-    if (match(TokenKind::Float)) {
+    if (match(TokenKind::RealLiteral)) {
         const auto t=previous(); char* end=nullptr; const auto value=std::strtod(t.text.c_str(),&end);
         if (!end || *end!='\0') error(t,"Invalid real literal.");
-        auto e=std::make_unique<Expr>(); e->span=t.span; e->data=FloatExpr{value,t.text}; return e;
+        auto e=std::make_unique<Expr>(); e->span=t.span; e->data=RealLiteralExpr{value,t.text}; return e;
+    }
+    if (match(TokenKind::ImaginaryLiteral)) {
+        const auto t=previous(); auto magnitude=t.text.substr(0,t.text.size()-1);
+        const bool integer_form=magnitude.find('.')==std::string::npos;
+        auto e=std::make_unique<Expr>(); e->span=t.span;
+        e->data=ImaginaryLiteralExpr{std::move(magnitude),integer_form}; return e;
     }
     if (match(TokenKind::String)) { const auto t=previous(); return string_expression(t); }
     if (match(TokenKind::KwTrue)||match(TokenKind::KwFalse)) { const auto t=previous(); auto e=std::make_unique<Expr>(); e->span=t.span; e->data=BoolExpr{t.kind==TokenKind::KwTrue}; return e; }
     if (match(TokenKind::LBracket)) {
-        const auto start=previous().span.start; std::vector<ExprPtr> elements;
+        FlagScope header_stop(collection_header_source_, false);
+    FlagScope marker_stop(slice_start_marker_stop_, false);
+        const auto start=previous().span.start;
+        if (at(TokenKind::KwFor)) return array_comprehension(start);
+        std::vector<ExprPtr> elements;
         if (!at(TokenKind::RBracket)) { do { elements.push_back(expression()); } while(match(TokenKind::Comma) && !at(TokenKind::RBracket)); }
         const auto end=consume(TokenKind::RBracket,"Expected ']' after array literal.").span.end;
         auto e=std::make_unique<Expr>(); e->span=SourceSpan{start,end}; e->data=ArrayExpr{std::move(elements)}; return e;
     }
-    if (match(TokenKind::LParen)) { const auto start=previous().span.start; auto e=expression(); const auto end=consume(TokenKind::RParen,"Expected ')' after expression.").span.end; e->span=SourceSpan{start,end}; return e; }
+    if (match(TokenKind::LParen)) { FlagScope header_stop(collection_header_source_, false);
+    FlagScope marker_stop(slice_start_marker_stop_, false); const auto start=previous().span.start;
+        if(at(TokenKind::RParen)) throw CompileError(Diagnostic{"TUPLE","A tuple has at least two elements.",peek().span});
+        auto e=expression();
+        if(match(TokenKind::Comma)) {
+            std::vector<ExprPtr> elements;elements.push_back(std::move(e));
+            do {
+                if(at(TokenKind::RParen)) throw CompileError(Diagnostic{"TUPLE","Trailing comma is not allowed in a tuple.",peek().span});
+                elements.push_back(expression());
+            } while(match(TokenKind::Comma));
+            e=std::make_unique<Expr>();e->data=TupleExpr{std::move(elements)};
+        }
+        const auto end=consume(TokenKind::RParen,"Expected ')' after expression.").span.end;
+        e->span=SourceSpan{start,end};return e;
+    }
+    if (at(TokenKind::KwThis)) return this_field();
+    if (at(TokenKind::LBrace) || at(TokenKind::RBrace)) error(peek(), braces_outside_shape_message);
+    if (at(TokenKind::KwIf)) {
+        report_if_expression(
+            peek(),
+            "An if-expression used as an operand must be parenthesized: write '(if ... then ... else ...)'.");
+        return if_expression();
+    }
     if (match(TokenKind::Identifier)) {
         const auto t=previous(); auto e=std::make_unique<Expr>(); e->span=t.span;
         if (t.text=="void") e->data=VoidExpr{};

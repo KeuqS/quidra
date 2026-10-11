@@ -3,6 +3,10 @@
 #define NOMINMAX
 #endif
 #endif
+#include "runtime_internal.hpp"
+#include "quidra/abi/layout.hpp"
+#include "quidra/abi/runtime_entry_points.hpp"
+
 #include <algorithm>
 #include <curl/curl.h>
 #include <cstdint>
@@ -16,10 +20,8 @@
 
 #include "quidra/project.hpp"
 
-extern "C" void* quidra_managed_alloc(unsigned long long bytes);
-extern "C" void quidra_managed_release(void* value, void* drop_function);
-extern "C" char* quidra_runtime_copy_text(
-    const char* data, unsigned long long size);
+// The ABI this runtime shares with generated code (include/quidra/abi).
+namespace abi = quidra::abi;
 
 namespace {
 char* http_copy_string(const std::string& value) {
@@ -117,12 +119,12 @@ void http_set_error(const std::string& message) {
 
 void* http_make_bytes(const std::vector<unsigned char>& body) {
     if (body.size() > static_cast<std::size_t>(std::numeric_limits<long long>::max())) return nullptr;
-    if (body.size() > static_cast<std::size_t>(-1) - 8) return nullptr;
-    auto* value = static_cast<unsigned char*>(quidra_managed_alloc(8 + body.size()));
+    if (body.size() > static_cast<std::size_t>(-1) - abi::bin_layout::payload_offset) return nullptr;
+    auto* value = static_cast<unsigned char*>(quidra_managed_alloc(abi::bin_layout::payload_offset + body.size()));
     if (body.size() > static_cast<std::size_t>(std::numeric_limits<long long>::max() / 8)) return nullptr;
     const auto length = static_cast<long long>(body.size() * 8);
     std::memcpy(value, &length, sizeof(length));
-    if (!body.empty()) std::memcpy(value + 8, body.data(), body.size());
+    if (!body.empty()) std::memcpy(value + abi::bin_layout::payload_offset, body.data(), body.size());
     return value;
 }
 
@@ -139,7 +141,8 @@ void* http_make_response(long status, HttpCapture&& capture) {
     }
 
     auto* response = static_cast<unsigned char*>(quidra_managed_alloc(24));
-    const long long status_value = static_cast<long long>(status);
+    // status is an int field: the inline word of the status code.
+    const long long status_value = static_cast<long long>(status) << 1;
     const auto header_bits = reinterpret_cast<std::uintptr_t>(headers);
     std::memcpy(response, &status_value, 8);
     std::memcpy(response + 8, &body, sizeof(body));
@@ -286,8 +289,13 @@ extern "C" void* quidra_http_get(const char* url) {
     return response;
 }
 
-extern "C" char* quidra_http_last_error_copy() {
-    return http_copy_string(http_last_error.empty() ? "HTTP request failed" : http_last_error);
+// The error of the calling thread's last failed http.get (HTTP_REQUEST), its
+// problem the request's failure text.
+extern "C" void* quidra_error_http_last(unsigned long long line, unsigned long long column) {
+    const std::uint64_t slots[] = {static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(
+        http_copy_string(http_last_error.empty() ? "HTTP request failed" : http_last_error)))};
+    return quidra::runtime::make_error_record(abi::ErrorValueCode::http_request, slots, line,
+                                              column, false);
 }
 
 extern "C" char* quidra_http_header(void* response, const char* name) {

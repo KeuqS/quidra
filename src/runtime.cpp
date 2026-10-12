@@ -305,7 +305,6 @@ struct ManagedFinalization {
 };
 
 using ManagedAllocations = std::unordered_map<std::uintptr_t, ManagedAllocation>;
-thread_local ManagedAllocations managed_allocations;
 
 constexpr std::array<std::size_t, 5> small_managed_pool_sizes{
     16, 32, 64, 128, 256
@@ -319,8 +318,88 @@ struct SmallManagedPool {
     }
 };
 
-thread_local SmallManagedPool small_managed_pool;
-thread_local long long string_build_append_last_codepoints = 0;
+struct ManagedRangeCacheEntry {
+    ManagedAllocation* allocation{};
+    std::uintptr_t begin{};
+    std::size_t size{};
+};
+
+constexpr std::size_t managed_range_cache_slots = 4;
+
+// One lifetime for the allocation registry, its pool and every pointer cache.
+// C host exit handlers can call exported Quidra functions after this thread's
+// C++ TLS destructors have run. Keep access through a trivial TLS pointer so
+// such a call can start a fresh context without using a destroyed container.
+struct ManagedState {
+    ManagedAllocations allocations;
+    SmallManagedPool pool;
+    std::map<std::uintptr_t, std::size_t> ranges;
+    long long append_last_codepoints{};
+    const char* string_text{};
+    ManagedAllocation* string_allocation{};
+    const char* shared_text{};
+    std::size_t shared_length{};
+    ManagedAllocation* shared_allocation{};
+    void* array_append_base{};
+    ManagedAllocation* array_append_allocation{};
+    std::array<ManagedRangeCacheEntry, managed_range_cache_slots> range_cache{};
+    std::size_t range_cache_victim{};
+    ManagedState* next_preserved{};
+    bool preserved_for_exit{};
+};
+
+thread_local ManagedState* current_managed_state{};
+thread_local bool managed_thread_teardown_complete{};
+std::atomic<ManagedState*> preserved_managed_states{};
+
+void destroy_managed_state() {
+    auto* state = current_managed_state;
+    if (!state || state->preserved_for_exit) return;
+    current_managed_state = nullptr;
+    delete state;
+}
+
+struct ManagedStateLifetime {
+    ~ManagedStateLifetime() {
+        managed_thread_teardown_complete = true;
+        destroy_managed_state();
+    }
+};
+
+ManagedState& managed_state() {
+    if (!current_managed_state) {
+        if (!managed_thread_teardown_complete) {
+            static thread_local ManagedStateLifetime lifetime;
+            (void)lifetime;
+        }
+        auto* state = new (std::nothrow) ManagedState;
+        if (!state) runtime_allocation_failure();
+        current_managed_state = state;
+        // Usually the TLS guard deletes this context first. Also register an
+        // exit callback: first-ever use can itself be inside a host exit
+        // handler, after the TLS destructor phase has already finished.
+        // An older handler can enter Quidra again with another context.
+        if (std::atexit(destroy_managed_state) != 0) {
+            destroy_managed_state();
+            runtime_allocation_failure();
+        }
+    }
+    return *current_managed_state;
+}
+
+void preserve_current_managed_state() {
+    auto* state = current_managed_state;
+    if (!state || state->preserved_for_exit) return;
+    // Fatal exits do not unwind Quidra frames. Their active allocations must
+    // remain valid throughout host exit callbacks. Preserve this context until
+    // process termination, without allocating or invoking user drop callbacks.
+    state->preserved_for_exit = true;
+    auto* head = preserved_managed_states.load(std::memory_order_relaxed);
+    do {
+        state->next_preserved = head;
+    } while (!preserved_managed_states.compare_exchange_weak(
+        head, state, std::memory_order_release, std::memory_order_relaxed));
+}
 
 unsigned char small_managed_pool_class(std::size_t bytes) {
     for (std::size_t i = 0; i < small_managed_pool_sizes.size(); ++i)
@@ -334,7 +413,7 @@ void* acquire_managed_memory(std::size_t requested, unsigned char pool_class,
     if (pool_class != 0) {
         const auto index = static_cast<std::size_t>(pool_class - 1);
         actual_bytes = small_managed_pool_sizes[index];
-        auto& list = small_managed_pool.free_lists[index];
+        auto& list = managed_state().pool.free_lists[index];
         if (!list.empty()) {
             void* value = list.back();
             list.pop_back();
@@ -358,7 +437,7 @@ void recycle_managed_memory(void* base, unsigned char pool_class) {
     }
     if (quidra::runtime::node_failure_active()) {
         try {
-            small_managed_pool.free_lists[
+            managed_state().pool.free_lists[
                 static_cast<std::size_t>(pool_class - 1)].push_back(base);
         } catch (...) {
             std::free(base);
@@ -366,69 +445,59 @@ void recycle_managed_memory(void* base, unsigned char pool_class) {
         }
         return;
     }
-    small_managed_pool.free_lists[
+    managed_state().pool.free_lists[
         static_cast<std::size_t>(pool_class - 1)].push_back(base);
 }
-
-thread_local const char* cached_managed_string_text = nullptr;
-thread_local ManagedAllocation* cached_managed_string_allocation = nullptr;
-
-thread_local const char* cached_shared_string_text = nullptr;
-thread_local std::size_t cached_shared_string_length = 0;
-thread_local ManagedAllocation* cached_shared_string_allocation = nullptr;
 
 // Repeated xs = xs.append(value) loops hit the same exact allocation for long
 // stretches. Keep only the allocation-record lookup cached; every move-safety
 // property is still re-read on each operation, so aliases, pins, and
 // initialization state retain their ordinary semantics.
-thread_local void* cached_array_append_base = nullptr;
-thread_local ManagedAllocation* cached_array_append_allocation = nullptr;
-
 ManagedAllocation* exact_array_append_allocation(void* array) {
-    if (array && array == cached_array_append_base &&
-        cached_array_append_allocation) {
-        return cached_array_append_allocation;
+    if (array && array == managed_state().array_append_base &&
+        managed_state().array_append_allocation) {
+        return managed_state().array_append_allocation;
     }
     if (!array) return nullptr;
     const auto it =
-        managed_allocations.find(reinterpret_cast<std::uintptr_t>(array));
-    if (it == managed_allocations.end()) return nullptr;
-    cached_array_append_base = array;
-    cached_array_append_allocation = &it->second;
-    return cached_array_append_allocation;
+        managed_state().allocations.find(reinterpret_cast<std::uintptr_t>(array));
+    if (it == managed_state().allocations.end()) return nullptr;
+    managed_state().array_append_base = array;
+    managed_state().array_append_allocation = &it->second;
+    return managed_state().array_append_allocation;
 }
 
 void invalidate_array_append_cache(const ManagedAllocation* allocation) {
-    if (cached_array_append_allocation != allocation) return;
-    cached_array_append_base = nullptr;
-    cached_array_append_allocation = nullptr;
+    if (managed_state().array_append_allocation != allocation) return;
+    managed_state().array_append_base = nullptr;
+    managed_state().array_append_allocation = nullptr;
 }
 
 ManagedAllocation* exact_managed_string(const char* text) {
-    if (text && text == cached_managed_string_text &&
-        cached_managed_string_allocation) {
-        return cached_managed_string_allocation;
+    if (text && text == managed_state().string_text &&
+        managed_state().string_allocation) {
+        return managed_state().string_allocation;
     }
     if (!text) return nullptr;
     const auto it =
-        managed_allocations.find(reinterpret_cast<std::uintptr_t>(text));
-    if (it == managed_allocations.end()) return nullptr;
-    cached_managed_string_text = text;
-    cached_managed_string_allocation = &it->second;
-    return cached_managed_string_allocation;
+        managed_state().allocations.find(reinterpret_cast<std::uintptr_t>(text));
+    if (it == managed_state().allocations.end()) return nullptr;
+    managed_state().string_text = text;
+    managed_state().string_allocation = &it->second;
+    return managed_state().string_allocation;
 }
 
 void invalidate_managed_string_cache(const ManagedAllocation* allocation) {
-    if (cached_managed_string_allocation != allocation) return;
-    cached_managed_string_text = nullptr;
-    cached_managed_string_allocation = nullptr;
+    if (managed_state().string_allocation != allocation) return;
+    managed_state().string_text = nullptr;
+    managed_state().string_allocation = nullptr;
 }
 
 void invalidate_shared_string_cache(const ManagedAllocation* allocation = nullptr) {
-    if (allocation && cached_shared_string_allocation != allocation) return;
-    cached_shared_string_text = nullptr;
-    cached_shared_string_length = 0;
-    cached_shared_string_allocation = nullptr;
+    if (allocation && managed_state().shared_allocation != allocation) return;
+    managed_state().shared_text = nullptr;
+    managed_state().shared_length = 0;
+    managed_state().shared_allocation = nullptr;
 }
 
 // Interior references need an ordered range index, but exact owner operations do not.
@@ -436,24 +505,12 @@ void invalidate_shared_string_cache(const ManagedAllocation* allocation = nullpt
 // those ranges and avoid a tree lookup on every initialization check. The set holds
 // several entries because the common loops read one array while writing another; a
 // single entry would miss on every access of a two-array algorithm such as a merge.
-thread_local std::map<std::uintptr_t, std::size_t> managed_ranges;
-
-struct ManagedRangeCacheEntry {
-    ManagedAllocation* allocation{};
-    std::uintptr_t begin{};
-    std::size_t size{};
-};
-
-constexpr std::size_t managed_range_cache_slots = 4;
-thread_local ManagedRangeCacheEntry managed_range_cache[managed_range_cache_slots];
-thread_local std::size_t managed_range_cache_victim = 0;
-
 void clear_managed_range_cache(const ManagedAllocation* allocation = nullptr) {
-    for (auto& entry : managed_range_cache) {
+    for (auto& entry : managed_state().range_cache) {
         if (allocation && entry.allocation != allocation) continue;
         entry = ManagedRangeCacheEntry{};
     }
-    if (!allocation) managed_range_cache_victim = 0;
+    if (!allocation) managed_state().range_cache_victim = 0;
 }
 
 void finalize_managed(ManagedFinalization finalization) {
@@ -474,22 +531,22 @@ void finalize_managed(ManagedFinalization finalization) {
 ManagedAllocation* managed_containing(const void* address) {
     if (!address) return nullptr;
     const auto target = reinterpret_cast<std::uintptr_t>(address);
-    for (const auto& entry : managed_range_cache) {
+    for (const auto& entry : managed_state().range_cache) {
         if (entry.allocation && target >= entry.begin && target - entry.begin < entry.size) {
             return entry.allocation;
         }
     }
-    if (managed_ranges.empty()) return nullptr;
-    auto range = managed_ranges.upper_bound(target);
-    if (range == managed_ranges.begin()) return nullptr;
+    if (managed_state().ranges.empty()) return nullptr;
+    auto range = managed_state().ranges.upper_bound(target);
+    if (range == managed_state().ranges.begin()) return nullptr;
     --range;
     const auto begin = range->first;
     const auto size = range->second;
     if (target < begin || target - begin >= size) return nullptr;
-    const auto it = managed_allocations.find(begin);
-    if (it == managed_allocations.end()) return nullptr;
-    auto& entry = managed_range_cache[managed_range_cache_victim];
-    managed_range_cache_victim = (managed_range_cache_victim + 1) % managed_range_cache_slots;
+    const auto it = managed_state().allocations.find(begin);
+    if (it == managed_state().allocations.end()) return nullptr;
+    auto& entry = managed_state().range_cache[managed_state().range_cache_victim];
+    managed_state().range_cache_victim = (managed_state().range_cache_victim + 1) % managed_range_cache_slots;
     entry.allocation = &it->second;
     entry.begin = begin;
     entry.size = size;
@@ -510,19 +567,19 @@ void* managed_allocate_impl(std::size_t bytes, bool track_interior_range) {
     if (quidra::runtime::node_failure_active()) {
         bool installed = false;
         try {
-            managed_allocations.emplace(key, std::move(allocation));
+            managed_state().allocations.emplace(key, std::move(allocation));
             installed = true;
-            if (track_interior_range) managed_ranges.emplace(key, actual_bytes);
+            if (track_interior_range) managed_state().ranges.emplace(key, actual_bytes);
         } catch (...) {
-            if (installed) managed_allocations.erase(key);
-            managed_ranges.erase(key);
+            if (installed) managed_state().allocations.erase(key);
+            managed_state().ranges.erase(key);
             // The acquired pool block is detached already; free needs no allocation.
             std::free(memory);
             throw;
         }
         return memory;
     }
-    managed_allocations.emplace(key, std::move(allocation));
+    managed_state().allocations.emplace(key, std::move(allocation));
 
     // std::unordered_map rehash invalidates iterators, not references or pointers
     // to elements. The range cache stores pointers to mapped values, so inserting
@@ -530,8 +587,8 @@ void* managed_allocate_impl(std::size_t bytes, bool track_interior_range) {
     //
     // Strings never expose interior references: indexing and slicing return new
     // values. Keep them out of the ordered range index entirely; exact ownership
-    // still lives in managed_allocations.
-    if (track_interior_range) managed_ranges.emplace(key, actual_bytes);
+    // still lives in managed_state().allocations.
+    if (track_interior_range) managed_state().ranges.emplace(key, actual_bytes);
     return memory;
 }
 
@@ -685,8 +742,8 @@ bool valid_runtime_text(std::string_view text) {
 void mark_managed_string(char* value, std::size_t byte_length,
                          std::optional<std::size_t> codepoints = std::nullopt) {
     const auto it =
-        managed_allocations.find(reinterpret_cast<std::uintptr_t>(value));
-    if (it == managed_allocations.end())
+        managed_state().allocations.find(reinterpret_cast<std::uintptr_t>(value));
+    if (it == managed_state().allocations.end())
         runtime_text_failure("string storage is not managed");
     auto& allocation = it->second;
     allocation.string_byte_length_known = true;
@@ -773,12 +830,12 @@ std::string_view cached_string_view(const char* text, ManagedAllocation*& alloca
     allocation = nullptr;
     if (!text) runtime_text_failure("null string");
 
-    if (text == cached_shared_string_text && cached_shared_string_allocation) {
+    if (text == managed_state().shared_text && managed_state().shared_allocation) {
         // The cached length belongs to this slice, but UTF-8/code-point metadata
         // in ManagedAllocation belongs to the backing slab as a whole. Keep
         // allocation null so validated_string_view never reuses one slice's
         // semantic metadata for another slice from the same slab.
-        return std::string_view(text, cached_shared_string_length);
+        return std::string_view(text, managed_state().shared_length);
     }
 
     ManagedAllocation* found = exact_managed_string(text);
@@ -821,14 +878,14 @@ std::string_view validated_string_view(
     // Splitting a valid UTF-8 string on a valid UTF-8 separator cannot create
     // an invalid code-point boundary, so reparsing every hot-loop slice is
     // redundant. Keep per-slice length metadata out of the backing allocation.
-    if (text && text == cached_shared_string_text &&
-        cached_shared_string_allocation) {
+    if (text && text == managed_state().shared_text &&
+        managed_state().shared_allocation) {
         allocation = nullptr;
         const auto source =
-            std::string_view(text, cached_shared_string_length);
+            std::string_view(text, managed_state().shared_length);
         if (codepoints) {
-            if (cached_shared_string_allocation->string_ascii_known &&
-                cached_shared_string_allocation->string_ascii) {
+            if (managed_state().shared_allocation->string_ascii_known &&
+                managed_state().shared_allocation->string_ascii) {
                 *codepoints = source.size();
             } else {
                 *codepoints = utf8_length(source);
@@ -1325,8 +1382,8 @@ extern "C" bool quidra_runtime_commit_text_buffer(
     }
     const auto bytes = static_cast<std::size_t>(size);
     const auto it =
-        managed_allocations.find(reinterpret_cast<std::uintptr_t>(data));
-    if (it == managed_allocations.end() ||
+        managed_state().allocations.find(reinterpret_cast<std::uintptr_t>(data));
+    if (it == managed_state().allocations.end() ||
         it->second.size < bytes + 1) {
         return false;
     }
@@ -1351,8 +1408,8 @@ extern "C" void quidra_managed_retain(void* value) {
     if (!value) return;
     ManagedAllocation* allocation = nullptr;
     const auto exact =
-        managed_allocations.find(reinterpret_cast<std::uintptr_t>(value));
-    if (exact != managed_allocations.end()) {
+        managed_state().allocations.find(reinterpret_cast<std::uintptr_t>(value));
+    if (exact != managed_state().allocations.end()) {
         allocation = &exact->second;
     } else {
         auto* containing = managed_containing(value);
@@ -1369,8 +1426,8 @@ extern "C" void quidra_managed_release(void* value, void* drop_function) {
     if (!value) return;
     ManagedAllocation* allocation = nullptr;
     const auto exact =
-        managed_allocations.find(reinterpret_cast<std::uintptr_t>(value));
-    if (exact != managed_allocations.end()) {
+        managed_state().allocations.find(reinterpret_cast<std::uintptr_t>(value));
+    if (exact != managed_state().allocations.end()) {
         allocation = &exact->second;
     } else {
         auto* containing = managed_containing(value);
@@ -1392,9 +1449,9 @@ extern "C" void quidra_managed_release(void* value, void* drop_function) {
         invalidate_array_append_cache(allocation);
         if (allocation->interior_range_tracked) {
             clear_managed_range_cache(allocation);
-            managed_ranges.erase(key);
+            managed_state().ranges.erase(key);
         }
-        managed_allocations.erase(key);
+        managed_state().allocations.erase(key);
         finalize_managed(finalization);
     }
 }
@@ -1413,8 +1470,8 @@ extern "C" void quidra_managed_pin(void* address) {
     if (!address) return;
     ManagedAllocation* allocation = nullptr;
     const auto exact =
-        managed_allocations.find(reinterpret_cast<std::uintptr_t>(address));
-    if (exact != managed_allocations.end()) allocation = &exact->second;
+        managed_state().allocations.find(reinterpret_cast<std::uintptr_t>(address));
+    if (exact != managed_state().allocations.end()) allocation = &exact->second;
     else allocation = managed_containing(address);
     if (!allocation) return;
     if (allocation->pins == std::numeric_limits<std::size_t>::max()) {
@@ -1427,8 +1484,8 @@ extern "C" void quidra_managed_unpin(void* address) {
     if (!address) return;
     ManagedAllocation* allocation = nullptr;
     const auto exact =
-        managed_allocations.find(reinterpret_cast<std::uintptr_t>(address));
-    if (exact != managed_allocations.end()) allocation = &exact->second;
+        managed_state().allocations.find(reinterpret_cast<std::uintptr_t>(address));
+    if (exact != managed_state().allocations.end()) allocation = &exact->second;
     else allocation = managed_containing(address);
     if (!allocation) return;
     if (allocation->pins == 0) runtime_text_failure("managed pin count underflow");
@@ -1441,9 +1498,9 @@ extern "C" void quidra_managed_unpin(void* address) {
         invalidate_array_append_cache(allocation);
         if (allocation->interior_range_tracked) {
             clear_managed_range_cache(allocation);
-            managed_ranges.erase(key);
+            managed_state().ranges.erase(key);
         }
-        managed_allocations.erase(key);
+        managed_state().allocations.erase(key);
         finalize_managed(finalization);
     }
 }
@@ -1451,16 +1508,20 @@ extern "C" void quidra_managed_unpin(void* address) {
 // The runtime's internal entries for error records (runtime_internal.hpp).
 namespace quidra::runtime {
 
+void preserve_managed_state_for_exit() {
+    preserve_current_managed_state();
+}
+
 void* managed_allocate_with_drop(std::size_t bytes, void (*drop)(void*)) {
     void* memory = managed_allocate_impl(bytes, false);
-    managed_allocations.find(reinterpret_cast<std::uintptr_t>(memory))->second.drop = drop;
+    managed_state().allocations.find(reinterpret_cast<std::uintptr_t>(memory))->second.drop = drop;
     return memory;
 }
 
 bool managed_release_take(void* value, TakenAllocation& taken) {
     if (!value) return false;
-    const auto exact = managed_allocations.find(reinterpret_cast<std::uintptr_t>(value));
-    if (exact == managed_allocations.end()) return false;
+    const auto exact = managed_state().allocations.find(reinterpret_cast<std::uintptr_t>(value));
+    if (exact == managed_state().allocations.end()) return false;
     auto* allocation = &exact->second;
     if (allocation->owners == 0) runtime_text_failure("managed owner count underflow");
     --allocation->owners;
@@ -1472,9 +1533,9 @@ bool managed_release_take(void* value, TakenAllocation& taken) {
     invalidate_array_append_cache(allocation);
     if (allocation->interior_range_tracked) {
         clear_managed_range_cache(allocation);
-        managed_ranges.erase(key);
+        managed_state().ranges.erase(key);
     }
-    managed_allocations.erase(key);
+    managed_state().allocations.erase(key);
     return true;
 }
 
@@ -1483,13 +1544,13 @@ void recycle_taken(const TakenAllocation& taken) {
 }
 
 bool is_managed(const void* value) {
-    return value && managed_allocations.contains(reinterpret_cast<std::uintptr_t>(value));
+    return value && managed_state().allocations.contains(reinterpret_cast<std::uintptr_t>(value));
 }
 
 std::size_t managed_owners(const void* value) {
     if (!value) return 0;
-    const auto exact = managed_allocations.find(reinterpret_cast<std::uintptr_t>(value));
-    return exact == managed_allocations.end() ? 0 : exact->second.owners;
+    const auto exact = managed_state().allocations.find(reinterpret_cast<std::uintptr_t>(value));
+    return exact == managed_state().allocations.end() ? 0 : exact->second.owners;
 }
 
 char* managed_text_copy(std::string_view text) { return copy_runtime_text(text); }
@@ -1506,8 +1567,8 @@ extern "C" void quidra_init_create(void* base, unsigned long long count,
         data_offset > static_cast<unsigned long long>(std::numeric_limits<std::size_t>::max())) {
         runtime_text_failure("invalid initialization tracker");
     }
-    const auto it = managed_allocations.find(reinterpret_cast<std::uintptr_t>(base));
-    if (it == managed_allocations.end()) runtime_text_failure("initialization tracker requires managed storage");
+    const auto it = managed_state().allocations.find(reinterpret_cast<std::uintptr_t>(base));
+    if (it == managed_state().allocations.end()) runtime_text_failure("initialization tracker requires managed storage");
     auto tracker = std::make_unique<InitializationTracker>();
     tracker->count = static_cast<std::size_t>(count);
     tracker->unit_bytes = static_cast<std::size_t>(unit_bytes);
@@ -1658,7 +1719,7 @@ extern "C" void quidra_init_clone(void* destination, void* source_data,
     }
     quidra_init_create(destination, count, unit_bytes, destination_offset, 0);
     const auto destination_it =
-        managed_allocations.find(reinterpret_cast<std::uintptr_t>(destination));
+        managed_state().allocations.find(reinterpret_cast<std::uintptr_t>(destination));
     auto& destination_tracker = *destination_it->second.initialization;
     const auto& source_tracker = *source_unit->first->initialization;
     const auto requested = static_cast<std::size_t>(count);
@@ -1753,12 +1814,12 @@ extern "C" void* quidra_array_grow_move(void* array, unsigned long long raw_stri
         if(quidra::runtime::node_failure_active()) {
             // Reserve an existing tree node before realloc changes the sole
             // owner pointer; reinserting its node handle cannot allocate.
-            if(!managed_ranges.contains(old_key))managed_ranges.emplace(old_key,old_bytes);
-            node_range=managed_ranges.extract(old_key);
+            if(!managed_state().ranges.contains(old_key))managed_state().ranges.emplace(old_key,old_bytes);
+            node_range=managed_state().ranges.extract(old_key);
         }
         result = std::realloc(array, new_bytes);
         if (!result) {
-            if(node_range)managed_ranges.insert(std::move(node_range));
+            if(node_range)managed_state().ranges.insert(std::move(node_range));
             runtime_allocation_failure();
         }
         if (new_bytes > old_bytes) {
@@ -1767,9 +1828,9 @@ extern "C" void* quidra_array_grow_move(void* array, unsigned long long raw_stri
         }
 
         const auto new_key = reinterpret_cast<std::uintptr_t>(result);
-        if(!quidra::runtime::node_failure_active())managed_ranges.erase(old_key);
+        if(!quidra::runtime::node_failure_active())managed_state().ranges.erase(old_key);
         if (new_key != old_key) {
-            auto node = managed_allocations.extract(old_key);
+            auto node = managed_state().allocations.extract(old_key);
             if (node.empty())
                 runtime_text_failure("array append storage disappeared");
             node.key() = new_key;
@@ -1777,7 +1838,7 @@ extern "C" void* quidra_array_grow_move(void* array, unsigned long long raw_stri
             node.mapped().size = new_bytes;
             node.mapped().small_pool_class = 0;
             node.mapped().array_capacity = new_capacity;
-            const auto inserted = managed_allocations.insert(std::move(node));
+            const auto inserted = managed_state().allocations.insert(std::move(node));
             allocation = &inserted.position->second;
         } else {
             allocation->base = result;
@@ -1787,10 +1848,10 @@ extern "C" void* quidra_array_grow_move(void* array, unsigned long long raw_stri
         }
         if(node_range) {
             node_range.key()=new_key;node_range.mapped()=new_bytes;
-            managed_ranges.insert(std::move(node_range));
-        }else managed_ranges.emplace(new_key,new_bytes);
-        cached_array_append_base = result;
-        cached_array_append_allocation = allocation;
+            managed_state().ranges.insert(std::move(node_range));
+        }else managed_state().ranges.emplace(new_key,new_bytes);
+        managed_state().array_append_base = result;
+        managed_state().array_append_allocation = allocation;
         tracker = allocation->initialization.get();
     }
 
@@ -2305,7 +2366,7 @@ TensorValue* tensor_descriptor(TensorStorage* storage, std::vector<long long> sh
     auto* memory = managed_allocate(sizeof(TensorValue));
     auto* result = new (memory) TensorValue{
         storage, std::move(shape), std::move(strides), offset, {}, {}};
-    managed_allocations.at(reinterpret_cast<std::uintptr_t>(memory)).tensor_descriptor = true;
+    managed_state().allocations.at(reinterpret_cast<std::uintptr_t>(memory)).tensor_descriptor = true;
     forget_tensor_storage_partial(storage);
     return result;
 }
@@ -3762,7 +3823,7 @@ extern "C" void* quidra_tensor_shape(void* raw) {
     for (std::size_t i = 0; i < shape.size(); ++i) {
         std::memcpy(result + abi::array_layout::payload_offset + i * sizeof(long long), &shape[i], sizeof(long long));
     }
-    const auto it = managed_allocations.find(reinterpret_cast<std::uintptr_t>(result));
+    const auto it = managed_state().allocations.find(reinterpret_cast<std::uintptr_t>(result));
     auto tracker = std::make_unique<InitializationTracker>();
     tracker->count = shape.size();
     tracker->unit_bytes = sizeof(long long);
@@ -3787,7 +3848,7 @@ extern "C" void* quidra_tensor_shape_fixed(void* raw, unsigned long long expecte
     for (std::size_t i = 0; i < shape.size(); ++i) {
         std::memcpy(result + i * sizeof(long long), &shape[i], sizeof(long long));
     }
-    const auto it = managed_allocations.find(reinterpret_cast<std::uintptr_t>(result));
+    const auto it = managed_state().allocations.find(reinterpret_cast<std::uintptr_t>(result));
     auto tracker = std::make_unique<InitializationTracker>();
     tracker->count = shape.size();
     tracker->unit_bytes = sizeof(long long);
@@ -8865,8 +8926,8 @@ TensorValue* tensor_array_borrow_element(const TensorArrayBorrow& view,
     quidra_init_check(const_cast<unsigned char*>(slot), view.line, view.column);
     TensorValue* tensor = nullptr;
     std::memcpy(&tensor, slot, sizeof(tensor));
-    const auto allocation = managed_allocations.find(reinterpret_cast<std::uintptr_t>(tensor));
-    if (allocation == managed_allocations.end() || !allocation->second.tensor_descriptor)
+    const auto allocation = managed_state().allocations.find(reinterpret_cast<std::uintptr_t>(tensor));
+    if (allocation == managed_state().allocations.end() || !allocation->second.tensor_descriptor)
         tensor_fail("tensor array borrow contains a non-tensor element", view.line, view.column);
     if (!tensor->storage || static_cast<std::uint64_t>(tensor->storage->dtype) != view.dtype)
         tensor_fail("tensor array borrow has an incompatible element dtype", view.line, view.column);
@@ -8885,8 +8946,8 @@ extern "C" void quidra_tensor_array_borrow_begin(
     quidra_init_check(array_cell, line, column);
     void* array = nullptr;
     std::memcpy(&array, array_cell, sizeof(array));
-    const auto allocation = managed_allocations.find(reinterpret_cast<std::uintptr_t>(array));
-    if (allocation == managed_allocations.end() || !allocation->second.initialization ||
+    const auto allocation = managed_state().allocations.find(reinterpret_cast<std::uintptr_t>(array));
+    if (allocation == managed_state().allocations.end() || !allocation->second.initialization ||
         allocation->second.initialization->data_offset != abi::array_layout::payload_offset ||
         allocation->second.initialization->unit_bytes != sizeof(void*) ||
         allocation->second.size < abi::array_layout::payload_offset)
@@ -9912,7 +9973,7 @@ static void* quidra_string_split_iter_begin_impl(
         auto& allocation = *source_allocation;
         const auto key = reinterpret_cast<std::uintptr_t>(allocation.base);
         if (!allocation.interior_range_tracked) {
-            managed_ranges.emplace(key, allocation.size);
+            managed_state().ranges.emplace(key, allocation.size);
             allocation.interior_range_tracked = true;
         }
         if (allocation.owners == std::numeric_limits<std::size_t>::max()) {
@@ -9935,8 +9996,8 @@ static void* quidra_string_split_iter_begin_impl(
     slab[source.size()] = '\0';
 
     const auto slab_key = reinterpret_cast<std::uintptr_t>(slab);
-    auto slab_it = managed_allocations.find(slab_key);
-    if (slab_it == managed_allocations.end()) {
+    auto slab_it = managed_state().allocations.find(slab_key);
+    if (slab_it == managed_state().allocations.end()) {
         partial_iterator.relinquish();
         delete iterator;
         runtime_text_failure("split iterator backing storage disappeared");
@@ -9988,25 +10049,25 @@ extern "C" char* quidra_string_split_iter_next(void* raw) {
     if (relative == std::string_view::npos) {
         iterator.finished = true;
         iterator.slab[iterator.size] = '\0';
-        cached_shared_string_text = iterator.slab + start;
-        cached_shared_string_length = iterator.size - start;
-        cached_shared_string_allocation = iterator.allocation;
+        managed_state().shared_text = iterator.slab + start;
+        managed_state().shared_length = iterator.size - start;
+        managed_state().shared_allocation = iterator.allocation;
         return iterator.slab + start;
     }
 
     const auto position = start + relative;
     iterator.slab[position] = '\0';
     iterator.next = position + iterator.separator.size();
-    cached_shared_string_text = iterator.slab + start;
-    cached_shared_string_length = position - start;
-    cached_shared_string_allocation = iterator.allocation;
+    managed_state().shared_text = iterator.slab + start;
+    managed_state().shared_length = position - start;
+    managed_state().shared_allocation = iterator.allocation;
     return iterator.slab + start;
 }
 
 extern "C" void quidra_string_split_iter_end(void* raw) {
     if (!raw) return;
     auto* iterator = static_cast<QuidraStringSplitIterator*>(raw);
-    if (cached_shared_string_allocation == iterator->allocation) {
+    if (managed_state().shared_allocation == iterator->allocation) {
         invalidate_shared_string_cache(iterator->allocation);
     }
     quidra_managed_release(iterator->slab, nullptr);
@@ -10043,8 +10104,8 @@ extern "C" void* quidra_string_split(const char* text, const char* separator) {
     slab[source.size()] = '\0';
 
     const auto slab_key = reinterpret_cast<std::uintptr_t>(slab);
-    auto slab_it = managed_allocations.find(slab_key);
-    if (slab_it == managed_allocations.end())
+    auto slab_it = managed_state().allocations.find(slab_key);
+    if (slab_it == managed_state().allocations.end())
         runtime_text_failure("split backing storage disappeared");
     slab_it->second.shared_string_slab = true;
     if (!quidra::runtime::node_failure_active()) slab_it->second.owners = piece_count;
@@ -10065,7 +10126,7 @@ extern "C" void* quidra_string_split(const char* text, const char* separator) {
             ? source.size() : pos + delimiter.size();
     }
     if (quidra::runtime::node_failure_active())
-        managed_allocations.find(slab_key)->second.owners = piece_count;
+        managed_state().allocations.find(slab_key)->second.owners = piece_count;
     partial_slab.relinquish();
     return result;
 }
@@ -10257,7 +10318,7 @@ extern "C" char* quidra_string_build_append_move_unique_direct(
     const auto new_length = old_length + added;
 
     // validated_string_view already resolved the exact managed receiver.
-    // Re-looking it up in managed_allocations on every append is pure overhead
+    // Re-looking it up in managed_state().allocations on every append is pure overhead
     // in hot builders such as MB10. Keep the resolved metadata pointer and only
     // touch the hash table when a rare realloc actually changes the base key.
     auto* destination_allocation = receiver;
@@ -10291,14 +10352,14 @@ extern "C" char* quidra_string_build_append_move_unique_direct(
 
         const auto new_key = reinterpret_cast<std::uintptr_t>(result);
         if (new_key != old_key) {
-            auto node = managed_allocations.extract(old_key);
+            auto node = managed_state().allocations.extract(old_key);
             if (node.empty())
                 runtime_text_failure("string build-append storage disappeared");
             node.key() = new_key;
             node.mapped().base = result;
             node.mapped().size = new_bytes;
             node.mapped().small_pool_class = 0;
-            const auto inserted = managed_allocations.insert(std::move(node));
+            const auto inserted = managed_state().allocations.insert(std::move(node));
             destination_allocation = &inserted.position->second;
         } else {
             destination_allocation->base = result;
@@ -10372,7 +10433,7 @@ extern "C" char* quidra_string_build_append_move_unique(
     long long added_length = 0;
     auto* result = quidra_string_build_append_move_unique_direct(
         raw, kinds, raw_values, raw_count, separator, &added_length);
-    string_build_append_last_codepoints = added_length;
+    managed_state().append_last_codepoints = added_length;
     return result;
 }
 
@@ -10387,7 +10448,7 @@ extern "C" char* quidra_string_build_append_move(
 }
 
 extern "C" long long quidra_string_build_append_last_length() {
-    return string_build_append_last_codepoints;
+    return managed_state().append_last_codepoints;
 }
 
 extern "C" char* quidra_string_append_move_many(
@@ -10458,8 +10519,8 @@ extern "C" char* quidra_string_append_move_many(
     const auto new_length = old_length + added;
 
     const auto old_key = reinterpret_cast<std::uintptr_t>(raw);
-    auto it = managed_allocations.find(old_key);
-    if (it == managed_allocations.end()) {
+    auto it = managed_state().allocations.find(old_key);
+    if (it == managed_state().allocations.end()) {
         runtime_text_failure("string append storage disappeared");
     }
     auto& allocation = it->second;
@@ -10494,18 +10555,18 @@ extern "C" char* quidra_string_append_move_many(
 
         const auto new_key = reinterpret_cast<std::uintptr_t>(result);
         if (new_key != old_key) {
-            auto node = managed_allocations.extract(old_key);
+            auto node = managed_state().allocations.extract(old_key);
             node.key() = new_key;
             node.mapped().base = result;
             node.mapped().size = new_bytes;
             node.mapped().small_pool_class = 0;
-            managed_allocations.insert(std::move(node));
+            managed_state().allocations.insert(std::move(node));
         } else {
             allocation.base = result;
             allocation.size = new_bytes;
             allocation.small_pool_class = 0;
         }
-        it = managed_allocations.find(new_key);
+        it = managed_state().allocations.find(new_key);
         capacity = new_capacity;
     }
 

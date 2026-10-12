@@ -11,6 +11,7 @@
 // from a program's dependencies (pkg-config's libraries, the CUDA runtime,
 // libcurl when the program calls the HTTP runtime), and the C++ standard
 // library that a C linker, unlike the clang++ driver, does not add itself.
+// Sanitizer development archives also report their sanitizer runtime flags.
 
 #include <filesystem>
 #include <string>
@@ -33,7 +34,7 @@ std::vector<std::string> dependency_link_flags(const std::vector<std::string>& p
                                                bool uses_cuda, bool uses_http);
 
 // What a C linker needs besides a Quidra library archive: the C++ standard
-// library, the system libraries and the dependency flags.
+// library, any sanitizer runtimes, the system libraries and the dependency flags.
 std::vector<std::string> c_host_link_flags(const std::vector<std::string>& pkg_config_libraries,
                                            bool uses_cuda, bool uses_http);
 

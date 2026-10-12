@@ -3,6 +3,7 @@
 set -euo pipefail
 QUIDRA=$1
 SOURCE=$2
+HOST_CXX="${3:-${CXX:-c++}}"
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 export QUIDRA_CACHE_DIR="$TMP/cache"
@@ -82,6 +83,6 @@ int main() {
 CPP
 "$QUIDRA" build "$TMP/trace.qui" --lib -o "$TMP/libtrace.a" --print-link-flags > "$TMP/flags"
 read -r -a link_flags < "$TMP/flags"
-"${CXX:-c++}" -std=c++17 -O1 -I "$SOURCE/src" "$TMP/host.cpp" "$TMP/libtrace.a" "${link_flags[@]}" -pthread -o "$TMP/host"
+"$HOST_CXX" -std=c++17 -O1 -I "$SOURCE/src" "$TMP/host.cpp" "$TMP/libtrace.a" "${link_flags[@]}" -pthread -o "$TMP/host"
 perl -e 'alarm shift; exec @ARGV' 60 "$TMP/host"
 echo 'runtime trace concurrency: ok'

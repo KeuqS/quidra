@@ -49,8 +49,9 @@ public:
     void record_variable(DebugVariableRecord&& record){debug_variables_.push_back(std::move(record));}
     bool has_variables()const{return !debug_variables_.empty();}
 
-    // source_filename, in the module's header.
-    void emit_source_filename(llvm_text::LlvmModule& module)const;
+    // Stable source identity in the header, including modules without debug
+    // metadata: sanitizers must not name the temporary LLVM output file.
+    static void emit_source_filename(const ir::Module& source,llvm_text::LlvmModule& module);
     // Every metadata node, in the module's metadata.
     void emit_metadata(llvm_text::LlvmModule& module)const;
 

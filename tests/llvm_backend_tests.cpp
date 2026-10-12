@@ -5,6 +5,7 @@
 #include "llvm_backend/complex_arithmetic.hpp"
 #include "llvm_backend/small_rational.hpp"
 #include "llvm_backend/shape_variable_check.hpp"
+#include "llvm_text/escape.hpp"
 #include "quidra/compiler.hpp"
 
 #include <cstddef>
@@ -75,6 +76,15 @@ int main(int argc, char** argv) {
     } catch (const std::exception& error) {
         std::fprintf(stderr, "llvm backend test: cannot compile %s: %s\n", argv[1], error.what());
         return 2;
+    }
+
+    // The default (non-debug) module has a source identity independent of
+    // where its LLVM text is written, including when ASan instruments it.
+    const auto header = "source_filename = \"" + quidra::llvm_text::escape_metadata(
+        std::filesystem::path(argv[1]).filename().string()) + "\"\n";
+    if (!module.starts_with(header) && module.find("\n" + header) == std::string::npos) {
+        std::fprintf(stderr, "llvm backend test failed: missing stable source filename\n");
+        return 1;
     }
 
     const std::string_view prelude = quidra::llvm_backend::runtime_prelude_text();

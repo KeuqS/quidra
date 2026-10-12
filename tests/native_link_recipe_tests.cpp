@@ -114,7 +114,10 @@ void test_modes(const fs::path& root) {
         "#include \"recipe_header.h\"\n"
         "int recipe_native_value(void) { return RECIPE_VALUE; }\n");
     write_text(root / "plain.s", "\t.text\n");
-    write_text(root / "program.ll", "define i32 @main() {\n  ret i32 0\n}\n");
+    write_text(root / "program.ll",
+               "source_filename = \"program.qui\"\n"
+               "@value = global i32 0\n"
+               "define i32 @main() {\n  %v = load i32, ptr @value\n  ret i32 %v\n}\n");
     const auto llvm = root / "program.ll";
     const LinkOptions options{
         false, true, {root / "native.c", root / "plain.s"}, {}};
@@ -123,9 +126,11 @@ void test_modes(const fs::path& root) {
     const auto built = quidra::toolchain::native_link_recipe(
         llvm, root / "build" / "app", options);
     fs::create_directories(root / "run");
+    const auto recorded_llvm = root / "run" / "program.ll";
+    write_text(recorded_llvm, read_bytes(llvm));
     const LinkRecording recording{root / "run", root / "run" / "toolchain.log"};
     const auto recorded = quidra::toolchain::native_link_recipe(
-        llvm, root / "run" / "app", options, recording);
+        recorded_llvm, root / "run" / "app", options, recording);
 
     expect(!built.recording(), "build mode has no recording");
     expect(built.steps().size() == 3, "build mode: two compiles and a link");
@@ -141,8 +146,9 @@ void test_modes(const fs::path& root) {
     expect(template_text == recorded.template_text(),
            "the template does not depend on the mode or the directories:\n" +
                template_text + "---\n" + recorded.template_text());
-    expect(contains(template_text, "\n  =-x\n  =ir\n  @llvm\n"),
-           "the template names the LLVM file by placeholder:\n" + template_text);
+    expect(contains(template_text, "\n  =-x\n  =ir\n  =-\n") &&
+               contains(template_text, "\n  stdin @llvm\n"),
+           "the template feeds LLVM through stdin with its input named by placeholder:\n" + template_text);
     expect(contains(template_text, "  =-o\n  @output\n"),
            "the template names the output by placeholder:\n" + template_text);
     expect(contains(template_text, "@work/native-0."),

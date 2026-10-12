@@ -24,10 +24,11 @@ DOCS = [ROOT / document for document in doc_blocks.DOCUMENTS]
 RUN_CACHE = tempfile.TemporaryDirectory(prefix="quidra-cache-")
 os.environ["QUIDRA_CACHE_DIR"] = RUN_CACHE.name
 
-# quidra run includes native compilation. Windows CI has materially higher
-# toolchain startup cost, so keep the timeout as a hang guard rather than a
-# performance assertion.
-NATIVE_EXAMPLE_TIMEOUT = 60 if os.name == "nt" else 15
+# quidra run includes native compilation. Sanitizer instrumentation and Windows
+# toolchain startup need additional time even for bounded examples, so keep the
+# timeout as a hang guard rather than a performance assertion.
+SANITIZER_BUILD = bool(os.environ.get("ASAN_OPTIONS") or os.environ.get("UBSAN_OPTIONS"))
+NATIVE_EXAMPLE_TIMEOUT = 60 if os.name == "nt" or SANITIZER_BUILD else 15
 
 def command_environment(cwd: Path | None) -> dict[str, str]:
     environment = os.environ.copy()

@@ -52,7 +52,8 @@ int run_native_program(
     const fs::path& program,
     const std::vector<NativeText>& arguments,
     const std::optional<fs::path>& stdout_path,
-    const std::optional<fs::path>& stderr_path) {
+    const std::optional<fs::path>& stderr_path,
+    const std::optional<fs::path>& stdin_path) {
     std::wstring command = windows_quote_wide(program.native());
     for (const auto& argument : arguments) {
         command.push_back(L' ');
@@ -60,6 +61,7 @@ int run_native_program(
     }
     command.push_back(L'\0');
 
+    HANDLE input = INVALID_HANDLE_VALUE;
     HANDLE output = INVALID_HANDLE_VALUE;
     HANDLE error = INVALID_HANDLE_VALUE;
     SECURITY_ATTRIBUTES security{};
@@ -73,12 +75,21 @@ int run_native_program(
             &security, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     };
 
+    if (stdin_path) {
+        input = CreateFileW(
+            stdin_path->c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+            &security, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (input == INVALID_HANDLE_VALUE)
+            throw std::runtime_error("cannot open process stdin file");
+    }
     output = open_redirect(stdout_path);
     if (stdout_path && output == INVALID_HANDLE_VALUE) {
+        if (input != INVALID_HANDLE_VALUE) CloseHandle(input);
         throw std::runtime_error("cannot open process stdout file");
     }
     error = open_redirect(stderr_path);
     if (stderr_path && error == INVALID_HANDLE_VALUE) {
+        if (input != INVALID_HANDLE_VALUE) CloseHandle(input);
         if (output != INVALID_HANDLE_VALUE) CloseHandle(output);
         throw std::runtime_error("cannot open process stderr file");
     }
@@ -86,9 +97,10 @@ int run_native_program(
     STARTUPINFOW startup{};
     startup.cb = sizeof(startup);
     BOOL inherit = FALSE;
-    if (stdout_path || stderr_path) {
+    if (stdin_path || stdout_path || stderr_path) {
         startup.dwFlags = STARTF_USESTDHANDLES;
-        startup.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+        startup.hStdInput =
+            input != INVALID_HANDLE_VALUE ? input : GetStdHandle(STD_INPUT_HANDLE);
         startup.hStdOutput =
             output != INVALID_HANDLE_VALUE ? output : GetStdHandle(STD_OUTPUT_HANDLE);
         startup.hStdError =
@@ -102,6 +114,7 @@ int run_native_program(
         &startup, &process);
     const DWORD create_error = created ? ERROR_SUCCESS : GetLastError();
 
+    if (input != INVALID_HANDLE_VALUE) CloseHandle(input);
     if (output != INVALID_HANDLE_VALUE) CloseHandle(output);
     if (error != INVALID_HANDLE_VALUE) CloseHandle(error);
 
@@ -125,7 +138,8 @@ int run_native_program(
     const fs::path& program,
     const std::vector<NativeText>& arguments,
     const std::optional<fs::path>& stdout_path,
-    const std::optional<fs::path>& stderr_path) {
+    const std::optional<fs::path>& stderr_path,
+    const std::optional<fs::path>& stdin_path) {
     std::vector<std::string> storage;
     storage.reserve(arguments.size() + 1);
     storage.push_back(program.string());
@@ -139,14 +153,15 @@ int run_native_program(
     const pid_t pid = ::fork();
     if (pid < 0) throw std::runtime_error("failed to fork process");
     if (pid == 0) {
-        const auto redirect = [](const std::optional<fs::path>& path, int target) {
+        const auto redirect = [](const std::optional<fs::path>& path, int target, int flags) {
             if (!path) return;
-            const int fd = ::open(path->c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
+            const int fd = ::open(path->c_str(), flags, 0666);
             if (fd < 0 || ::dup2(fd, target) < 0) _exit(126);
-            ::close(fd);
+            if (fd != target) ::close(fd);
         };
-        redirect(stdout_path, STDOUT_FILENO);
-        redirect(stderr_path, STDERR_FILENO);
+        redirect(stdin_path, STDIN_FILENO, O_RDONLY);
+        redirect(stdout_path, STDOUT_FILENO, O_WRONLY | O_CREAT | O_TRUNC);
+        redirect(stderr_path, STDERR_FILENO, O_WRONLY | O_CREAT | O_TRUNC);
         ::execvp(program.c_str(), argv.data());
         _exit(errno == ENOENT ? 127 : 126);
     }
@@ -161,6 +176,14 @@ int run_native_program(
     return 1;
 }
 #endif
+
+int run_native_program(
+    const fs::path& program,
+    const std::vector<NativeText>& arguments,
+    const std::optional<fs::path>& stdout_path,
+    const std::optional<fs::path>& stderr_path) {
+    return run_native_program(program, arguments, stdout_path, stderr_path, std::nullopt);
+}
 
 int run_program(
     const fs::path& program,

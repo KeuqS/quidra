@@ -196,7 +196,7 @@ void ModuleEmitter::collect_array_casts_and_clones() {
 }
 
 void ModuleEmitter::emit_header() {
-    if(debug_) debug_->emit_source_filename(text_);
+    DebugModule::emit_source_filename(module_,text_);
 }
 
 void ModuleEmitter::emit_prelude() {

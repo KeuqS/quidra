@@ -3,7 +3,8 @@
 # called from C: the values of every exported scalar type cross the boundary
 # unchanged in both directions; C can call back into Quidra while Quidra code
 # runs (export -> extern C -> export); host threads call an export
-# concurrently; a runtime failure inside an exported function is reported at
+# concurrently; host exit callbacks can allocate through exports; a runtime
+# failure inside an exported function is reported at
 # its Quidra source and ends the process with status 101 before control
 # returns to C; and an exported function that leaves a failing deferred GPU
 # check behind reports it before it returns. The C side is compiled with
@@ -14,6 +15,9 @@ set -euo pipefail
 
 QUIDRA="$1"
 CC="${CC:-cc}"
+# Sanitizer builds supply the runtime's compiler for compatible host links.
+# Compile the host sources separately so they remain C with either driver.
+HOST_LINKER="${2:-$CC}"
 HELPER="$(cd "$(dirname "$0")" && pwd)/runtime_report.py"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
@@ -36,10 +40,10 @@ build() {
         { cat "$TMP/$name.build"; return 1; }
 }
 
-# run NAME: runs $TMP/NAME from $TMP; sets rc.
+# run NAME [args...]: runs $TMP/NAME from $TMP; sets rc.
 run() {
     rc=0
-    (cd "$TMP" && perl -e 'alarm shift; exec @ARGV' 120 "./$1" > "$TMP/$1.out" 2> "$TMP/$1.err") || rc=$?
+    (cd "$TMP" && perl -e 'alarm shift; exec @ARGV' 120 "./$1" "${@:2}" > "$TMP/$1.out" 2> "$TMP/$1.err") || rc=$?
 }
 
 cat > "$TMP/exports.qui" <<'QUI'
@@ -365,8 +369,9 @@ C
 if "$QUIDRA" build "$TMP/add.qui" --lib -o "$TMP/libadd.a" --print-link-flags \
         > "$TMP/flags" 2> "$TMP/lib.build"; then
     read -r -a link_flags < "$TMP/flags"
-    if "$CC" -std=c11 "$TMP/host.c" "$TMP/libadd.a" "${link_flags[@]}" -o "$TMP/host" \
-            2> "$TMP/host.link"; then
+    if "$CC" -std=c11 -c "$TMP/host.c" -o "$TMP/host.o" 2> "$TMP/host.link" &&
+       "$HOST_LINKER" "$TMP/host.o" "$TMP/libadd.a" "${link_flags[@]}" -o "$TMP/host" \
+            2>> "$TMP/host.link"; then
         run host
         if [[ "$rc" -ne 0 ]]; then
             fail "host: exit status $rc"; cat "$TMP/host.out" "$TMP/host.err"
@@ -400,8 +405,9 @@ int main(void) {
 }
 C
 if [[ -f "$TMP/libadd.a" ]] &&
-   "$CC" -std=c11 "$TMP/failing_host.c" "$TMP/libadd.a" "${link_flags[@]}" -o "$TMP/failing_host" \
-       2> "$TMP/failing_host.link"; then
+   "$CC" -std=c11 -c "$TMP/failing_host.c" -o "$TMP/failing_host.o" 2> "$TMP/failing_host.link" &&
+   "$HOST_LINKER" "$TMP/failing_host.o" "$TMP/libadd.a" "${link_flags[@]}" -o "$TMP/failing_host" \
+       2>> "$TMP/failing_host.link"; then
     run failing_host
     if [[ "$rc" -ne 101 ]]; then
         fail "failing_host: exit status $rc, expected 101"; cat "$TMP/failing_host.err"
@@ -413,6 +419,89 @@ if [[ -f "$TMP/libadd.a" ]] &&
     fi
 else
     fail "failing_host: link failed"; cat "$TMP/failing_host.link" 2>/dev/null || true
+fi
+
+# Host exit callbacks can call allocating exports after the main thread's
+# ordinary work, on both normal return and a fatal Quidra runtime failure.
+# Two callbacks, each with repeated allocations, exercise pool reuse and
+# reentry even when a callback's runtime cleanup runs before the next one.
+# The late mode first enters the runtime from an exit callback.
+cat > "$TMP/atexit.qui" <<'QUI'
+export "C" int32 host_work(int32 x)
+    int32[] values = [x, x + 1]
+    return values[0] + values[1]
+
+export "C" void fail_now()
+    int[4] slots = [1, 2, 3, 4]
+    nat at = len(slots) + 1
+    print(slots[at])
+QUI
+cat > "$TMP/atexit_host.c" <<'C'
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+int32_t host_work(int32_t);
+void fail_now(void);
+static void cleanup(void) {
+    puts("host callback entered");
+    fflush(stdout);
+    if (host_work(4) != 9 || host_work(4) != 9) {
+        fputs("host callback returned an incorrect result\n", stderr);
+        _Exit(2);
+    }
+    puts("host callback result=9");
+    fflush(stdout);
+}
+int main(int argc, char** argv) {
+    if (atexit(cleanup) != 0 || atexit(cleanup) != 0) return 2;
+    if (argc < 2 || strcmp(argv[1], "late") != 0) {
+        if (host_work(3) != 7 || host_work(3) != 7) return 3;
+        puts("before result=7");
+        fflush(stdout);
+    }
+    if (argc > 1 && strcmp(argv[1], "fatal") == 0) {
+        fail_now();
+        puts("fatal call returned");
+        return 4;
+    }
+    return 0;
+}
+C
+if "$QUIDRA" build "$TMP/atexit.qui" --lib -o "$TMP/libatexit.a" --print-link-flags \
+        > "$TMP/atexit.flags" 2> "$TMP/atexit.build"; then
+    read -r -a atexit_link_flags < "$TMP/atexit.flags"
+    if compile atexit_host &&
+       "$HOST_LINKER" "$TMP/atexit_host.o" "$TMP/libatexit.a" "${atexit_link_flags[@]}" \
+           -o "$TMP/atexit_host" 2> "$TMP/atexit_host.link"; then
+        for mode in normal fatal late; do
+            expected_status=0
+            expected_output=$'host callback entered\nhost callback result=9\nhost callback entered\nhost callback result=9'
+            if [[ "$mode" != late ]]; then
+                expected_output=$'before result=7\n'"$expected_output"
+            fi
+            if [[ "$mode" == fatal ]]; then
+                expected_status=101
+            fi
+            run atexit_host "$mode"
+            if [[ "$rc" -ne "$expected_status" ]]; then
+                fail "atexit $mode: exit status $rc, expected $expected_status"
+                cat "$TMP/atexit_host.out" "$TMP/atexit_host.err"
+            elif [[ "$(cat "$TMP/atexit_host.out")" != "$expected_output" ]]; then
+                fail "atexit $mode: callback output"; cat "$TMP/atexit_host.out"
+            elif [[ "$mode" != fatal && -s "$TMP/atexit_host.err" ]]; then
+                fail "atexit $mode: unexpected diagnostics"; cat "$TMP/atexit_host.err"
+            elif [[ "$mode" == fatal ]] &&
+                 ! python3 "$HELPER" "$TMP/atexit_host.err" kind=runtime_error code=INDEX_BOUNDS \
+                     'file=/atexit\.qui$/' line=8 snippet=yes; then
+                fail "atexit fatal: report"; cat "$TMP/atexit_host.err"
+            fi
+        done
+    else
+        fail "atexit host: build failed"; cat "$TMP/atexit_host.link" 2>/dev/null || true
+    fi
+else
+    fail "atexit library: build failed"; cat "$TMP/atexit.build"
 fi
 
 # The root of a library holds declarations only, and exports something.

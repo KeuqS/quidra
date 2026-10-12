@@ -348,6 +348,7 @@ ValueId ExpressionLowering::lower_string_template(const StringTemplateExpr& n) {
             const auto& format=n.formats[i];
             builder_.emit(FormatNumber{converted,part,pt,format.integer_width,
                 format.fractional_digits,format.significant_digits,format.zero});
+            if(part_owned) release_owned(builder_,part,pt);
             part=converted;
             part_owned=true;
         }else if(pt.kind==TypeKind::Error){
@@ -361,6 +362,7 @@ ValueId ExpressionLowering::lower_string_template(const StringTemplateExpr& n) {
             auto converted=builder_.fresh();
             if(pt.kind==TypeKind::Tuple || pt.kind==TypeKind::Union)converted=value_text(builder_,part,pt);
             else builder_.emit(ToString{converted,part,pt});
+            if(part_owned) release_owned(builder_,part,pt);
             part=converted;
             part_owned=true;
         }

@@ -19,6 +19,8 @@
 // Release links then strip debug data (-Wl,-S on Mach-O, --strip-debug on
 // ELF): the object carries line tables, and ld64 would write a debug map
 // naming it, so builds of the same inputs would differ.
+// LLVM input is redirected through stdin: sanitizer metadata otherwise
+// embeds the temporary input filename even with a source_filename header.
 //
 // A recipe is made in one of two modes:
 // - build (no LinkRecording): exactly the commands `quidra build` runs, with
@@ -87,7 +89,8 @@ struct NativeStep {
     std::vector<platform::NativeText> arguments;
     // Run mode only, passed after `arguments`.
     std::vector<platform::NativeText> recording_arguments;
-    // compile: the native source; link: unused.
+    // compile: the native source; module/link: the LLVM file fed to stdin;
+    // call_sites: the object whose line table is read.
     std::filesystem::path source;
     // compile: the object; link: the executable.
     std::filesystem::path output;

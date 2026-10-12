@@ -1,5 +1,6 @@
 #include "device_backend.hpp"
 #include "runtime_counters.hpp"
+#include "runtime_internal.hpp"
 #include "runtime_location.hpp"
 #include "runtime_report.hpp"
 #include "node_failure.hpp"
@@ -208,6 +209,7 @@ template <class WriteMessage>
     // the root file.
     source_provenance = nullptr;
     user_statement = nullptr;
+    quidra::runtime::preserve_managed_state_for_exit();
     quidra::device::exit_failed_program();
 }
 

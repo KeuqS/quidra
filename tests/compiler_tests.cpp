@@ -6,6 +6,7 @@
 #include "quidra/frontend.hpp"
 #include "quidra/ir.hpp"
 #include "quidra/ir/dtype.hpp"
+#include "quidra/lowering.hpp"
 #include "quidra/package_lock.hpp"
 #include "quidra/source_tools.hpp"
 #include "quidra/standard_classes.hpp"
@@ -49,6 +50,78 @@ static void capture_source(const char* helper, const std::string& source,
     if (!code.empty()) expect << "code " << code << "\n";
     if (replay_prefix_bytes) expect << "replay_prefix_bytes " << replay_prefix_bytes << "\n";
 }
+static void string_templates_release_owned_inputs() {
+    using namespace quidra;
+    struct Case {
+        const char* expression;
+        TypeKind kind;
+        bool formatted;
+        bool owned;
+    };
+    const Case cases[] = {
+        {"x ^ half", TypeKind::Real, false, true},
+        {"x ^ half:frac=2", TypeKind::Real, true, true},
+        {"z - z", TypeKind::Com, false, true},
+        {"real32(x)", TypeKind::Union, false, true},
+        {"x", TypeKind::Real, false, false},
+        {"x:frac=2", TypeKind::Real, true, false},
+        {"z", TypeKind::Com, false, false},
+    };
+    for (const auto& test : cases) {
+        const std::string source =
+            "real x = 2.0\nreal half = 0.5\ncom z = 0.5 + 0.25i\n"
+            "string text = \"{" + std::string(test.expression) + "}\"\n";
+        capture_source("string_template_ownership", source);
+        const auto module = ir::lower(quidra::check(source));
+        bool found = false;
+        for (const auto& function : module.functions) {
+            if (!function.entrypoint) continue;
+            ir::ValueId input = 0;
+            std::size_t converted_at = 0;
+            std::size_t position = 0;
+            for (const auto& block : function.blocks) {
+                for (const auto& instruction : block.instructions) {
+                    ++position;
+                    if (const auto* text = std::get_if<ir::ToString>(&instruction);
+                        text && !test.formatted && text->source_type.kind == test.kind) {
+                        input = text->value;
+                        converted_at = position;
+                    } else if (const auto* format = std::get_if<ir::FormatNumber>(&instruction);
+                               format && test.formatted && format->source_type.kind == test.kind) {
+                        input = format->value;
+                        converted_at = position;
+                    } else if (const auto* tag = std::get_if<ir::VariantTag>(&instruction);
+                               tag && test.kind == TypeKind::Union) {
+                        input = tag->container;
+                        converted_at = position;
+                    }
+                }
+            }
+            if (!input) continue;
+            found = true;
+            position = 0;
+            std::size_t releases = 0;
+            for (const auto& block : function.blocks) {
+                for (const auto& instruction : block.instructions) {
+                    ++position;
+                    if (const auto* release = std::get_if<ir::Release>(&instruction);
+                        release && release->value == input && position > converted_at) {
+                        ++releases;
+                    }
+                }
+            }
+            if (releases == static_cast<std::size_t>(test.owned)) continue;
+            std::cerr << "string template input has " << releases << " releases: "
+                      << test.expression << "\n" << ir::dump(module);
+            std::exit(1);
+        }
+        if (!found) {
+            std::cerr << "string template conversion missing: " << test.expression << "\n";
+            std::exit(1);
+        }
+    }
+}
+
 static void good(const std::string& s) {
     capture_source("good", s);
     try {
@@ -3696,6 +3769,7 @@ auto indirect = operation(tensor.ones<real32>([2, 2]))
 }
 
 int main(){
+    string_templates_release_owned_inputs();
     inspect_contains("int[] x = [1]\nint[] y = [2]\nfor int a = x[], int b = y[]\n    print(a + b)\n", "\"collection_count\":2");
     inspect_contains("int[] x = [1]\nint[] y = [2]\nfor int a = x[], int b = y[]\n    print(a + b)\n", "ForCollectionBinding");
     good("nat[2] expected_shape = [2, 3]\nparallel\n    tensor<real32>{nat N, N + 1} a = tensor.zeros<real32>([2, 3])\n    tensor<real32>{N, N + 1} b = tensor.ones<real32>()\n    print(b.shape() == expected_shape)\n");
@@ -4086,6 +4160,16 @@ match string.from_utf8(bin(data))
         print("not a number")
         print(NL)
 )", "parse.direct");
+ // A direct parse still emits a constant error record. Its type detail must
+ // keep its backing string alive until the message and details are interned.
+ llvm_contains(R"(match int64.parse("42")
+    int64 value
+        print(value)
+        print(NL)
+    error
+        print("not a number")
+        print(NL)
+)", "cannot parse numeric input as int64");
  // A bound error is read, so the match goes through the parse whose error
  // block knows why it failed.
  ir_contains(R"(match int64.parse("42")

@@ -38,6 +38,11 @@ void recycle_taken(const TakenAllocation& taken);
 bool is_managed(const void* value);
 std::size_t managed_owners(const void* value);
 
+// A fatal exit does not unwind the active Quidra frames. Keep their allocation
+// context valid through the C host's exit callbacks, until process termination.
+// This does not allocate, run drops or change normal thread teardown.
+void preserve_managed_state_for_exit();
+
 // A new managed string holding `text` (valid UTF-8 without NUL).
 char* managed_text_copy(std::string_view text);
 

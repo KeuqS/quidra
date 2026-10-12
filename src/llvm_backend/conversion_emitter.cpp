@@ -1121,7 +1121,8 @@ void ConversionEmitter::emit(const ir::ParseNumberDirect& n,const ir::Instructio
     // The idiom applies to a match whose error case binds no name, so the
     // error is never read; it is named, as the site's record of text that
     // is not a number, so that nothing is made on success.
-    const std::array details{abi::ErrorDetailValue::name_value(type_name(n.target_type)),
+    const auto type=type_name(n.target_type);
+    const std::array details{abi::ErrorDetailValue::name_value(type),
                              abi::ErrorDetailValue::name_value(abi::parse_reasons[0])};
     copy_by_zero_gep(builder_,symbols_.value(n.error_out),Inbounds::yes,
                      LlvmOperand::global(records_.record(abi::ErrorValueCode::numeric_parse,details,n.line,n.column)));

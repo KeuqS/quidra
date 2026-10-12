@@ -794,6 +794,15 @@ if(BUILD_TESTING AND NOT QUIDRA_BUILD_WASM_FRONTEND)
   target_include_directories(quidra_platform_sha256_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
   add_test(NAME quidra_platform_sha256_tests COMMAND quidra_platform_sha256_tests)
 
+  add_executable(quidra_platform_process_tests
+      tests/platform_process_tests.cpp
+      src/platform/file_descriptor.cpp
+      src/platform/native_text.cpp
+      src/platform/process.cpp
+      src/platform/temporary_directory.cpp)
+  target_include_directories(quidra_platform_process_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
+  add_test(NAME quidra_platform_process_tests COMMAND quidra_platform_process_tests)
+
   # The native link recipe with the host toolchain: build and run modes, the
   # template, the run-mode recording, and byte-identical executables.
   add_executable(quidra_native_link_recipe_tests
@@ -814,6 +823,9 @@ if(BUILD_TESTING AND NOT QUIDRA_BUILD_WASM_FRONTEND)
       src/platform/temporary_directory.cpp)
   target_include_directories(quidra_native_link_recipe_tests PRIVATE
       ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/include)
+  if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU" AND CMAKE_CXX_FLAGS MATCHES "sanitize")
+    target_compile_definitions(quidra_native_link_recipe_tests PRIVATE QUIDRA_SANITIZE_GENERATED=1)
+  endif()
   add_dependencies(quidra_native_link_recipe_tests quidra_runtime)
   add_test(NAME quidra_native_link_recipe_tests COMMAND quidra_native_link_recipe_tests)
   set_tests_properties(quidra_native_link_recipe_tests PROPERTIES
@@ -998,13 +1010,22 @@ if(BUILD_TESTING AND NOT QUIDRA_BUILD_WASM_FRONTEND)
     add_test(NAME quidra_runtime_error_json COMMAND bash ${CMAKE_SOURCE_DIR}/tests/runtime_error_json_tests.sh $<TARGET_FILE:quidra>)
     add_test(NAME quidra_error_values COMMAND bash ${CMAKE_SOURCE_DIR}/tests/error_value_tests.sh $<TARGET_FILE:quidra>)
     add_test(NAME quidra_runtime_trace COMMAND bash ${CMAKE_SOURCE_DIR}/tests/runtime_trace_tests.sh $<TARGET_FILE:quidra>)
+    # External hosts must use the runtime's compiler to resolve sanitizer
+    # instrumentation with its matching runtime. Ordinary builds keep the
+    # scripts' CC/CXX defaults, and the C export sources remain compiled as C.
+    set(QUIDRA_TEST_HOST_LINKER "")
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU" AND CMAKE_CXX_FLAGS MATCHES "sanitize")
+      set(QUIDRA_TEST_HOST_LINKER "${CMAKE_CXX_COMPILER}")
+    endif()
     add_test(NAME quidra_runtime_trace_concurrency
              COMMAND bash ${CMAKE_SOURCE_DIR}/tests/runtime_trace_concurrency_tests.sh
-                     $<TARGET_FILE:quidra> ${CMAKE_SOURCE_DIR})
+                     $<TARGET_FILE:quidra> ${CMAKE_SOURCE_DIR} "${QUIDRA_TEST_HOST_LINKER}")
     add_test(NAME quidra_runtime_tail_trace COMMAND bash ${CMAKE_SOURCE_DIR}/tests/runtime_tail_trace_tests.sh $<TARGET_FILE:quidra>)
     # Exported functions called from C (export "C"): values, reentrancy,
     # concurrent host threads, failures at the boundary.
-    add_test(NAME quidra_c_export COMMAND bash ${CMAKE_SOURCE_DIR}/tests/c_export_tests.sh $<TARGET_FILE:quidra>)
+    add_test(NAME quidra_c_export
+             COMMAND bash ${CMAKE_SOURCE_DIR}/tests/c_export_tests.sh
+                     $<TARGET_FILE:quidra> "${QUIDRA_TEST_HOST_LINKER}")
     add_test(NAME quidra_package_releases COMMAND bash ${CMAKE_SOURCE_DIR}/tests/package_release_tests.sh $<TARGET_FILE:quidra>)
     add_test(NAME quidra_package_metadata_sync COMMAND bash ${CMAKE_SOURCE_DIR}/tests/package_metadata_sync_tests.sh $<TARGET_FILE:quidra>)
     add_test(NAME quidra_structural_traversals COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/structural_traversal_tests.sh $<TARGET_FILE:quidra>)
@@ -1100,6 +1121,7 @@ if(BUILD_TESTING AND NOT QUIDRA_BUILD_WASM_FRONTEND)
     quidra_platform_cache_directory_tests
     quidra_platform_sha256_tests
     quidra_platform_strict_json_tests
+    quidra_platform_process_tests
     quidra_toolchain_identity_tests
     quidra_run_cache_unit_tests
     quidra_tensor_view_bounds_tests
@@ -1139,9 +1161,13 @@ if(BUILD_TESTING AND NOT QUIDRA_BUILD_WASM_FRONTEND)
       quidra_complex
       PROPERTIES TIMEOUT ${QUIDRA_TEST_TIMEOUT}
     )
-    # The CLI and stdlib suites compile and run many programs each, so they
-    # get twice the unit suites' timeout; a hang still fails the run.
+    # The CLI and stdlib suites compile and run many programs each. Fully
+    # instrumented compiler runs need additional cumulative build time;
+    # each suite still has a finite hang guard.
     math(EXPR QUIDRA_PROGRAM_SUITE_TIMEOUT "${QUIDRA_TEST_TIMEOUT} * 2")
+    if(CMAKE_CXX_FLAGS MATCHES "sanitize")
+      math(EXPR QUIDRA_PROGRAM_SUITE_TIMEOUT "${QUIDRA_TEST_TIMEOUT} * 3")
+    endif()
     set_tests_properties(
       quidra_cli
       quidra_stdlib

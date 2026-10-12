@@ -113,13 +113,14 @@ int run_tool(
     const fs::path& program,
     const std::vector<NativeText>& arguments,
     const std::optional<fs::path>& stdout_path,
-    const LinkRecording* recording) {
+    const LinkRecording* recording,
+    const std::optional<fs::path>& stdin_path = std::nullopt) {
     if (!recording) {
-        return platform::run_native_program(program, arguments, stdout_path);
+        return platform::run_native_program(program, arguments, stdout_path, std::nullopt, stdin_path);
     }
     const auto scratch = recording->directory / "tool.stderr";
     const int status =
-        platform::run_native_program(program, arguments, stdout_path, scratch);
+        platform::run_native_program(program, arguments, stdout_path, scratch, stdin_path);
     const auto text = read_bytes(scratch);
     std::error_code ignored;
     fs::remove(scratch, ignored);
@@ -333,7 +334,10 @@ NativeLinkRecipe native_link_recipe(
 #endif
         for (const auto* argument : {"-c", "-x", "ir"})
             module.arguments.push_back(platform::native_text(argument));
-        module.arguments.push_back(llvm.native());
+        // ASan records LLVM's input-buffer identifier, independently of the
+        // source_filename header. Stdin keeps that identifier stable across
+        // output and cache directories while the header names the source.
+        module.arguments.push_back(platform::native_text("-"));
         module.arguments.push_back(platform::native_text("-o"));
         module.arguments.push_back(module_object->native());
         recipe.steps_.push_back(std::move(module));
@@ -382,6 +386,7 @@ NativeLinkRecipe native_link_recipe(
 
     NativeStep link;
     link.kind = NativeStep::Kind::link;
+    link.source = table_module ? *table_module : llvm;
     link.output = output;
     link.required_inputs = link_inputs;
     if (module_object) {
@@ -392,9 +397,9 @@ NativeLinkRecipe native_link_recipe(
     std::vector<NativeText> program;
     if (module_object) {
         program = {module_object->native(), platform::native_text("-x"), platform::native_text("ir"),
-                   table_module->native()};
+                   platform::native_text("-")};
     } else {
-        program = {platform::native_text("-x"), platform::native_text("ir"), llvm.native()};
+        program = {platform::native_text("-x"), platform::native_text("ir"), platform::native_text("-")};
     }
 #ifdef _WIN32
     std::vector<NativeText> arguments{
@@ -535,7 +540,7 @@ int NativeLinkRecipe::execute() const {
         }
         const auto stdout_path = record ? step.trace : std::nullopt;
         if (step.kind == NativeStep::Kind::module) {
-            if (run_tool(step.program, arguments, stdout_path, record) != 0 ||
+            if (run_tool(step.program, arguments, stdout_path, record, step.source) != 0 ||
                 !fs::is_regular_file(step.output)) {
                 throw std::runtime_error(
                     "failed to compile the program's LLVM IR");
@@ -562,7 +567,7 @@ int NativeLinkRecipe::execute() const {
             if (!fs::is_regular_file(input))
                 throw std::runtime_error("--link input is not a regular file: " + input.string());
         }
-        return run_tool(step.program, arguments, stdout_path, record);
+        return run_tool(step.program, arguments, stdout_path, record, step.source);
     }
     throw std::runtime_error("native link recipe has no link step");
 }
@@ -602,6 +607,8 @@ std::string NativeLinkRecipe::template_text() const {
         if (step.kind != NativeStep::Kind::call_sites)
             out += template_literal(utf8(step.program.native()));
         out += "\n";
+        if (step.kind == NativeStep::Kind::module || step.kind == NativeStep::Kind::link)
+            out += "  stdin " + argument_line(step.source.native()) + "\n";
         for (const auto& argument : step.arguments) {
             out += "  ";
             out += argument_line(argument);

@@ -31,8 +31,9 @@ def driver():
     # toolchain override. The production CLI gains no gate options.
     args = sys.argv[2:]
     inputs = [Path(arg) for arg in args if arg.endswith('.ll')]
-    changed = '-c' in args and len(inputs) == 1 and inputs[0].name != 'calls.ll'
-    if changed:
+    stdin_ir = '-c' in args and '-' in args
+    changed = '-c' in args and (stdin_ir or len(inputs) == 1 and inputs[0].name != 'calls.ll')
+    if changed and not stdin_ir:
         shutil.copyfile(os.environ['QUIDRA_GATE_IR'], inputs[0])
     if not changed and '-c' not in args and os.environ.get('QUIDRA_GATE_CAPTURE_LINK') == '1':
         capture = Path(os.environ['QUIDRA_GATE_OBJECT'] + '.inputs')
@@ -54,7 +55,11 @@ def driver():
                     shutil.copyfile(source, destination)
     if '-c' not in args:
         args = ['--driver-mode=g++', *args]
-    result = subprocess.run([os.environ['QUIDRA_GATE_DRIVER'], *args])
+    if stdin_ir:
+        with Path(os.environ['QUIDRA_GATE_IR']).open('rb') as source:
+            result = subprocess.run([os.environ['QUIDRA_GATE_DRIVER'], *args], stdin=source)
+    else:
+        result = subprocess.run([os.environ['QUIDRA_GATE_DRIVER'], *args])
     if result.returncode == 0 and changed:
         output = Path(args[args.index('-o') + 1])
         shutil.copyfile(output, os.environ['QUIDRA_GATE_OBJECT'])

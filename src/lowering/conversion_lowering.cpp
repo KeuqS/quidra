@@ -44,6 +44,7 @@ ValueId ConversionLowering::consume_fail_fast(ValueId container, const Type& sou
     if (hop) {
         // The error leaves the call: a hop, which takes it out of the cell.
         problem = lowerer_.error_hop(container, source, *hop, abi::ErrorHopKind::fail_fast);
+        if (owned) release_owned(builder_, container, source);
     } else {
         problem = builder_.fresh();
         builder_.emit(VariantPayload{problem, container, error_type});

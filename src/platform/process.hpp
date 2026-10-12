@@ -1,10 +1,11 @@
 #pragma once
 
-// Child processes: run a program with arguments and wait for it, with stdout
-// and stderr optionally redirected to files (created or truncated).
+// Child processes: run a program with arguments and wait for it, with stdin
+// optionally read from an existing file and stdout and stderr optionally
+// redirected to files (created or truncated).
 //
 // POSIX forks and execs (execvp, so a bare program name is searched for in
-// PATH); the child's redirect files are created with mode 0666 before the
+// PATH); the child's output files are created with mode 0666 before the
 // umask, and a child that cannot redirect or exec exits with 126, or 127 when
 // the program does not exist. The result is the exit status, or 128 + the
 // signal of a child killed by one, or 1. Windows starts the program with
@@ -28,6 +29,15 @@ int run_native_program(
     const std::vector<NativeText>& arguments,
     const std::optional<std::filesystem::path>& stdout_path = std::nullopt,
     const std::optional<std::filesystem::path>& stderr_path = std::nullopt);
+
+// Also redirects stdin from `stdin_path`, opened read-only. A null path
+// inherits the parent's stdin, as the original four-argument overload does.
+int run_native_program(
+    const std::filesystem::path& program,
+    const std::vector<NativeText>& arguments,
+    const std::optional<std::filesystem::path>& stdout_path,
+    const std::optional<std::filesystem::path>& stderr_path,
+    const std::optional<std::filesystem::path>& stdin_path);
 
 // Runs `program` with UTF-8 arguments on every platform: each is converted
 // to native text once.

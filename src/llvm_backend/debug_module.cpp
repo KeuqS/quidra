@@ -12,15 +12,21 @@
 
 namespace quidra::llvm_backend {
 
-DebugModule::DebugModule(const ir::Module& module)
-    :module_(module),debug_subprograms_(module.functions.size()),
-     debug_locations_(module.functions.size()){
-    for(const auto& f:module_.functions)
-        if(f.entrypoint&&!f.source_file.empty()) { primary_source_=f.source_file; break; }
-    if(primary_source_.empty())
-        for(const auto& f:module_.functions)
-            if(!f.source_file.empty()) { primary_source_=f.source_file; break; }
+namespace {
 
+std::string_view primary_source_file(const ir::Module& module){
+    for(const auto& f:module.functions)
+        if(f.entrypoint&&!f.source_file.empty()) return f.source_file;
+    for(const auto& f:module.functions)
+        if(!f.source_file.empty()) return f.source_file;
+    return {};
+}
+
+} // namespace
+
+DebugModule::DebugModule(const ir::Module& module)
+    :module_(module),primary_source_(primary_source_file(module)),debug_subprograms_(module.functions.size()),
+     debug_locations_(module.functions.size()){
     if(!primary_source_.empty()) {
         debug_files_.emplace(primary_source_,1);
         for(const auto& f:module_.functions) {
@@ -45,12 +51,12 @@ std::size_t DebugModule::file_id(std::size_t function)const{
     return debug_subprograms_[function]?debug_files_.at(module_.functions[function].source_file):0;
 }
 
-void DebugModule::emit_source_filename(llvm_text::LlvmModule& module)const{
-    if(!primary_source_.empty()) {
-        const auto path=std::filesystem::path(primary_source_);
-        module.append(llvm_text::LlvmModule::Section::header,
-                      "source_filename = \""+llvm_text::escape_metadata(path.filename().string())+"\"\n");
-    }
+void DebugModule::emit_source_filename(const ir::Module& source,llvm_text::LlvmModule& module){
+    const auto primary=primary_source_file(source);
+    const auto filename=primary.empty()?std::string("<memory>")
+                                        :std::filesystem::path(primary).filename().string();
+    module.append(llvm_text::LlvmModule::Section::header,
+                  "source_filename = \""+llvm_text::escape_metadata(filename)+"\"\n");
 }
 
 void DebugModule::emit_metadata(llvm_text::LlvmModule& module)const{

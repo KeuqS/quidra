@@ -60,6 +60,11 @@ std::vector<std::string> c_host_link_flags(const std::vector<std::string>& pkg_c
 #else
     flags.emplace_back("-lstdc++");
 #endif
+#ifdef QUIDRA_SANITIZE_GENERATED
+    // Generated objects and an instrumented runtime archive require the same
+    // sanitizer runtimes when linked by an external host as by Quidra itself.
+    flags.emplace_back("-fsanitize=address,undefined");
+#endif
     for (auto& flag : system_link_libraries()) flags.push_back(std::move(flag));
     for (auto& flag : dependency_link_flags(pkg_config_libraries, uses_cuda, uses_http))
         flags.push_back(std::move(flag));

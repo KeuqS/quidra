@@ -8,8 +8,8 @@
 namespace quidra::lowering {
 namespace {
 template<class Field> bool reflected_reference_field(const Field& field) {
-    if constexpr(requires{field.reference;})return field.reference;
-    return false;
+    if constexpr(requires{field.reference;}) return field.reference;
+    else return false;
 }
 }
 

@@ -224,10 +224,10 @@ public:
     // result = phi type [ value, %block ], ...
     void phi(std::string_view result, LlvmType type, std::initializer_list<LlvmIncoming> incoming);
     // result = extractvalue aggregate value, index
-    void extractvalue(std::string_view result, LlvmType aggregate, LlvmOperand value, unsigned index);
+    void extractvalue(std::string_view result, LlvmType aggregate, LlvmOperand value, std::size_t index);
     // result = insertvalue aggregate value, element, index
     void insertvalue(std::string_view result, LlvmType aggregate, LlvmOperand value,
-                     LlvmValue element, unsigned index);
+                     LlvmValue element, std::size_t index);
     // [result = ]call type callee(arguments)
     void call(std::string_view result, LlvmType type, LlvmOperand callee,
               std::initializer_list<LlvmValue> arguments);

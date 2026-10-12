@@ -96,8 +96,8 @@ void EffectSummaries::set_isolated(std::set<const Expr*> arguments) {
 namespace {
 
 template<class Field> bool reference_field(const Field& field) {
-    if constexpr(requires{field.reference;})return field.reference;
-    return false;
+    if constexpr(requires{field.reference;}) return field.reference;
+    else return false;
 }
 
 bool is_reference_member(const CheckedProgram& checked,const Type& type,const std::string& name) {

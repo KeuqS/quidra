@@ -15,8 +15,8 @@ namespace quidra::lowering {
 namespace {
 
 template<class Field> bool reference_field(const Field& field) {
-    if constexpr(requires{field.reference;})return field.reference;
-    return false;
+    if constexpr(requires{field.reference;}) return field.reference;
+    else return false;
 }
 
 // The binding an expression's storage belongs to: the name at the base of its

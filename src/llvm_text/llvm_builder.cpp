@@ -202,7 +202,7 @@ void LlvmBuilder::phi(std::string_view result, LlvmType type, std::initializer_l
 }
 
 void LlvmBuilder::extractvalue(std::string_view result, LlvmType aggregate, LlvmOperand value,
-                               unsigned index) {
+                               std::size_t index) {
     assign(result);
     put("extractvalue ");
     put_type(aggregate);
@@ -214,7 +214,7 @@ void LlvmBuilder::extractvalue(std::string_view result, LlvmType aggregate, Llvm
 }
 
 void LlvmBuilder::insertvalue(std::string_view result, LlvmType aggregate, LlvmOperand value,
-                              LlvmValue element, unsigned index) {
+                              LlvmValue element, std::size_t index) {
     assign(result);
     put("insertvalue ");
     put_type(aggregate);

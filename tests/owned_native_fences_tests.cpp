@@ -36,6 +36,16 @@ struct FakeApi {
                 [this] {++releases;return std::string{};}};
     }
 };
+// CTest prints captured stderr for failures. These checkpoints identify which
+// allocation-free fence scenario triggered a Windows fail-fast exit.
+static void windows_stage(const char* name) {
+#ifdef _WIN32
+    std::fprintf(stderr,"native-fences stage: %s\n",name);
+    std::fflush(stderr);
+#else
+    (void)name;
+#endif
+}
 int main(int argc,char** argv) {
     if(argc==2&&std::strcmp(argv[1],"--unknown-oom")==0) {
         FakeApi api;
@@ -74,6 +84,7 @@ int main(int argc,char** argv) {
         });
         return 1;
     }
+    windows_stage("reservation and no-alloc drain");
     // Reservation, publication, success drain, failure completion and view
     // retention require no allocation after work has begun.
     {
@@ -93,6 +104,7 @@ int main(int argc,char** argv) {
         reject_allocations=false;
         assert(reserved_api.waits==1&&reserved_api.releases==1);
     }
+    windows_stage("out-of-order publication");
     // An earlier reservation can publish after a later one, as package
     // epochs do. A serial boundary must still drain the earlier cell.
     {
@@ -109,6 +121,7 @@ int main(int argc,char** argv) {
         assert(earlier->idle()&&!later->idle());
         assert(reserved_fences.drain(10,reserved_fences.boundary(10)).empty()&&later->idle());
     }
+    windows_stage("retained callback");
     // A completed callback keeps its immutable outcome owner alive after
     // removal from a queue/map and after an earlier outcome is inserted.
     {
@@ -140,6 +153,7 @@ int main(int argc,char** argv) {
         auto completed=std::move(*callback);callback.reset();
         assert(&completed.invoke(11)==&view&&!lifetime.expired());
     }
+    windows_stage("owned completion");
     FakeApi api;
     auto first=std::make_shared<parallel::DeferredNode>();
     auto second=std::make_shared<parallel::DeferredNode>();
@@ -159,6 +173,7 @@ int main(int argc,char** argv) {
     assert(second->idle()&&second->first_failure()->message=="second only");
     assert(foreign->idle()&&!foreign->first_failure());
     assert(api.waits==2&&api.releases==2);
+    windows_stage("serial boundary");
     // A boundary covers only the submission serials recorded before it.
     auto later=std::make_shared<parallel::DeferredNode>();
     {
@@ -166,6 +181,7 @@ int main(int argc,char** argv) {
     }
     assert(fences.drain(0,boundary).empty()&&!later->idle());
     assert(fences.drain(0,fences.boundary(0)).empty()&&later->idle());
+    windows_stage("nested owner scopes");
     // Nested scopes retain separate owners even on the same device.
     auto parent=std::make_shared<parallel::DeferredNode>();
     auto child=std::make_shared<parallel::DeferredNode>();
@@ -183,6 +199,7 @@ int main(int argc,char** argv) {
     assert(fences.drain(1,fences.boundary(1)).empty());
     assert(parent->idle()&&!parent->first_failure());
     assert(child->idle()&&child->first_failure()->message=="child only");
+    windows_stage("event cleanup");
     // Event cleanup precedes ticket completion and any later failure capture.
     auto cleanup_owner=std::make_shared<parallel::DeferredNode>();
     bool cleaned=false;
@@ -194,6 +211,7 @@ int main(int argc,char** argv) {
     }
     assert(fences.drain(2,fences.boundary(2)).empty());
     assert(cleaned&&cleanup_owner->first_failure());
+    windows_stage("multithreaded submissions");
     // Submission locks serialize one device without sharing another lock.
     auto concurrent=std::make_shared<parallel::DeferredNode>();
     std::vector<std::thread> workers;
@@ -206,6 +224,7 @@ int main(int argc,char** argv) {
         });
     for(auto& worker:workers)worker.join();
     assert(fences.drain(3,fences.boundary(3)).empty()&&concurrent->idle());
+    windows_stage("unattributed failure");
     // Low-level unknown result exists only until drain_or_fail invokes its
     // immediate fatal callback. It must never be retried by runtime joins.
     auto ambiguous=std::make_shared<parallel::DeferredNode>();

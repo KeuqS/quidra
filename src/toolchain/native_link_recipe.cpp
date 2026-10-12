@@ -405,8 +405,8 @@ NativeLinkRecipe native_link_recipe(
     std::vector<NativeText> arguments{
         (debug || !optimize) ? L"-O0" : L"-O3",
         L"-fms-runtime-lib=dll",
-        L"-Xlinker",
-        L"/NODEFAULTLIB:libcmt",
+        // Let clang choose the matching MSVC CRT startup library; excluding
+        // libcmt explicitly left mainCRTStartup unresolved on hosted Windows.
         L"-Wno-override-module",
     };
     arguments.insert(arguments.end(), program.begin(), program.end());

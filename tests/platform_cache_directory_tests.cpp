@@ -48,25 +48,34 @@ void expect_root(CacheDirectoryConvention convention, const CacheDirectoryInputs
           name + ": expected " + shown(expected) + ", got " + shown(actual));
 }
 
+// Give synthetic POSIX-style fixtures a native absolute root on Windows.
+std::string fixture_absolute(const char* unix_path) {
+#ifdef _WIN32
+    return std::string("C:") + unix_path;
+#else
+    return unix_path;
+#endif
+}
+
 void location_rules() {
     using C = CacheDirectoryConvention;
     CacheDirectoryInputs inputs;
-    inputs.working_directory = "/work/project";
+    inputs.working_directory = fixture_absolute("/work/project");
 
-    inputs.home = "/home/ada";
-    expect_root(C::macos, inputs, fs::path("/home/ada/Library/Caches/Quidra"), "macOS home");
-    expect_root(C::xdg, inputs, fs::path("/home/ada/.cache/quidra"), "XDG home");
+    inputs.home = fixture_absolute("/home/ada");
+    expect_root(C::macos, inputs, fs::path(fixture_absolute("/home/ada/Library/Caches/Quidra")), "macOS home");
+    expect_root(C::xdg, inputs, fs::path(fixture_absolute("/home/ada/.cache/quidra")), "XDG home");
     expect_root(C::windows, inputs, std::nullopt, "Windows without the known folder");
 
-    inputs.xdg_cache_home = "/var/cache/ada";
-    expect_root(C::xdg, inputs, fs::path("/var/cache/ada/quidra"), "XDG_CACHE_HOME");
-    expect_root(C::macos, inputs, fs::path("/home/ada/Library/Caches/Quidra"),
+    inputs.xdg_cache_home = fixture_absolute("/var/cache/ada");
+    expect_root(C::xdg, inputs, fs::path(fixture_absolute("/var/cache/ada/quidra")), "XDG_CACHE_HOME");
+    expect_root(C::macos, inputs, fs::path(fixture_absolute("/home/ada/Library/Caches/Quidra")),
                 "macOS ignores XDG_CACHE_HOME");
     inputs.xdg_cache_home = "relative/cache";
-    expect_root(C::xdg, inputs, fs::path("/home/ada/.cache/quidra"),
+    expect_root(C::xdg, inputs, fs::path(fixture_absolute("/home/ada/.cache/quidra")),
                 "a relative XDG_CACHE_HOME is ignored");
     inputs.xdg_cache_home = "";
-    expect_root(C::xdg, inputs, fs::path("/home/ada/.cache/quidra"),
+    expect_root(C::xdg, inputs, fs::path(fixture_absolute("/home/ada/.cache/quidra")),
                 "an empty XDG_CACHE_HOME is ignored");
     inputs.xdg_cache_home.reset();
 
@@ -78,13 +87,13 @@ void location_rules() {
     expect_root(C::xdg, inputs, std::nullopt, "XDG with an empty HOME");
     inputs.home = "relative/home";
     expect_root(C::xdg, inputs, std::nullopt, "XDG with a relative HOME");
-    inputs.xdg_cache_home = "/xdg";
-    expect_root(C::xdg, inputs, fs::path("/xdg/quidra"),
+    inputs.xdg_cache_home = fixture_absolute("/xdg");
+    expect_root(C::xdg, inputs, fs::path(fixture_absolute("/xdg/quidra")),
                 "XDG_CACHE_HOME without a usable HOME");
     inputs.xdg_cache_home.reset();
 
-    inputs.local_app_data = fs::path("/profiles/ada/AppData/Local");
-    expect_root(C::windows, inputs, fs::path("/profiles/ada/AppData/Local/Quidra/Cache"),
+    inputs.local_app_data = fs::path(fixture_absolute("/profiles/ada/AppData/Local"));
+    expect_root(C::windows, inputs, fs::path(fixture_absolute("/profiles/ada/AppData/Local/Quidra/Cache")),
                 "Windows known folder");
     inputs.local_app_data = fs::path("relative");
     expect_root(C::windows, inputs, std::nullopt, "a relative known folder");
@@ -92,11 +101,11 @@ void location_rules() {
 
     for (const auto convention : {C::macos, C::xdg, C::windows}) {
         auto configured = inputs;
-        configured.home = "/home/ada";
-        configured.quidra_cache_dir = "/tmp/quidra-cache/../q";
-        expect_root(convention, configured, fs::path("/tmp/q"), "absolute QUIDRA_CACHE_DIR");
+        configured.home = fixture_absolute("/home/ada");
+        configured.quidra_cache_dir = fixture_absolute("/tmp/quidra-cache/../q");
+        expect_root(convention, configured, fs::path(fixture_absolute("/tmp/q")), "absolute QUIDRA_CACHE_DIR");
         configured.quidra_cache_dir = "cache/dir";
-        expect_root(convention, configured, fs::path("/work/project/cache/dir"),
+        expect_root(convention, configured, fs::path(fixture_absolute("/work/project/cache/dir")),
                     "relative QUIDRA_CACHE_DIR");
         configured.quidra_cache_dir = "";
         const auto fallback = user_cache_directory(convention, configured);

@@ -3129,8 +3129,13 @@ static void source_table_names_every_user_file() {
         const auto revision = quidra::platform::sha256_hex(main);
         for (const auto& text : {std::string("app/main.qui"), std::string("app/lib/pick.qui"),
                                  (root / "main.qui").lexically_normal().string(), revision}) {
-            require(llvm.find("c\"" + text + "\\00\"") != std::string::npos,
-                    "the table names " + text, "");
+            const auto expected = "c\"" + text + "\\00\"";
+            const auto probe = llvm.find("pick.qui");
+            const auto nearby = probe == std::string::npos
+                ? llvm.substr(0, 1500)
+                : llvm.substr(probe > 160 ? probe - 160 : 0, 350);
+            require(llvm.find(expected) != std::string::npos,
+                    "the table names " + text, nearby);
         }
         require(llvm.find(", i64 8, i64 " + std::to_string(std::string(main).size()) + " }") !=
                     std::string::npos,

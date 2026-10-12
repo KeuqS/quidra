@@ -1014,9 +1014,14 @@ void readers_against_evictor() {
     Scratch scratch;
     const auto root = scratch.path() / "root";
     auto store = RunCacheStore::open(root, "0.5.0", "t");
+    if (!store) {
+        check(false, "the reader's cache store opens");
+        return;
+    }
     const pid_t evictor = ::fork();
     if (evictor == 0) {
         auto own = RunCacheStore::open(root, "0.5.0", "t");
+        if (!own) _exit(2);
         RunCacheEvictionPolicy none;
         none.limit_bytes = 1;
         none.recent_use = std::chrono::seconds(0);
@@ -1027,10 +1032,20 @@ void readers_against_evictor() {
     }
     int seen = 0;
     int missed = 0;
+    int staged = 0;
     for (int round = 0; round < 200; ++round) {
         const char key = static_cast<char>('a' + round % 6);
         {
             auto staging = store->create_staging();
+            // A scanner can make cache staging temporarily unavailable. A
+            // cache miss is allowed; dereferencing a failed staging attempt
+            // is not. Also verify below that staging never disappears for
+            // the entire test.
+            if (!staging) {
+                ++missed;
+                continue;
+            }
+            ++staged;
             fill_entry(*staging, std::string(4096, key));
             (void)store->publish(*staging, digest(key));
         }
@@ -1049,6 +1064,7 @@ void readers_against_evictor() {
     int status = 0;
     ::waitpid(evictor, &status, 0);
     check(WIFEXITED(status) && WEXITSTATUS(status) == 0, "the evictor finished");
+    check(staged > 0, "cache staging was available during concurrent eviction");
     check(seen + missed == 200, "every reader saw an entry or a miss");
 }
 

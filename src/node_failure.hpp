@@ -162,6 +162,11 @@ struct NodeCleanupFrame {
 };
 inline bool finish_node_frames(NodeFailureScope* scope);
 inline thread_local NodeFailureScope* current_node_failure{};
+#ifdef _MSC_VER
+// std::jmp_buf intentionally imposes alignment padding.
+#pragma warning(push)
+#pragma warning(disable: 4324)
+#endif
 struct NodeFailureScope {
     NodeFailureScope* previous{current_node_failure};
     std::unique_ptr<OwnedNodeReport> report;
@@ -182,6 +187,9 @@ struct NodeFailureScope {
         current_node_failure = previous;
     }
 };
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
 inline bool node_failure_active() noexcept {return current_node_failure != nullptr;}
 [[noreturn]] inline void capture_node_failure(const ReportHead& head,
         ReportLocation location, std::string_view message, const ReportData& data,
@@ -208,6 +216,11 @@ inline bool call_node_body(NodeBody body, void* frame) {
 }
 // The catch and every runtime C++ frame have returned before this jump.
 // This frame contains only pointers and the setjmp expression.
+#ifdef _MSC_VER
+// All nontrivial C++ frames unwind in call_node_body before longjmp.
+#pragma warning(push)
+#pragma warning(disable: 4611)
+#endif
 inline bool invoke_node_body(NodeFailureScope* scope, NodeBody body, void* frame) {
     if (setjmp(scope->target) != 0) return false;
     const bool failed=call_node_body(body, frame);
@@ -216,6 +229,9 @@ inline bool invoke_node_body(NodeFailureScope* scope, NodeBody body, void* frame
         std::longjmp(scope->target, 1);
     return true;
 }
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
 
 // Generated owned slots live in this payload when a function runs inside
 // a node. Unlike a pointer to an LLVM alloca, it remains valid after the

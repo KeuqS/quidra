@@ -1709,9 +1709,9 @@ std::string product_text(const Rational& coefficient,const RealTerms& factors,bo
     const auto magnitude=absbi(coefficient.num);
     for(const auto& [base,exponent]:factors){
         if(!rat_int(exponent)){
-            auto magnitude=exponent;
-            magnitude.num=absbi(magnitude.num);
-            (exponent.num.sign>0?numerator:denominator).push_back(fractional_power_text(base,magnitude));
+            auto absolute_exponent=exponent;
+            absolute_exponent.num=absbi(absolute_exponent.num);
+            (exponent.num.sign>0?numerator:denominator).push_back(fractional_power_text(base,absolute_exponent));
         }
         else if(exponent.num.sign>0)numerator.push_back(factor_text(base,exponent.num));
         else if(exponent.num.sign<0)denominator.push_back(factor_text(base,absbi(exponent.num)));

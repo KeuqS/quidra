@@ -63,6 +63,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 option(QUIDRA_WARNINGS_AS_ERRORS "Treat compiler warnings as errors for Quidra targets" OFF)
+# CI-only, default OFF: preserve normal optimized Windows Release builds.
+option(QUIDRA_MSVC_CI_FAST_FRONTEND "Build MSVC compiler frontend with low optimization in CI" OFF)
 option(QUIDRA_SANITIZE_RUNTIME "Instrument the generated-program runtime archive in sanitizer builds" OFF)
 option(QUIDRA_ENABLE_TEST_GPU_BACKEND "Compile the deterministic test-only fake GPU backend" OFF)
 
@@ -82,9 +84,15 @@ option(QUIDRA_BUILD_WASM_GOLDEN
     "With the WebAssembly frontend, also build quidra_golden_dump_wasm for node" OFF)
 
 if(MSVC)
-  # MSBuild /m parallelizes projects, not compilation within quidra_core.
-  # Bound cl.exe concurrency per target on the hosted Windows runner.
+  # Quidra's C-linkage parallel error callbacks may throw C++ exceptions.
+  # /EHsc treats extern "C" as non-throwing; use /EHs instead.
+  string(REPLACE "/EHsc" "/EHs" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
+  # Bound concurrent cl.exe processes on Windows hosted runners.
   add_compile_options(/MP2)
+endif()
+if(WIN32)
+  # Includes apply to independently compiled runtime test targets as well.
+  add_compile_definitions(NOMINMAX)
 endif()
 
 if(QUIDRA_WARNINGS_AS_ERRORS)
@@ -270,6 +278,12 @@ target_include_directories(quidra_core PUBLIC include ${CMAKE_CURRENT_BINARY_DIR
 # The compiler's internal layers (src/llvm_backend, src/llvm_text, ...) include
 # each other by their directory: "llvm_backend/x.hpp".
 target_include_directories(quidra_core PRIVATE src)
+if(MSVC AND QUIDRA_MSVC_CI_FAST_FRONTEND)
+  # Hosted MSVC /O2 code generation of AST/IR visitors takes tens of minutes.
+  # Only the CI host compiler uses /Od, retaining Release ABI and NDEBUG.
+  # Normal Windows Release builds remain fully optimized.
+  target_compile_options(quidra_core PRIVATE "$<$<CONFIG:Release>:/Od>" /Bt)
+endif()
 # Inline functions of the compiler stay hidden. Otherwise each one the
 # compiler instantiates, the IR Instruction variant's dispatch tables among
 # them, is a weak exported symbol of the CLI that the dynamic loader binds at

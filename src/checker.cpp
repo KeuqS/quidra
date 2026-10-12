@@ -9881,10 +9881,11 @@ void Checker::check_for_stmt(const Stmt& statement, const ForStmt& node) {
                     if (const auto root = writable_storage_path(*source)) {
                         const auto invalid = traversal_element_invalidations_.find(root->first);
                         if (invalid != traversal_element_invalidations_.end()) {
-                            const auto path = root->second.empty() ? full : full.empty()
+                            const auto storage_path = root->second.empty() ? full : full.empty()
                                 ? root->second : root->second + "." + full;
                             for (const auto& field : invalid->second)
-                                if (path.empty() || field == path || field.starts_with(path + "[]")) return false;
+                                if (storage_path.empty() || field == storage_path ||
+                                    field.starts_with(storage_path + "[]")) return false;
                         }
                     }
                     return full.empty() ? storage_initialized(*source) : root_paths.contains(full);

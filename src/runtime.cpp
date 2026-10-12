@@ -5928,7 +5928,7 @@ void autograd_add_gradient(std::unordered_map<const AutogradNode*,HostValues<T>>
     // A backward operation's result for a real16 or real16b node is rounded
     // once to its type, and so is each sum of two contributions.
     const bool half=std::is_same_v<T,float>&&autograd_half_dtype(node->dtype);
-    const auto round=[&](HostValues<T>& values){
+    const auto round=[&]([[maybe_unused]] HostValues<T>& values){
         if constexpr(std::is_same_v<T,float>){
             const auto count=values.size();
             if(count==0) return;
@@ -6570,8 +6570,8 @@ public:
         const TensorValue& value,unsigned long long line,unsigned long long column) {
         if(owned_) {
             if(quidra::runtime::node_failure_active()) {
-                auto* value=std::exchange(owned_,nullptr);
-                release_managed_tensor(value);
+                auto* previously_owned=std::exchange(owned_,nullptr);
+                release_managed_tensor(previously_owned);
             } else {
                 release_managed_tensor(owned_);
                 owned_=nullptr;
@@ -7315,7 +7315,7 @@ void autograd_add_cast_gradient(
     if(autograd_compute_dtype(node->dtype)!=HostValues<T>::element_dtype)
         runtime_text_failure("autograd cast buffer dtype mismatch");
     const bool half=std::is_same_v<T,float>&&autograd_half_dtype(node->dtype);
-    const auto round=[&](HostValues<T>& values){
+    const auto round=[&]([[maybe_unused]] HostValues<T>& values){
         if constexpr(std::is_same_v<T,float>){
             const auto count=values.size();
             if(count==0) return;

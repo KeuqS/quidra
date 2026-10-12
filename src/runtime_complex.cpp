@@ -122,12 +122,16 @@ ExactRealValue exact_binary(const ExactRealValue& left, const ExactRealValue& ri
 }
 
 int exact_compare(const ExactRealValue& left, const ExactRealValue& right) {
+#if defined(__SIZEOF_INT128__)
     if (small(left) && small(right)) {
         __extension__ using WideInteger = __int128;
         const WideInteger a = static_cast<WideInteger>(left.numerator) * right.denominator;
         const WideInteger b = static_cast<WideInteger>(right.numerator) * left.denominator;
         return a < b ? -1 : a > b ? 1 : 0;
     }
+#endif
+    // MSVC lacks native 128-bit integers: compare via exact big reals instead
+    // of truncating cross-products or relying on floating approximation.
     void* a = promote(left);
     void* b = promote(right);
     const int order = quidra_bigreal_compare(a, b, 0, 0);

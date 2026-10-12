@@ -3831,7 +3831,7 @@ int main(){
          "string c = text[len(text)>:0]\nstring d = text[0:<1]\nstring e = \"abc\"[3:]\n");
     bad_message("string part = \"abc\"[1:5]\n", "INDEX_BOUNDS",
                 "Slice 1:5 out of bounds for length 3.");
-    bad_message("string part = \"a\u00e9\"[0:2]\n", "INDEX_BOUNDS",
+    bad_message("string part = \"a\xc3\xa9\"[0:2]\n", "INDEX_BOUNDS",
                 "Slice 0:2 out of bounds for length 2.");
     bad_message("int[] values = [1, 2, 3]\nint part = values[0:1]\n",
                 "TYPE_MISMATCH", "");

@@ -236,7 +236,7 @@ std::string report_text(const std::filesystem::path& directory, const std::strin
 #else
     const int saved = dup(2);
 #endif
-    if (saved < 0 || !std::freopen(captured.string().c_str(), "w", stderr)) return {};
+    if (saved < 0 || !std::freopen(captured.string().c_str(), "wb", stderr)) return {};
     quidra::runtime::write_report({quidra::runtime::ReportKind::coded, "INDEX_BOUNDS"},
                                   quidra::runtime::locate_site(line, column, nullptr),
                                   "index 3 out of bounds for length 3", {});

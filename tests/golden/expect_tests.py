@@ -197,8 +197,8 @@ def synthetic_rewrite(tool: Path) -> None:
                                     ("broken/e.qui", BROKEN, BROKEN_EDITS)):
             rewritten, map_rows = apply_edits(source, edits)
             check(rewritten != source, f"{name}: the rewrite changes nothing")
-            (root / name).write_text(source, encoding="utf-8")
-            (work / f"{name.replace('/', '_')}.rewritten").write_text(rewritten, encoding="utf-8")
+            (root / name).write_bytes(source.encode("utf-8"))
+            (work / f"{name.replace('/', '_')}.rewritten").write_bytes(rewritten.encode("utf-8"))
             rows += [row.replace("e.qui", name, 1) for row in map_rows]
         (work / "map.tsv").write_text("\n".join(rows) + "\n", encoding="utf-8")
 
@@ -212,9 +212,8 @@ def synthetic_rewrite(tool: Path) -> None:
 
         base = capture("base")
         for name in ("e.qui", "broken/e.qui"):
-            (root / name).write_text(
-                (work / f"{name.replace('/', '_')}.rewritten").read_text(encoding="utf-8"),
-                encoding="utf-8")
+            (root / name).write_bytes(
+                (work / f"{name.replace('/', '_')}.rewritten").read_bytes())
         head = capture("head")
         # inspect and deps hold the source text and its hash, not columns.
         skip = ["--skip-views", "inspect,deps"]

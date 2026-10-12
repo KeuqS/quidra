@@ -1289,6 +1289,26 @@ if(BUILD_TESTING AND NOT QUIDRA_BUILD_WASM_FRONTEND)
   endif()
 endif()
 
+# Windows CI builds every test target after the compiler and CLI. The
+# generated compiler was already using /O1 /Ob0 here, but the 30+ test
+# executables still used Release /O2, leading to very slow MSVC codegen in
+# large template-heavy tests. Apply the same CI-only options to test targets;
+# production executables, native runtime and ordinary Release builds retain
+# their normal optimization. Keep /WX and all other warnings enabled.
+if(MSVC AND QUIDRA_MSVC_CI_FAST_FRONTEND AND BUILD_TESTING)
+  get_property(_quidra_ci_targets DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
+  foreach(_quidra_ci_target IN LISTS _quidra_ci_targets)
+    if(_quidra_ci_target MATCHES "^quidra_" AND
+       NOT _quidra_ci_target MATCHES
+           "^quidra_(core($|_part_)|runtime($|_jit$)|repl_submission$)")
+      target_compile_options(${_quidra_ci_target} PRIVATE
+        "$<$<CONFIG:Release>:/O1>"
+        "$<$<CONFIG:Release>:/Ob0>"
+        /wd4702 /Bt)
+    endif()
+  endforeach()
+endif()
+
 set(CPACK_PACKAGE_NAME "quidra")
 set(CPACK_PACKAGE_VENDOR "Quidra")
 set(CPACK_PACKAGE_CONTACT "Quidra project")

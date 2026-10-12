@@ -132,6 +132,14 @@ std::unique_ptr<RunCacheStaging> RunCacheStore::create_staging() const {
             result->lease_path_.clear();
             return nullptr;
         }
+        // The cleaner may unlink a newly created lease before its owner
+        // acquires the lock. Do not stage files under an orphaned lease:
+        // a held lock only protects a lease that is still linked.
+        std::error_code lease_error;
+        if (!fs::exists(result->lease_path_, lease_error) || lease_error) {
+            result->lease_path_.clear();
+            continue;
+        }
         const auto directory = platform::open_private_subdirectory(
             layout_.root, fs::path("staging") / result->id_);
         if (!directory.path) return nullptr;

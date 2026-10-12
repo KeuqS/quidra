@@ -121,7 +121,7 @@ configure_file(
     @ONLY
 )
 
-add_library(quidra_core
+set(QUIDRA_CORE_SOURCES
     src/lexer.cpp
     src/parser.cpp
     src/class_initialization.cpp
@@ -274,16 +274,49 @@ add_library(quidra_core
     src/platform/sha256.cpp
     src/platform/strict_json.cpp
 )
+
+# Windows CI generates roughly 10 GiB of MSVC objects. lib.exe cannot pack
+# those into one COFF archive (LNK1248), so divide only the CI frontend into
+# small archives while keeping quidra_core a real STATIC target for consumers.
+if(MSVC AND QUIDRA_MSVC_CI_FAST_FRONTEND)
+  list(POP_FRONT QUIDRA_CORE_SOURCES _quidra_core_entry_source)
+  add_library(quidra_core STATIC ${_quidra_core_entry_source})
+  set(_quidra_core_part_index 0)
+  # Eight objects per archive stay below 4 GiB even at the observed
+  # ~450 MiB worst-case per translation unit.
+  while(QUIDRA_CORE_SOURCES)
+    list(LENGTH QUIDRA_CORE_SOURCES _quidra_core_remaining)
+    if(_quidra_core_remaining GREATER 8)
+      list(SUBLIST QUIDRA_CORE_SOURCES 0 8 _quidra_core_part_sources)
+      list(SUBLIST QUIDRA_CORE_SOURCES 8 -1 QUIDRA_CORE_SOURCES)
+    else()
+      set(_quidra_core_part_sources ${QUIDRA_CORE_SOURCES})
+      set(QUIDRA_CORE_SOURCES "")
+    endif()
+    set(_quidra_core_part quidra_core_part_${_quidra_core_part_index})
+    add_library(${_quidra_core_part} STATIC ${_quidra_core_part_sources})
+    target_include_directories(${_quidra_core_part}
+      PRIVATE include ${CMAKE_CURRENT_BINARY_DIR}/generated src)
+    # /O1 emits repeated C4702 diagnostics from std::visit instantiations.
+    # Keep /WX, /W4 and every other warning active.
+    target_compile_options(${_quidra_core_part} PRIVATE
+      /W4 /wd4456 /wd4702 /bigobj /Bt
+      "$<$<CONFIG:Release>:/O1>" "$<$<CONFIG:Release>:/Ob0>")
+    target_link_libraries(quidra_core PUBLIC ${_quidra_core_part})
+    math(EXPR _quidra_core_part_index "${_quidra_core_part_index} + 1")
+  endwhile()
+else()
+  add_library(quidra_core ${QUIDRA_CORE_SOURCES})
+endif()
 target_include_directories(quidra_core PUBLIC include ${CMAKE_CURRENT_BINARY_DIR}/generated)
 # The compiler's internal layers (src/llvm_backend, src/llvm_text, ...) include
 # each other by their directory: "llvm_backend/x.hpp".
 target_include_directories(quidra_core PRIVATE src)
 if(MSVC AND QUIDRA_MSVC_CI_FAST_FRONTEND)
-  # Hosted MSVC /O2 spends tens of minutes in code generation, but /Od
-  # inflates quidra_core.lib past COFF\'s 4 GiB limit (LNK1248). Favor
-  # compact code with /O1 and disable automatic inlining with /Ob0.
-  # Only the CI host compiler changes; normal Windows Release keeps /O2.
-  target_compile_options(quidra_core PRIVATE "$<$<CONFIG:Release>:/O1>" "$<$<CONFIG:Release>:/Ob0>" /Bt)
+  # The entry source uses the same CI-only optimization as the subarchives.
+  # Normal Windows Release builds continue to use /O2.
+  target_compile_options(quidra_core PRIVATE
+    "$<$<CONFIG:Release>:/O1>" "$<$<CONFIG:Release>:/Ob0>" /wd4702 /Bt)
 endif()
 # Inline functions of the compiler stay hidden. Otherwise each one the
 # compiler instantiates, the IR Instruction variant's dispatch tables among

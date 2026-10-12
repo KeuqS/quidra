@@ -279,10 +279,11 @@ target_include_directories(quidra_core PUBLIC include ${CMAKE_CURRENT_BINARY_DIR
 # each other by their directory: "llvm_backend/x.hpp".
 target_include_directories(quidra_core PRIVATE src)
 if(MSVC AND QUIDRA_MSVC_CI_FAST_FRONTEND)
-  # Hosted MSVC /O2 code generation of AST/IR visitors takes tens of minutes.
-  # Only the CI host compiler uses /Od, retaining Release ABI and NDEBUG.
-  # Normal Windows Release builds remain fully optimized.
-  target_compile_options(quidra_core PRIVATE "$<$<CONFIG:Release>:/Od>" /Bt)
+  # Hosted MSVC /O2 spends tens of minutes in code generation, but /Od
+  # inflates quidra_core.lib past COFF\'s 4 GiB limit (LNK1248). Favor
+  # compact code with /O1 and disable automatic inlining with /Ob0.
+  # Only the CI host compiler changes; normal Windows Release keeps /O2.
+  target_compile_options(quidra_core PRIVATE "$<$<CONFIG:Release>:/O1>" "$<$<CONFIG:Release>:/Ob0>" /Bt)
 endif()
 # Inline functions of the compiler stay hidden. Otherwise each one the
 # compiler instantiates, the IR Instruction variant's dispatch tables among

@@ -315,6 +315,15 @@ jobs:
           -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
       - name: Build compiler core
         run: cmake --build build --config Release --target quidra_core --parallel 2
+      - name: Diagnose Windows compiler-core failure
+        if: failure()
+        shell: pwsh
+        run: |
+          $objects = @(Get-ChildItem build -Filter *.obj -Recurse -File -ErrorAction SilentlyContinue)
+          if ($objects.Count -eq 0) { Write-Host 'No object files to inspect'; exit 0 }
+          $sum = ($objects | Measure-Object -Property Length -Sum).Sum
+          Write-Host "Objects: $($objects.Count); total bytes: $sum"
+          $objects | Sort-Object Length -Descending | Select-Object -First 12 FullName,Length | Format-Table -AutoSize
       - name: Build CLI
         run: cmake --build build --config Release --target quidra --parallel 2
       - name: Build remaining test targets

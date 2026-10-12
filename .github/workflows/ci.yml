@@ -327,7 +327,10 @@ jobs:
       - name: Build CLI
         run: cmake --build build --config Release --target quidra --parallel 2
       - name: Build remaining test targets
-        run: cmake --build build --config Release --parallel 2
+        # On a hosted runner MSVC's large compiler/IR test instantiations
+        # exhaust cl.exe and MSBuild memory when multiple projects compile.
+        # /MP2 still bounds intra-target parallel compilation.
+        run: cmake --build build --config Release --parallel 1
       - name: Tests
         run: ctest --test-dir build -C Release --output-on-failure --parallel ${{ runner.os == 'macOS' && 3 || 4 }}
       - name: Native smoke

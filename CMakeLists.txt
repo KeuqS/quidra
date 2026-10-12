@@ -1292,9 +1292,10 @@ endif()
 # Windows CI builds every test target after the compiler and CLI. The
 # generated compiler was already using /O1 /Ob0 here, but the 30+ test
 # executables still used Release /O2, leading to very slow MSVC codegen in
-# large template-heavy tests. Apply the same CI-only options to test targets;
-# production executables, native runtime and ordinary Release builds retain
-# their normal optimization. Keep /WX and all other warnings enabled.
+# large template-heavy tests. Apply the same CI-only options to test targets.
+# /bigobj is needed for shape_relation_tests.cpp (MSVC C1128). C4702 is
+# repeated from visitor template instantiations. Production executables,
+# native runtime and normal Release builds are unchanged; /WX remains on.
 if(MSVC AND QUIDRA_MSVC_CI_FAST_FRONTEND AND BUILD_TESTING)
   get_property(_quidra_ci_targets DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
   foreach(_quidra_ci_target IN LISTS _quidra_ci_targets)
@@ -1304,7 +1305,7 @@ if(MSVC AND QUIDRA_MSVC_CI_FAST_FRONTEND AND BUILD_TESTING)
       target_compile_options(${_quidra_ci_target} PRIVATE
         "$<$<CONFIG:Release>:/O1>"
         "$<$<CONFIG:Release>:/Ob0>"
-        /wd4702 /Bt)
+        /bigobj /wd4702 /Bt)
     endif()
   endforeach()
 endif()

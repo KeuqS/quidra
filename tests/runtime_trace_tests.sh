@@ -633,6 +633,34 @@ else
     fi
 fi
 
+# The source-level path stays complete when an inlined shape wrapper loses
+# its DWARF identity at a merged call. JSON must retain the same candidate
+# sites as text, without exposing the compiler's wrapper/body split.
+if ! python3 - "$TMP/merged" <<'PY'
+import json, os, subprocess, sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+ran = subprocess.run(["./prog"], cwd=root, text=True, capture_output=True,
+                     env=dict(os.environ, QUIDRA_ERROR_FORMAT="json"))
+(root / "json.txt").write_text(ran.stderr)
+assert ran.returncode == 101, (ran.returncode, ran.stdout, ran.stderr)
+report = json.loads(ran.stderr.splitlines()[0])
+assert report["path_complete"] is True, report
+path = report["path"]
+assert [p["function"] for p in path] == ["heavy", "choose"], path
+heavy, choose = path
+positions = [(p["file"], p["line"], p["column"]) for p in heavy.get("sites", [heavy])]
+assert positions in ([('main.qui', 10, 13), ('main.qui', 12, 13)], [('main.qui', 10, 13)]), heavy
+assert (choose["file"], choose["line"], choose["column"]) == ("main.qui", 17, 7), choose
+assert all(p["count"] == 1 and p["via"] in ("call", "inline") for p in path), path
+PY
+then
+    fail "merged-json"; cat "$TMP/merged/json.txt"
+else
+    echo "ok   merged-json"
+fi
+
 # --- An error that leaves a call through an fn value names the function
 # actually called.
 program indirect-hop <<'QUI'

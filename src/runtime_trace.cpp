@@ -436,8 +436,8 @@ private:
             [](const void* context, std::uint32_t id) { return static_cast<const Shared*>(context)->owner(id); }};
     }
 
-    std::uint32_t direct_target(const CollectedFrame& caller) const {
-        if (caller.raw.ip_before_instruction) return table::no_function;
+    quidra::runtime_tail::CallEntry direct_target(const CollectedFrame& caller) const {
+        if (caller.raw.ip_before_instruction) return {};
 #if defined(__aarch64__) || defined(_M_ARM64)
         const auto address = branch_target(caller.raw.ip - 4);
 #elif defined(__x86_64__) || defined(_M_X64)
@@ -448,14 +448,17 @@ private:
         Frame target;
         if (!address || !lookup(sections_, address, target) || target.symbol_class == table::class_unknown ||
             !consistent_chain(target, shared_))
-            return table::no_function;
-        return target.function;
+            return {};
+        return quidra::runtime_tail::logical_call_entry(
+            graph(), innermost(caller.frame, shared_), target.function);
     }
 
     std::uint32_t kept_site(CollectedFrame& current) const {
         const auto site = current.frame.chain[0];
         if (site) return site;
-        const auto target = direct_target(current);
+        const auto resolved = direct_target(current);
+        if (resolved.ambiguous) { current.uncertain = true; return 0; }
+        const auto target = resolved.function;
         const auto scope = innermost(current.frame, shared_);
         if (target == table::no_function || scope >= shared_.function_count()) return 0;
         const auto function = shared_.function(scope);
@@ -531,7 +534,13 @@ private:
                     current.entered = site.callee;
                 } else if (!caller.frame.chain[0]) {
                     const auto target = direct_target(caller);
-                    if (target != table::no_function) current.entered = target;
+                    if (target.ambiguous) {
+                        // The physical body does not identify which source
+                        // callee was entered. Do not let the next frame use
+                        // it to select a falsely precise merged-call site.
+                        current.entered = table::no_function;
+                        current.uncertain = true;
+                    } else if (target.function != table::no_function) current.entered = target.function;
                     else if (!(shared_.function(current.frame.function).flags &
                                quidra::call_site_function_flags::address_taken)) current.uncertain = true;
                 }

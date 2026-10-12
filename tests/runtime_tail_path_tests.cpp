@@ -148,8 +148,160 @@ void merged_inline_requires_proved_endpoints() {
     expect(!recover(ambiguous.graph(),{},1000,0,2,1,unknown,0,hops,proof).complete,
            "different logical hop structures remain incomplete");
 }
+
+void transparent_wrapper_recovers_without_inline_metadata() {
+    Fixture f(2);
+    const auto forwarded = f.edge(0, 1, call_site_flags::synthesized);
+    std::array<Hop, 16> hops;
+    expect(!recover(f.graph(), {}, 1000, 0, 1, 1, {}, 0, hops).complete,
+           "an ordinary synthesized call cannot invent a missing inline edge");
+
+    f.functions[0].flags = call_site_function_flags::transparent_forwarder;
+    const auto result = recover(f.graph(), {}, 1000, 0, 1, 1, {}, 0, hops);
+    expect(result.complete && result.count == 1 && hops[0].site == forwarded && hops[0].callee == 1,
+           "a declared forwarding wrapper reaches its body without inline metadata");
+}
+
+void merged_calls_retain_the_unique_source_wrapper() {
+    Fixture f(3);
+    f.edge(0, 1, call_site_flags::synthesized);
+    f.edge(2, 0, call_site_flags::user);
+    f.edge(2, 0, call_site_flags::user);
+
+    const auto ordinary = logical_call_entry(f.graph(), 2, 1);
+    expect(!ordinary.ambiguous && ordinary.function == 1,
+           "an unflagged function cannot stand in for the observed physical callee");
+
+    f.functions[0].flags = call_site_function_flags::transparent_forwarder;
+    const auto merged = logical_call_entry(f.graph(), 2, 1);
+    expect(!merged.ambiguous && merged.function == 0,
+           "multiple merged source sites of one wrapper retain that wrapper as the logical callee");
+    const auto direct = logical_call_entry(f.graph(), 2, 0);
+    expect(!direct.ambiguous && direct.function == 0,
+           "a physically retained wrapper keeps its direct source identity");
+}
+
+void nested_forwarding_wrappers_recover_one_route() {
+    Fixture f(4);
+    f.functions[0].flags = call_site_function_flags::transparent_forwarder;
+    f.functions[1].flags = call_site_function_flags::transparent_forwarder;
+    const auto outer = f.edge(0, 1, call_site_flags::synthesized);
+    const auto inner = f.edge(1, 2, call_site_flags::synthesized);
+    f.edge(3, 0, call_site_flags::user);
+    const auto entry = logical_call_entry(f.graph(), 3, 2);
+    expect(!entry.ambiguous && entry.function == 0,
+           "a chain of declared wrappers resolves to its source-level entry");
+    std::array<Hop, 16> hops;
+    const auto result = recover(f.graph(), {}, 1000, 0, 2, 1, {}, 0, hops);
+    expect(result.complete && result.count == 2 && hops[0].site == outer && hops[1].site == inner,
+           "a declared wrapper chain preserves each forwarding edge without inline metadata");
+}
+
+void converging_source_wrappers_remain_ambiguous() {
+    Fixture f(4);
+    f.functions[0].flags = call_site_function_flags::transparent_forwarder;
+    f.functions[1].flags = call_site_function_flags::transparent_forwarder;
+    f.edge(0, 2, call_site_flags::synthesized);
+    f.edge(1, 2, call_site_flags::synthesized);
+    f.edge(3, 0, call_site_flags::user);
+    const auto alternative = f.edge(3, 1, call_site_flags::user);
+    const auto entry = logical_call_entry(f.graph(), 3, 2);
+    expect(entry.ambiguous && entry.function == table::no_function,
+           "different source wrappers reaching one physical body cannot select a logical callee");
+
+    f.sites[alternative].callee = 2;
+    const auto direct_or_wrapper = logical_call_entry(f.graph(), 3, 2);
+    expect(direct_or_wrapper.ambiguous && direct_or_wrapper.function == table::no_function,
+           "a direct call and a wrapper reaching the same body cannot select the direct call's site");
+}
+
+void ordinary_routes_make_wrapper_recovery_ambiguous() {
+    // The caller invokes either wrapper W or ordinary user function U.
+    // W forwards to body B; U calls W. LLVM may inline U and merge both
+    // branches to a direct call of B, erasing the inline hierarchy.
+    Fixture f(4);  // W=0, B=1, U=2, caller=3.
+    f.functions[0].flags = call_site_function_flags::transparent_forwarder;
+    f.edge(0, 1, call_site_flags::synthesized);
+    const auto user_call = f.edge(2, 0, call_site_flags::user);
+    f.edge(3, 0, call_site_flags::user);
+    f.edge(3, 2, call_site_flags::user);
+    std::array<Hop, 16> hops;
+    expect(!recover(f.graph(), {}, 1000, 2, 1, 1, {}, 0, hops).complete,
+           "a possible user-call route cannot authorize an unproved inline edge");
+    const auto entry = logical_call_entry(f.graph(), 3, 1);
+    expect(entry.ambiguous && entry.function == table::no_function,
+           "an alternate ordinary user-call route prevents selecting the wrapper's source site");
+
+    f.sites[user_call].flags |= call_site_flags::tail;
+    const auto tail_entry = logical_call_entry(f.graph(), 3, 1);
+    expect(tail_entry.ambiguous && tail_entry.function == table::no_function,
+           "an alternate user tail-call route also prevents selecting the wrapper's source site");
+
+    auto unrelated = f;
+    unrelated.functions[2].site_count = 0;
+    const auto unique_entry = logical_call_entry(unrelated.graph(), 3, 1);
+    expect(!unique_entry.ambiguous && unique_entry.function == 0,
+           "an unrelated source callee does not obscure a proven forwarding entry");
+}
+
+void unknown_alternate_targets_remain_ambiguous() {
+    Fixture f(4);
+    f.functions[0].flags = call_site_function_flags::transparent_forwarder;
+    f.edge(0, 1, call_site_flags::synthesized);
+    const auto unknown = f.edge(2, table::no_function, call_site_flags::user);
+    f.sites[unknown].callee_kind = static_cast<std::uint8_t>(CallSiteCallee::indirect);
+    f.edge(3, 0, call_site_flags::user);
+    f.edge(3, 2, call_site_flags::user);
+    const auto indirect = logical_call_entry(f.graph(), 3, 1);
+    expect(indirect.ambiguous && indirect.function == table::no_function,
+           "an indirect call on an alternative user route can reach the physical target");
+
+    f.sites[unknown].callee_kind = static_cast<std::uint8_t>(CallSiteCallee::extern_function);
+    f.sites[unknown].flags |= call_site_flags::extern_callback;
+    const auto callback = logical_call_entry(f.graph(), 3, 1);
+    expect(callback.ambiguous && callback.function == table::no_function,
+           "an extern callback on an alternative user route can reach the physical target");
+
+    f.sites[unknown].flags = call_site_flags::user;
+    const auto ordinary_extern = logical_call_entry(f.graph(), 3, 1);
+    expect(!ordinary_extern.ambiguous && ordinary_extern.function == 0,
+           "an extern call without callbacks cannot invent an alternate user route");
+}
+
+void invalid_forwarding_relations_remain_incomplete() {
+    Fixture ambiguous(4);
+    ambiguous.functions[0].flags = call_site_function_flags::transparent_forwarder;
+    ambiguous.edge(0, 1, call_site_flags::synthesized);
+    ambiguous.edge(0, 2, call_site_flags::synthesized);
+    ambiguous.edge(3, 0, call_site_flags::user);
+    const auto entry = logical_call_entry(ambiguous.graph(), 3, 1);
+    expect(entry.ambiguous && entry.function == table::no_function,
+           "a declared wrapper with multiple forwarding edges does not prove a call entry");
+    std::array<Hop, 16> hops;
+    expect(!recover(ambiguous.graph(), {}, 1000, 0, 1, 1, {}, 0, hops).complete,
+           "a malformed wrapper cannot authorize one of its forwarding edges");
+
+    Fixture cycle(4);
+    cycle.functions[0].flags = call_site_function_flags::transparent_forwarder;
+    cycle.functions[1].flags = call_site_function_flags::transparent_forwarder;
+    cycle.edge(0, 1, call_site_flags::synthesized);
+    cycle.edge(1, 0, call_site_flags::synthesized);
+    cycle.edge(3, 0, call_site_flags::user);
+    const auto cyclic_entry = logical_call_entry(cycle.graph(), 3, 1);
+    expect(cyclic_entry.ambiguous && cyclic_entry.function == table::no_function,
+           "a forwarding cycle cannot prove a target even when its prefix reaches that target");
+    expect(!recover(cycle.graph(), {}, 1000, 0, 1, 1, {}, 0, hops).complete,
+           "a cyclic forwarding relation cannot authorize a missing inline edge");
+}
 } // namespace
 int main() {
+    transparent_wrapper_recovers_without_inline_metadata();
+    merged_calls_retain_the_unique_source_wrapper();
+    nested_forwarding_wrappers_recover_one_route();
+    converging_source_wrappers_remain_ambiguous();
+    ordinary_routes_make_wrapper_recovery_ambiguous();
+    unknown_alternate_targets_remain_ambiguous();
+    invalid_forwarding_relations_remain_incomplete();
     merged_inline_requires_proved_endpoints();
     unavailable_cfa_and_proved_inline_edges();
     unique_and_ambiguous_paths();

@@ -63,6 +63,8 @@ CallSiteMetadata::CallSiteMetadata(const ir::Module& module, const ModuleContext
         function_ids_[i] = id;
         CallSiteFunction function;
         function.display = call_site_display_name(f);
+        if (f.shape_wrapper)
+            function.flags |= call_site_function_flags::transparent_forwarder;
         if (f.entrypoint) {
             function.kind = CallSiteFunctionKind::entry;
             function.symbols.emplace_back(abi::symbol_namespace::entry);

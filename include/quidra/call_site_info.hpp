@@ -97,6 +97,10 @@ inline constexpr std::uint8_t self_depth = 4;
 inline constexpr std::uint8_t self_tail = 8;
 // A cold fragment touched this function's log at a different CFA.
 inline constexpr std::uint8_t tail_unusable = 16;
+// A compiler-generated shape wrapper. Its one synthesized function call
+// forwards to the checked body, even if LLVM erases the wrapper's inline
+// location when it merges callers. This does not authorize user tail calls.
+inline constexpr std::uint8_t transparent_forwarder = 32;
 } // namespace call_site_function_flags
 
 struct CallSiteFunction {

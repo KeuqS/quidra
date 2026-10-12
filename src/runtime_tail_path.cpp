@@ -10,14 +10,101 @@ namespace {
 constexpr std::size_t max_static_hops = 128;
 constexpr std::size_t max_search_steps = 100000;
 
+struct ForwardingPath {
+    std::uint32_t first_site{};
+    bool reaches{};
+    bool valid{};
+};
+
+// Only the compiler's declared wrappers authorize this relation. An
+// ordinary synthesized call, or an arbitrary user call, proves no edge.
+// Validate the whole chain, including beyond `target`, so a cyclic or
+// malformed wrapper cannot accidentally establish a route to its prefix.
+ForwardingPath forwarding_path(const Graph& graph, std::uint32_t from,
+                               std::uint32_t target) noexcept {
+    ForwardingPath result;
+    std::array<std::uint32_t, max_static_hops> active{};
+    for (std::size_t depth = 0; depth < active.size(); ++depth) {
+        if (from >= graph.function_count) return result;
+        if (from == target) result.reaches = true;
+        const auto function = graph.function(graph.context, from);
+        if (!(function.flags & call_site_function_flags::transparent_forwarder)) {
+            result.valid = true;
+            return result;
+        }
+        for (std::size_t i = 0; i < depth; ++i)
+            if (active[i] == from) return result;
+        active[depth] = from;
+        const auto end = std::uint64_t{function.first_site} + function.site_count;
+        if (end > graph.site_count) return result;
+        std::uint32_t forward = 0;
+        for (auto id = function.first_site; id < end; ++id) {
+            const auto site = graph.site(graph.context, id);
+            if (site.callee_kind != static_cast<std::uint8_t>(CallSiteCallee::function) ||
+                !(site.flags & call_site_flags::synthesized)) continue;
+            if (!id || forward || (site.flags & call_site_flags::user)) return result;
+            forward = id;
+        }
+        if (!forward) return result;
+        if (!result.first_site) result.first_site = forward;
+        from = graph.site(graph.context, forward).callee;
+    }
+    return result;
+}
+
+// This search only rejects a source-entry guess. An ordinary function may
+// have been inlined before LLVM erased a merged call's location, so its
+// route to the physical target competes with a declared forwarder even
+// though that route cannot be recovered without inline or tail evidence.
+class PossibleCallPath {
+public:
+    PossibleCallPath(const Graph& graph, std::uint32_t target) : graph_(graph), target_(target) {}
+
+    bool through(const table::SharedSite& site) noexcept { return through(site, 0); }
+
+private:
+    bool through(const table::SharedSite& site, std::size_t depth) noexcept {
+        if (++steps_ > max_search_steps) return true;
+        switch (static_cast<CallSiteCallee>(site.callee_kind)) {
+            case CallSiteCallee::function: return visit(site.callee, depth);
+            case CallSiteCallee::indirect: case CallSiteCallee::unknown: return true;
+            case CallSiteCallee::extern_function:
+                return site.flags & call_site_flags::extern_callback;
+            case CallSiteCallee::runtime: return false;
+        }
+        return true;
+    }
+
+    bool visit(std::uint32_t function, std::size_t depth) noexcept {
+        if (++steps_ > max_search_steps || depth == active_.size() || function >= graph_.function_count)
+            return true;
+        if (function == target_) return true;
+        for (std::size_t i = 0; i < depth; ++i)
+            if (active_[i] == function) return false;
+        active_[depth] = function;
+        const auto source = graph_.function(graph_.context, function);
+        const auto end = std::uint64_t{source.first_site} + source.site_count;
+        if (end > graph_.site_count) return true;
+        for (auto id = source.first_site; id < end; ++id)
+            if (through(graph_.site(graph_.context, id), depth + 1)) return true;
+        return false;
+    }
+
+    const Graph& graph_;
+    std::uint32_t target_{};
+    std::array<std::uint32_t, max_static_hops> active_{};
+    std::size_t steps_{};
+};
+
 struct Route {
     std::array<Hop, max_static_hops> hops{};
     std::size_t count{};
     unsigned matches{};
 };
 
-// A bounded search for a unique route through unrecorded tail edges and
-// the inline edges the row proves. Other recorded edges require a log entry.
+// A bounded search for a unique route through unrecorded tail edges,
+// declared transparent forwarders and the inline edges the row proves.
+// Other recorded edges require a log entry.
 class Search {
 public:
     Search(const Graph& graph, std::span<const std::uint32_t> inlined, std::uint32_t inline_target,
@@ -51,6 +138,8 @@ private:
         if (function.flags & call_site_function_flags::tail_unusable) { result_.matches = 2; return; }
         const auto end = std::uint64_t{function.first_site} + function.site_count;
         if (end > graph_.site_count) { result_.matches = 2; return; }
+        const auto forwarding = forwarding_path(graph_, from, table::no_function);
+        if (!forwarding.valid) { result_.matches = 2; return; }
         for (std::uint32_t id = function.first_site; id < end; ++id) {
             const auto site = graph_.site(graph_.context, id);
             const auto inline_at = std::find(inlined_.begin(), inlined_.end(), id);
@@ -76,7 +165,7 @@ private:
                 inlined=true;
             }
             if (!inlined && (site.flags & call_site_flags::recorded_tail)) continue;
-            if (!inlined && !(site.flags & call_site_flags::tail)) continue;
+            if (!inlined && !(site.flags & call_site_flags::tail) && id != forwarding.first_site) continue;
             path_[depth] = {id, callee, 1, inlined, from, merged};
             visit(callee, to, depth + 1);
         }
@@ -96,6 +185,36 @@ bool self_function(const Graph& graph, std::uint32_t function) noexcept {
            (graph.function(graph.context, function).flags & call_site_function_flags::self_tail);
 }
 } // namespace
+
+CallEntry logical_call_entry(const Graph& graph, std::uint32_t owner,
+                             std::uint32_t target) noexcept {
+    if (target >= graph.function_count) return {};
+    if (owner >= graph.function_count) return {target, false};
+    const auto function = graph.function(graph.context, owner);
+    const auto end = std::uint64_t{function.first_site} + function.site_count;
+    if (end > graph.site_count) return {table::no_function, true};
+    std::uint32_t entry = table::no_function;
+    for (auto id = function.first_site; id < end; ++id) {
+        const auto site = graph.site(graph.context, id);
+        if (site.callee_kind != static_cast<std::uint8_t>(CallSiteCallee::function)) continue;
+        const auto forwarding = forwarding_path(graph, site.callee, target);
+        if (!forwarding.valid) return {table::no_function, true};
+        if (!forwarding.reaches) continue;
+        if (entry != table::no_function && entry != site.callee)
+            return {table::no_function, true};
+        entry = site.callee;
+    }
+    if (entry != table::no_function) {
+        PossibleCallPath alternatives(graph, target);
+        for (auto id = function.first_site; id < end; ++id) {
+            const auto site = graph.site(graph.context, id);
+            if (site.callee_kind == static_cast<std::uint8_t>(CallSiteCallee::function) &&
+                site.callee == entry) continue;
+            if (alternatives.through(site)) return {table::no_function, true};
+        }
+    }
+    return {entry == table::no_function ? target : entry, false};
+}
 
 Recovery recover(const Graph& graph, Snapshot log, std::uintptr_t cfa,
                  std::uint32_t start, std::uint32_t target, std::uint32_t start_depth,

@@ -18,6 +18,21 @@ struct Graph {
     table::SharedSite (*site)(const void*, std::uint32_t){};
     std::uint32_t (*owner)(const void*, std::uint32_t){};
 };
+struct CallEntry {
+    std::uint32_t function{table::no_function};
+    bool ambiguous{};
+};
+// A line-zero direct call can reach a checked body after LLVM removed its
+// transparent wrapper. Resolve the physical target to the one source
+// callee in `owner` that reaches it through declared forwarders. Repeated
+// sites of that callee remain candidates; distinct callees, invalid
+// forwarding relations and cycles are ambiguous. Another ordinary call
+// that may reach the target also prevents choosing a source entry; this
+// negative check never authorizes recovery of its unproved route. With no
+// matching source call, retain the physical target so ordinary direct calls
+// are unchanged.
+CallEntry logical_call_entry(const Graph& graph, std::uint32_t owner,
+                             std::uint32_t target) noexcept;
 struct Hop {
     std::uint32_t site{};
     std::uint32_t callee{};

@@ -65,24 +65,34 @@ PrivateDirectoryVerdict judge_private_directory(
 
 namespace {
 
-// The SID of the user this process runs as, in a buffer that holds it.
-std::vector<unsigned char> current_user_sid() {
+// Elevated Windows tokens may default to a group SID (Administrators) as
+// owner of new files. Both TokenUser and TokenOwner are legitimate owner SIDs
+// for this process; an arbitrary other user's SID is never accepted.
+std::vector<unsigned char> token_sid(TOKEN_INFORMATION_CLASS kind) {
     HANDLE token = nullptr;
     if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return {};
     DWORD size = 0;
-    GetTokenInformation(token, TokenUser, nullptr, 0, &size);
+    GetTokenInformation(token, kind, nullptr, 0, &size);
     std::vector<unsigned char> buffer(size);
     std::vector<unsigned char> sid;
-    if (size != 0 &&
-        GetTokenInformation(token, TokenUser, buffer.data(), size, &size)) {
-        const auto* user = reinterpret_cast<const TOKEN_USER*>(buffer.data());
-        const DWORD length = GetLengthSid(user->User.Sid);
-        sid.resize(length);
-        if (!CopySid(length, sid.data(), user->User.Sid)) sid.clear();
+    if (size != 0 && GetTokenInformation(token, kind, buffer.data(), size, &size)) {
+        PSID raw = nullptr;
+        if (kind == TokenUser)
+            raw = reinterpret_cast<const TOKEN_USER*>(buffer.data())->User.Sid;
+        else if (kind == TokenOwner)
+            raw = reinterpret_cast<const TOKEN_OWNER*>(buffer.data())->Owner;
+        if (raw && IsValidSid(raw)) {
+            const DWORD length = GetLengthSid(raw);
+            sid.resize(length);
+            if (!CopySid(length, sid.data(), raw)) sid.clear();
+        }
     }
     CloseHandle(token);
     return sid;
 }
+
+std::vector<unsigned char> current_user_sid() { return token_sid(TokenUser); }
+std::vector<unsigned char> current_default_owner_sid() { return token_sid(TokenOwner); }
 
 bool owned_by(const fs::path& path, const std::vector<unsigned char>& sid) {
     PSID owner = nullptr;
@@ -92,9 +102,12 @@ bool owned_by(const fs::path& path, const std::vector<unsigned char>& sid) {
             nullptr, nullptr, nullptr, &descriptor) != ERROR_SUCCESS) {
         return false;
     }
+    const auto default_owner = current_default_owner_sid();
     const bool equal =
-        owner && !sid.empty() &&
-        EqualSid(owner, const_cast<unsigned char*>(sid.data())) != FALSE;
+        owner &&
+        ((!sid.empty() && EqualSid(owner, const_cast<unsigned char*>(sid.data())) != FALSE) ||
+         (!default_owner.empty() &&
+          EqualSid(owner, const_cast<unsigned char*>(default_owner.data())) != FALSE));
     LocalFree(descriptor);
     return equal;
 }

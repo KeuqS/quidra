@@ -408,14 +408,21 @@ class ColumnMaps:
                     raise ValueError(f"{name}:{number}: LINE and COLUMN start at 1, DELTA is not 0")
                 self.files.setdefault(parts[0], FileEdits()).add(line, column, delta)
 
+    @staticmethod
+    def path_matches(key: str, path: str) -> bool:
+        # The capture's deps view uses host-native paths. Column-map files use
+        # corpus-relative POSIX paths even when the capture runs on Windows.
+        normalized_key = key.replace("\\", "/")
+        normalized_path = path.replace("\\", "/")
+        return normalized_path == normalized_key or normalized_path.endswith("/" + normalized_key)
+
     def names(self, entry: str, path: str) -> bool:
-        return any(path == key or path.endswith("/" + key) or (key == entry and path == entry)
-                   for key in self.files)
+        return any(self.path_matches(key, path) for key in self.files)
 
     def for_entry(self, entry: str, sources: list[str]) -> list[FileEdits]:
         found = []
         for key, edits in self.files.items():
-            if key == entry or any(path == key or path.endswith("/" + key) for path in sources):
+            if key == entry or any(self.path_matches(key, path) for path in sources):
                 found.append(edits)
         return found
 

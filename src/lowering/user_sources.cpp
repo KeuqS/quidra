@@ -26,7 +26,7 @@ std::vector<ir::UserSource> user_source_table(const Program& program) {
             i == 0 ? display_root
                    : (display_directory / fs::path(absolute).lexically_relative(root_directory))
                          .lexically_normal()
-                         .string();
+                         .generic_string();
         if (const auto text = program.source_texts.find(absolute);
             text != program.source_texts.end()) {
             if (file_backed) source.revision = platform::sha256_hex(text->second);

@@ -3127,9 +3127,25 @@ static void source_table_names_every_user_file() {
                     std::string::npos,
                 "the table has the root and its import", llvm);
         const auto revision = quidra::platform::sha256_hex(main);
+        // LLVM prints nonprintable bytes, including Windows path separators,
+        // as two-digit hexadecimal escapes in c"..." constants.
+        const auto llvm_c_string = [](const std::string& text) {
+            static constexpr char hex[] = "0123456789ABCDEF";
+            std::string literal = "c\"";
+            for (const unsigned char byte : text) {
+                if (byte == '\\' || byte == '"' || byte < 32 || byte >= 127) {
+                    literal += '\\';
+                    literal += hex[byte >> 4];
+                    literal += hex[byte & 15];
+                } else {
+                    literal += static_cast<char>(byte);
+                }
+            }
+            return literal + "\\00\"";
+        };
         for (const auto& text : {std::string("app/main.qui"), std::string("app/lib/pick.qui"),
                                  (root / "main.qui").lexically_normal().string(), revision}) {
-            const auto expected = "c\"" + text + "\\00\"";
+            const auto expected = llvm_c_string(text);
             const auto probe = llvm.find("pick.qui");
             const auto nearby = probe == std::string::npos
                 ? llvm.substr(0, 1500)

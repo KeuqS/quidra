@@ -114,6 +114,14 @@ def column_map_cases() -> None:
         (maps / "line.tsv").write_text("e.qui\t2\t5\t4\n", encoding="utf-8")
         (maps / "other.tsv").write_text("f.qui\t3\t5\t4\n", encoding="utf-8")
         (maps / "bad.tsv").write_text("e.qui\t3\t5\n", encoding="utf-8")
+        windows_path = r"C:\Users\runneradmin\AppData\Local\Temp\sample\root\e.qui"
+        column_maps = expect.ColumnMaps([str(maps / "right.tsv")])
+        check(column_maps.names("main.qui", windows_path),
+              "a mapped source is recognized with Windows separators")
+        check(len(column_maps.for_entry("main.qui", [windows_path])) == 1,
+              "a column map applies through a Windows-style source dependency")
+        check(not column_maps.names("main.qui", r"C:\tmp\other.qui"),
+              "unrelated Windows dependencies do not match")
         for name, expected in (("right", 0), ("line", 1), ("other", 1), ("bad", 1)):
             code, output = compare(base, head, None, "--column-map", str(maps / f"{name}.tsv"))
             check(code == expected, f"column map {name}: exit {code}, expected {expected}\n{output}")

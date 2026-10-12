@@ -311,8 +311,12 @@ jobs:
           cmake -S . -B build -A x64
           -DQUIDRA_WARNINGS_AS_ERRORS=ON
           -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
-      - name: Build
-        run: cmake --build build --config Release --parallel ${{ runner.os == 'macOS' && 3 || 4 }}
+      - name: Build compiler core
+        run: cmake --build build --config Release --target quidra_core --parallel 2
+      - name: Build CLI
+        run: cmake --build build --config Release --target quidra --parallel 2
+      - name: Build remaining test targets
+        run: cmake --build build --config Release --parallel 2
       - name: Tests
         run: ctest --test-dir build -C Release --output-on-failure --parallel ${{ runner.os == 'macOS' && 3 || 4 }}
       - name: Native smoke

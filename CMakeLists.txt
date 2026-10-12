@@ -81,6 +81,12 @@ endif()
 option(QUIDRA_BUILD_WASM_GOLDEN
     "With the WebAssembly frontend, also build quidra_golden_dump_wasm for node" OFF)
 
+if(MSVC)
+  # MSBuild /m parallelizes projects, not compilation within quidra_core.
+  # Bound cl.exe concurrency per target on the hosted Windows runner.
+  add_compile_options(/MP2)
+endif()
+
 if(QUIDRA_WARNINGS_AS_ERRORS)
   if(MSVC)
     add_compile_options(/WX)
@@ -655,6 +661,11 @@ if(BUILD_TESTING AND NOT QUIDRA_BUILD_WASM_FRONTEND)
       $<TARGET_OBJECTS:quidra_repl_submission>
   )
   target_link_libraries(quidra_golden_support PUBLIC quidra_core)
+  if(MSVC)
+    # This golden AST walker intentionally repeats node names in mutually
+    # exclusive if/else-if branches (C4456 under /WX).
+    target_compile_options(quidra_golden_support PRIVATE /wd4456)
+  endif()
   target_include_directories(quidra_golden_support
       PUBLIC ${CMAKE_SOURCE_DIR}/tests/golden
       PRIVATE ${CMAKE_SOURCE_DIR}/src)

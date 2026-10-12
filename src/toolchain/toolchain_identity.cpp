@@ -264,6 +264,7 @@ ToolchainSnapshot snapshot_toolchain(
         return snapshot;
     }
 #ifdef _WIN32
+    (void)pkg_config_modules;
     fail("a Windows link records no trace of the files it opens");
     return snapshot;
 #else

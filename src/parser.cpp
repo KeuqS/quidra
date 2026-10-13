@@ -650,6 +650,19 @@ TypeName Parser::type_name() {
             return kind == TokenKind::Comma || kind == TokenKind::RBrace;
         };
         while (true) {
+            if (at(TokenKind::Dot)) {
+                const auto ellipsis = peek();
+                if (peek(1).kind != TokenKind::Dot || peek(2).kind != TokenKind::Dot)
+                    error(ellipsis, "A shape ellipsis is written as '...'.");
+                if (t.tensor_shape_ellipsis)
+                    error(ellipsis, "A shape pattern may contain only one ellipsis.");
+                current_ += 3;
+                t.tensor_shape_ellipsis = t.tensor_shape_prefix.size();
+                if (!axis_end(0)) error(peek(), "Expected ',' or '}' after shape ellipsis.");
+                if (!match(TokenKind::Comma)) break;
+                if (at(TokenKind::RBrace)) error(peek(), "Trailing comma is not allowed in a shape pattern.");
+                continue;
+            }
             ShapeAxis axis;
             axis.span = peek().span;
             long long code = -2;
@@ -709,7 +722,8 @@ TypeName Parser::type_name() {
             if (at(TokenKind::RBrace)) error(peek(), "Trailing comma is not allowed in a shape pattern.");
         }
         consume(TokenKind::RBrace, "Expected '}' after shape pattern.");
-        t.tensor_rank = static_cast<long long>(t.tensor_shape_prefix.size());
+        if (!t.tensor_shape_ellipsis)
+            t.tensor_rank = static_cast<long long>(t.tensor_shape_prefix.size());
         t.span.end = previous().span.end;
     };
 

@@ -142,7 +142,7 @@ void check_arities() {
     check_arity<ir::TensorBackward>("TensorBackward", 6);
     check_arity<ir::TensorGrad>("TensorGrad", 5);
     check_arity<ir::TensorCast>("TensorCast", 7);
-    check_arity<ir::ShapedConstraintCheck>("ShapedConstraintCheck", 7);
+    check_arity<ir::ShapedConstraintCheck>("ShapedConstraintCheck", 8);
     check_arity<ir::ExtentEqualCheck>("ExtentEqualCheck", 5);
     check_arity<ir::TensorBinary>("TensorBinary", 9);
     check_arity<ir::TensorCompare>("TensorCompare", 9);
@@ -275,7 +275,7 @@ void check_arities() {
     check_arity<ir::ComplexMake>("ComplexMake", 4);
     check_arity<ir::ComplexPart>("ComplexPart", 4);
     check_arity<ir::CheckedReal>("CheckedReal", 7);
-    check_arity<Type>("Type", 11);
+    check_arity<Type>("Type", 12);
     check_arity<ir::Block>("Block", 2);
     check_arity<ir::TensorRegionLocation>("TensorRegionLocation", 2);
     check_arity<ir::TensorRegion>("TensorRegion", 9);
@@ -335,6 +335,11 @@ void check_rendering() {
                "ShapedConstraintCheck{4, 20, [none, 5], 6, 7, variables=[\"\", \"K\"], "
                "subject=\"sq\"}",
            "shape variable check rendering: " + golden::serialize_instruction(shaped));
+    const ir::Instruction variadic_shape = ir::ShapedConstraintCheck{
+        4, TypeKind::Tensor, {std::nullopt, 5}, 6, 7, {}, {}, 1};
+    expect(golden::serialize_instruction(variadic_shape) ==
+               "ShapedConstraintCheck{4, 20, [none, 5], 6, 7, ellipsis=1}",
+           "ellipsis check rendering: " + golden::serialize_instruction(variadic_shape));
     const ir::Instruction get = ir::ArrayGet{1, 2, 3, Type::simple(TypeKind::Int64), 0, 0,
                                              false, true, std::nullopt, 9};
     expect(golden::serialize_instruction(get) ==

@@ -4164,8 +4164,12 @@ extern "C" void quidra_tensor_rank_check(
     unsigned long long line, unsigned long long column) {
     if(!raw) tensor_fail("null tensor",line,column);
     const auto* tensor=static_cast<TensorValue*>(raw);
-    if(expected_rank<0 ||
-       tensor->shape.size()!=static_cast<std::size_t>(expected_rank))
+    // Negative ranks encode a minimum: -1 permits every rank, -2
+    // requires one axis, and so on. Nonnegative ranks remain exact.
+    const bool mismatch = expected_rank < 0
+        ? tensor->shape.size() < static_cast<std::size_t>(-(expected_rank + 1))
+        : tensor->shape.size() != static_cast<std::size_t>(expected_rank);
+    if(mismatch)
         tensor_fail("tensor rank does not satisfy captured shape constraint",line,column);
 }
 
@@ -4174,6 +4178,7 @@ extern "C" void quidra_tensor_extent_check(
     unsigned long long line, unsigned long long column) {
     if(!raw) tensor_fail("null tensor",line,column);
     const auto* tensor=static_cast<TensorValue*>(raw);
+    if(axis < 0) axis += static_cast<long long>(tensor->shape.size());
     if(axis<0 || static_cast<std::size_t>(axis)>=tensor->shape.size())
         tensor_fail("tensor shape axis is outside rank",line,column);
     if(expected<0)
@@ -4187,6 +4192,7 @@ extern "C" void quidra_tensor_shape_variable_check(
     unsigned long long line, unsigned long long column) {
     if(!raw) tensor_fail("null tensor",line,column);
     const auto* tensor=static_cast<TensorValue*>(raw);
+    if(axis < 0) axis += static_cast<long long>(tensor->shape.size());
     if(axis<0 || static_cast<std::size_t>(axis)>=tensor->shape.size())
         tensor_fail("tensor shape axis is outside rank",line,column);
     if(expected<0)

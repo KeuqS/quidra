@@ -65,7 +65,7 @@ type_atom        = tuple_type | "(", type, ")" | function_type | tensor_type | q
 function_type    = "func", "<", type, ">", "(", [ type, { ",", type } ], ")" ;
 tensor_type      = "tensor", "<", type, ">", [ brace_shape ] ;
 brace_shape      = "{", brace_axis, { ",", brace_axis }, "}" ;
-brace_axis       = "nat", identifier, [ "=", expression ]
+brace_axis       = "..." | "nat", identifier, [ "=", expression ]
                  | "_"
                  | expression ;
 integer_expression = integer_term, { ( "+" | "-" ), integer_term } ;
@@ -210,8 +210,10 @@ statement_end    = NEWLINE | EOF ;
      argument(), trailing argument(default = value), option(default = value), or flag();
      required positional argument() fields must precede optional positional fields;
    - `tensor<T>{AXIS, ...}` uses a mandatory fixed-width native numeric element type plus an
-     optional exact-rank shape pattern; each shape axis is `_`, a shape-variable declaration or a nat
-     expression, and the number of axes is the required rank. Integer expressions
+     optional shape pattern; each explicit axis is `_`, a shape-variable declaration or a nat
+     expression. Without `...`, the number of axes is the required rank; one `...` permits
+     zero or more middle axes, with preceding constraints aligned from the head and following
+     constraints aligned from the tail. Rank must be at least the number of explicit axes; Integer expressions
      that are not compile-time constants are evaluated once when the binding is
      created and their nonnegative results are captured for that binding;
    - a shape in braces, `tensor<T>{AXIS, ...}`, gives the roles of the four bracket

@@ -29,6 +29,15 @@ Numeric built-ins are `int8`, `int16`, `int32`, `int64`, `int`, `nat8`, `nat16`,
 
 `none` is the absence alternative of a union. `string | none` can hold text or normal absence; `string | none | error` additionally admits failure. Standalone `none` declarations, function returns typed solely `none`, and `auto x = none` are invalid. `void` is allowed as a function result and as an alternative in a union. Non-continuing control flow is compiler-internal and is neither storable nor source-spellable.
 
+For readability, prefer `auto` when the inferred type is obvious from the initializer on the same line. A constructor naming its class or a tensor factory naming its element type makes that choice clear. For example, given `class Point(real64 x, real64 y)`:
+
+```quidra
+auto point = Point(1.0, 2.0)
+auto image = tensor.zeros<real32>([3, 224, 224])
+```
+
+Otherwise prefer an explicit type, such as `Point point = make_point()`, when understanding a helper's result would require finding its declaration. This is a style recommendation: every otherwise valid `auto` declaration remains accepted without additional warnings or errors. The same readability guidance applies to `const auto` and `auto | error`; their inference and error-handling rules are unchanged.
+
 ## Arrays and shapes
 
 Array type information precedes the binding name:
@@ -359,7 +368,7 @@ tensor<T> normalize<T: floating>(tensor<T> value)
 
 The built-in constraints are `numeric`, `integer`, `floating`, `ordered`, and `equatable`. They add no runtime representation, vtable, dynamic dispatch, or implicit conversion. `integer` accepts the fixed-width integers, `int` and `nat`; `floating` accepts `real16`, `real16b`, `real32` and `real64`; `numeric` accepts integer, floating, exact `real`, and every complex type; `ordered` accepts integer, floating, and exact `real`, excluding complex values; and `equatable` accepts values with ordinary structural/scalar equality. Constraint failure is diagnosed before a concrete generic body is emitted. User-defined traits/interfaces are intentionally not part of this constraint system.
 
-A repeated function or method name is legal only when the declarations form one generic specialization family within the same scope. Family members keep the same call shape: the same argument count, parameter names, reference/const forms, and default-argument positions. Generic members also keep the same generic type pattern and relationships among their type parameters. The number of generic parameters is unrestricted; for example, a family may use `<T1, T2>`. A concrete exact-type member may specialize the family, and generic members may narrow the same type variables with constraints.
+A repeated function or method name is legal only when the declarations form one generic specialization family within the same scope. Family members keep the same call shape: the same argument count, parameter names, reference/const forms, and default-argument positions. Generic members also keep the same generic type pattern and relationships among their type parameters, except that array and tensor parameter patterns may coexist when their container domains are statically disjoint. The number of generic parameters is unrestricted; for example, a family may use `<T1, T2>`. A concrete exact-type member may specialize the family, and generic members may narrow the same type variables with constraints.
 
 ```quidra
 T1 combine<T1: numeric, T2: integer>(T1 left, T2 right)
@@ -369,7 +378,7 @@ T1 combine<T1: floating, T2: integer>(T1 left, T2 right)
     return left
 ```
 
-A concrete member normally instantiates that generic type pattern. A narrow exception permits a different concrete signature only when known primitive argument types and supported built-in constraints prove that every generic member excludes that signature. For example, an `int` argument cannot match a `floating` type parameter. A mismatch involving a structural or nominal type, shape, reference/const form, value, or unknown type is not a primitive-disjoint proof. The exception does not change the family's argument count, parameter names, default positions, mutation marker, visibility, or ordinary shape checks; it does not introduce implicit conversion or return-type-only overloading. Generic members still share one type-variable pattern, and a concrete signature that is not proved excluded from every generic member remains an error.
+A concrete member normally instantiates that generic type pattern. A narrow exception permits a different concrete signature only when known primitive argument types and supported built-in constraints prove that every generic member excludes that signature. For example, an `int` argument cannot match a `floating` type parameter. A mismatch involving a structural or nominal type, shape, reference/const form, value, or unknown type is not a primitive-disjoint proof. The exception does not change the family's argument count, parameter names, default positions, mutation marker, visibility, or ordinary shape checks; it does not introduce implicit conversion or return-type-only overloading. Within each container domain, generic members still share one type-variable pattern, and a concrete signature that is not proved excluded from every generic member remains an error.
 
 A concrete exact match is preferred to generic members. Between generic matches, a uniquely narrower supported constraint wins, such as `floating` over `numeric`. Domains such as `ordered` and `equatable` that overlap without a unique specificity relation are rejected as ambiguous; the compiler never chooses an arbitrary member. Changing the type-variable relationship between generic members, such as pairing `(T, T)` in one declaration with `(T, U)` in another, is an ordinary overload rather than specialization and is rejected.
 
@@ -938,7 +947,7 @@ A rejected compile-time submission does not become part of the session. EOF exit
 
 `tensor<T>` is a first-class dense numeric N-dimensional value type. `T` must be numeric and is always static; Quidra does not have a tensor type with an unknown element type. Without a shape pattern, rank and known extents are compiler-inferred flow facts obtained from construction, tensor arithmetic (by its broadcasting rule), reshape/index operations, control flow, and ordinary checked function contracts.
 
-An optional brace group is an **exact-rank shape pattern**:
+An optional brace group constrains tensor rank and axis sizes. Without `...`, it is an **exact-rank shape pattern**:
 
 ```quidra
 tensor<real32> any_rank
@@ -948,7 +957,7 @@ tensor<real32>{3, 224, 224} chw_224
 tensor<real32>{_, _, _} any_rank_three
 ```
 
-The number of shape entries is the required rank. Each extent is a `nat` value, a shape variable or `_`. A constant expression is folded by the compiler; a runtime expression is evaluated once and captured. `_` requires the axis to exist and leaves its extent unrestricted. Thus `tensor<real32>{3, _, _}` accepts `[3,H,W]` but rejects `[3,H]`, `[3,H,W,D]`, and `[1,H,W]`. The angle group names the mandatory element type; braces name the shape. Empty slots and trailing commas are invalid.
+Without an ellipsis, the number of shape entries is the required rank. Each extent is a `nat` value, a shape variable or `_`. A constant expression is folded by the compiler; a runtime expression is evaluated once and captured. `_` requires the axis to exist and leaves its extent unrestricted. Thus `tensor<real32>{3, _, _}` accepts `[3,H,W]` but rejects `[3,H]`, `[3,H,W,D]`, and `[1,H,W]`. The angle group names the mandatory element type; braces name the shape. Empty slots and trailing commas are invalid.
 
 Known rank or extent conflicts are rejected statically. A tensor expected type may supply the numeric element type when an explicit shape argument is present, so `tensor<real32> x = tensor.zeros([2, 3])` is valid and avoids repeating `real32`. Without either an explicit tensor type argument or an expected tensor element type, as in `auto x = tensor.zeros([2, 3])`, the element type is ambiguous and the call is rejected. If a source tensor's relevant rank or extent is not statically known, assignment or parameter passing to a constrained destination performs the corresponding runtime constraint check instead of silently assuming the shape. Declared captured constraints remain fixed for that binding across reassignment, while inferred flow facts may weaken after reassignment or control-flow joins. APIs that produce runtime data may additionally validate an expected pattern through their normal result model. Shape constraints and inferred rank/shape facts do not change TensorStorage or the LLVM ABI.
 
@@ -962,6 +971,19 @@ tensor<real32>{1, _, _} o = tensor.ones<real32>([1, 224, 224])
 ```
 
 The direct `tensor<T>(shape)` form creates uninitialized tensor storage. Scalar indexed assignment initializes an element. `tensor.zeros<T>` and `tensor.ones<T>` create fully initialized tensors. When the expected tensor type supplies the element type and every exact extent, `tensor.zeros()` and `tensor.ones()` may use that context to allocate; an unconstrained rank or `_` extent still requires an explicit shape argument. Initialization is tracked independently from shape knowledge and numeric contents; reading an uninitialized element is a deterministic safety failure.
+
+A shape may contain one `...`, standing for zero or more axes. `_` always stands for exactly one axis. Constraints before `...` align from the start; those after it align from the end, without overlap. The minimum rank is the number of explicitly written axes. A statically known rank or extent mismatch is a compile-time error; otherwise the constraint is checked at runtime before an axis is read.
+
+| Shape | Meaning |
+| --- | --- |
+| `{...}` | Any rank, including rank zero; equivalent to `tensor<T>` (prefer the latter) |
+| `{N, ...}` | First axis is N |
+| `{_, N, ...}` | Second axis is N |
+| `{..., N}` | Last axis is N |
+| `{N, ..., M}` | First axis is N and last is M; rank is at least two |
+| `{N, M}` | Exactly two axes, N and M |
+
+The same rules apply to bindings, parameters, results and match cases. Each shape permits at most one ellipsis. Shape variables retain their existing declaration and reference syntax: `tensor<real32>{..., nat C} x = value` binds C to the last axis, while `{nat N, ..., N}` requires equal first and last axes. A later assignment may have a different rank if the captured head and tail constraints still hold. An omitted shape in `tensor.zeros()` or `tensor.ones()` needs an exact-rank context; an ellipsis cannot supply the missing axes.
 
 ### Shapes in braces and shape variables
 
@@ -1594,7 +1616,7 @@ Quidra has one numeric tensor value type: `tensor<T>`. Floating tensors are
 untracked by default. `.track()` starts a dynamic computation graph,
 `.untrack()` disconnects the value from its graph, and `.retrack()` cuts the
 previous graph and starts a new tracked root. Tracking is runtime metadata and
-does not change the source type or its optional exact-rank shape contract.
+does not change the source type or its optional shape contract.
 
 Tracked and untracked tensors may participate in the same operation. If any
 operand is tracked, the result is tracked; untracked operands are constants for

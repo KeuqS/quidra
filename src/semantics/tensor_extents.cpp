@@ -8,6 +8,7 @@
 #include <map>
 #include <set>
 #include <limits>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -23,12 +24,45 @@ struct CallableShape {
     std::map<std::string, ShapeExtent> scalars;
 };
 
+struct TensorContract {
+    std::vector<std::optional<ShapeExtent>> extents;
+    std::optional<std::size_t> ellipsis;
+};
+
+bool pattern_rank_matches(long long rank, std::size_t axes,
+                          std::optional<std::size_t> ellipsis) {
+    if (rank < 0) return false;
+    return ellipsis ? rank >= static_cast<long long>(axes)
+                    : rank == static_cast<long long>(axes);
+}
+
+std::optional<std::size_t> pattern_axis(std::size_t axis, std::size_t axes,
+                                      std::optional<std::size_t> ellipsis,
+                                      long long rank) {
+    if (rank >= 0 && !pattern_rank_matches(rank, axes, ellipsis)) return std::nullopt;
+    if (!ellipsis || axis < *ellipsis) return axis;
+    if (rank < 0) return std::nullopt;
+    return static_cast<std::size_t>(rank) - (axes - axis);
+}
+
+ShapeExtent pattern_extent(const Type& value, std::size_t axis, std::size_t axes,
+                           std::optional<std::size_t> ellipsis) {
+    const auto actual = pattern_axis(axis, axes, ellipsis, value.length);
+    return actual ? tensor_extent(value, *actual) : ShapeExtent{};
+}
+
+void set_pattern_extent(Type& value, std::size_t axis, std::size_t axes,
+                        std::optional<std::size_t> ellipsis, ShapeExtent extent) {
+    if (const auto actual = pattern_axis(axis, axes, ellipsis, value.length))
+        value.set_extent(*actual, std::move(extent));
+}
+
 struct Environment {
     std::map<std::string, Type> tensors;
     std::map<std::string, ShapeExtent> scalars;
     std::unordered_set<std::string> references;
-    std::map<std::string, std::vector<std::optional<ShapeExtent>>> contracts;
-    std::vector<std::optional<ShapeExtent>> result_contract;
+    std::map<std::string, TensorContract> contracts;
+    TensorContract result_contract;
     std::map<std::string, std::vector<std::optional<ShapeExtent>>> array_contracts;
     std::map<std::string, CallableShape> callable_shapes;
 };
@@ -391,7 +425,8 @@ private:
             for (const auto& variable : plan.variables)
                 if (!variable.value && variable.axis >= part.offset && variable.axis < part.offset + part.size)
                     environment.scalars[variable.name] = p < arguments.size()
-                        ? tensor_extent(arguments[p], variable.axis - part.offset) : ShapeExtent{};
+                        ? pattern_extent(arguments[p], variable.axis - part.offset,
+                                         part.size, part.ellipsis) : ShapeExtent{};
         }
         for (const auto& variable : plan.variables)
             if (variable.value && !plan.axes[variable.axis].after_initializer)
@@ -410,15 +445,17 @@ private:
                 parameter < arguments.size() ? arguments[parameter] : Type::simple(TypeKind::Invalid);
             if (part.parameter != 0) {
                 const bool rank_proven = value.kind == TypeKind::Tensor &&
-                    value.length == static_cast<long long>(part.size);
+                    pattern_rank_matches(value.length, part.size, part.ellipsis);
                 complete = complete && rank_proven;
                 if (parameter < parameters.size()) parameters[parameter].rank = rank_proven;
                 if (value.kind == TypeKind::Tensor && value.length >= 0 &&
-                    value.length != static_cast<long long>(part.size))
+                    !rank_proven)
                     throw CompileError({"TENSOR_SHAPE", "Tensor argument rank does not match the signature.", expression.span});
             } else {
-                result.length = static_cast<long long>(part.size);
-                result.tensor_known_shape_prefix.resize(part.size);
+                if (!part.ellipsis) {
+                    result.length = static_cast<long long>(part.size);
+                    result.tensor_known_shape_prefix.resize(part.size);
+                }
             }
             for (std::size_t axis = 0; axis < part.size; ++axis) {
                 const auto& constraint = plan.axes[part.offset + axis];
@@ -428,14 +465,15 @@ private:
                 else if (constraint.check == ShapeAxisCheck::Value)
                     expected = signature_scalar(*constraint.value, environment);
                 if (part.parameter == 0) {
-                    if (expected.kind != ShapeExtent::Kind::Unknown) result.tensor_known_shape_prefix[axis] = expected;
+                    if (expected.kind != ShapeExtent::Kind::Unknown)
+                        set_pattern_extent(result, axis, part.size, part.ellipsis, expected);
                     continue;
                 }
                 if (constraint.check == ShapeAxisCheck::None) {
                     if (parameter < parameters.size()) parameters[parameter].axes.push_back(true);
                     continue;
                 }
-                const auto actual = tensor_extent(value, axis);
+                const auto actual = pattern_extent(value, axis, part.size, part.ellipsis);
                 if (expected.known() && actual.known() && expected.value != actual.value)
                     throw CompileError({"TENSOR_SHAPE", "Tensor argument extent does not match the signature.", expression.span});
                 const bool equal = same_extent(expected, actual);
@@ -527,7 +565,8 @@ private:
             for (const auto& variable : plan.variables)
                 if (!variable.value && variable.axis >= part.offset && variable.axis < part.offset + part.size)
                     environment.scalars[variable.name] =
-                        tensor_extent(environment.tensors.at(input.name), variable.axis - part.offset);
+                        pattern_extent(environment.tensors.at(input.name), variable.axis - part.offset,
+                                       part.size, part.ellipsis);
         }
         for (const auto& variable : plan.variables) {
             if (variable.value && !plan.axes[variable.axis].after_initializer)
@@ -551,20 +590,24 @@ private:
                     captured[axis] = environment.scalars.at(constraint.variable);
             }
             if (part.parameter == 0) {
-                environment.result_contract = std::move(captured);
+                environment.result_contract = {std::move(captured), part.ellipsis};
                 continue;
             }
             const auto& input = signature.parameters.at(part.parameter - 1 + parameter_offset);
-            environment.contracts[input.name] = captured;
+            environment.contracts[input.name] = {captured, part.ellipsis};
             auto& tensor = environment.tensors.at(input.name);
-            tensor.length = static_cast<long long>(part.size);
-            tensor.tensor_known_shape_prefix.resize(part.size);
+            if (!part.ellipsis) {
+                tensor.length = static_cast<long long>(part.size);
+                tensor.tensor_known_shape_prefix.resize(part.size);
+            }
             for (std::size_t axis = 0; axis < part.size; ++axis) {
                 const auto& constraint = plan.axes[part.offset + axis];
                 if (constraint.check == ShapeAxisCheck::Variable)
-                    tensor.tensor_known_shape_prefix[axis] = environment.scalars.at(constraint.variable);
+                    set_pattern_extent(tensor, axis, part.size, part.ellipsis,
+                                       environment.scalars.at(constraint.variable));
                 else if (constraint.check == ShapeAxisCheck::Value)
-                    tensor.tensor_known_shape_prefix[axis] = scalar(*constraint.value, environment);
+                    set_pattern_extent(tensor, axis, part.size, part.ellipsis,
+                                       scalar(*constraint.value, environment));
             }
         }
     }
@@ -868,7 +911,8 @@ private:
     }
 
     void prove_contract(const Expr& expression, const Type& value,
-                        const std::vector<std::optional<ShapeExtent>>& captured) {
+                        const std::vector<std::optional<ShapeExtent>>& captured,
+                        std::optional<std::size_t> ellipsis = std::nullopt) {
         if (captured.empty()) return;
         if (value.kind == TypeKind::Array) {
             auto& proof = checked_.proven_shape_constraints[&expression];
@@ -885,11 +929,11 @@ private:
         if (value.kind != TypeKind::Tensor) return;
         auto& proof = checked_.proven_shape_constraints[&expression];
         proof.axes.clear();
-        proof.rank = value.length == static_cast<long long>(captured.size());
+        proof.rank = pattern_rank_matches(value.length, captured.size(), ellipsis);
         if (value.length >= 0 && !proof.rank)
             throw CompileError({"TENSOR_SHAPE", "Tensor rank does not match its declared shape.", expression.span});
         for (std::size_t axis = 0; axis < captured.size(); ++axis) {
-            const auto actual = tensor_extent(value, axis);
+            const auto actual = pattern_extent(value, axis, captured.size(), ellipsis);
             if (captured[axis] && captured[axis]->known() && actual.known() &&
                 captured[axis]->value != actual.value)
                 throw CompileError({"TENSOR_SHAPE", "Tensor extent does not match its declared shape.", expression.span});
@@ -935,11 +979,13 @@ private:
                     environment.tensors[binding->name] = seed(type, statement.get());
                     if (plan != checked_.shape_plans.end()) {
                         auto& value = environment.tensors[binding->name];
-                        value.length = static_cast<long long>(plan->second.axes.size());
+                        if (!plan->second.ellipsis)
+                            value.length = static_cast<long long>(plan->second.axes.size());
                         value = seed(value, statement.get());
                         for (const auto& variable : plan->second.variables) {
                             if (variable.value) continue;
-                            const auto extent = tensor_extent(value, variable.axis);
+                            const auto extent = pattern_extent(value, variable.axis,
+                                plan->second.axes.size(), plan->second.ellipsis);
                             environment.scalars[variable.name] = extent;
                             // The declaring axis also captures the initial value;
                             // null would incorrectly prove later stores unconstrained.
@@ -958,10 +1004,13 @@ private:
                             if (constraint.check == ShapeAxisCheck::Variable && environment.scalars.contains(constraint.variable))
                                 captured[axis] = environment.scalars.at(constraint.variable);
                         }
-                        if (binding->value) prove_contract(*binding->value, type, captured);
+                        if (binding->value)
+                            prove_contract(*binding->value, type, captured, plan->second.ellipsis);
                         for (std::size_t axis = 0; axis < captured.size(); ++axis)
-                            if (captured[axis]) value.tensor_known_shape_prefix[axis] = *captured[axis];
-                        environment.contracts[binding->name] = captured;
+                            if (captured[axis])
+                                set_pattern_extent(value, axis, captured.size(), plan->second.ellipsis,
+                                                   *captured[axis]);
+                        environment.contracts[binding->name] = {captured, plan->second.ellipsis};
                     }
                     auto& recorded = checked_.binding_types[statement.get()];
                     recorded.length = environment.tensors[binding->name].length;
@@ -989,11 +1038,15 @@ private:
                         target.tensor_known_shape_prefix = value.tensor_known_shape_prefix;
                         if (const auto contract = environment.contracts.find(name->name);
                             contract != environment.contracts.end()) {
-                            prove_contract(*assignment->value, value, contract->second);
-                            target.length = static_cast<long long>(contract->second.size());
+                            const auto& captured = contract->second.extents;
+                            prove_contract(*assignment->value, value, captured, contract->second.ellipsis);
+                            if (!contract->second.ellipsis)
+                                target.length = static_cast<long long>(captured.size());
                             target = seed(target, statement.get());
-                            for (std::size_t axis = 0; axis < contract->second.size(); ++axis)
-                                if (contract->second[axis]) target.tensor_known_shape_prefix[axis] = *contract->second[axis];
+                            for (std::size_t axis = 0; axis < captured.size(); ++axis)
+                                if (captured[axis])
+                                    set_pattern_extent(target, axis, captured.size(), contract->second.ellipsis,
+                                                       *captured[axis]);
                         }
                     }
                     else if (value.kind == TypeKind::Array) {
@@ -1016,7 +1069,8 @@ private:
             } else if (const auto* returned = std::get_if<ReturnStmt>(&statement->data)) {
                 if (returned->value) {
                     const auto value = expression_type(*returned->value, environment);
-                    prove_contract(*returned->value, value, environment.result_contract);
+                    prove_contract(*returned->value, value, environment.result_contract.extents,
+                                   environment.result_contract.ellipsis);
                     returns_[statement.get()] = value;
                 }
                 return false;
@@ -1041,18 +1095,23 @@ private:
                 std::vector<Environment> continuing;
                 for (const auto& arm : match->cases) {
                     auto branch = environment;
-                    if (arm.binder) {
-                        auto type = value;
-                        if (const auto found = checked_.case_types.find(&arm); found != checked_.case_types.end())
-                            type = found->second;
-                        if (type.kind == TypeKind::Tensor) {
-                            if (value.kind == TypeKind::Tensor) type.tensor_known_shape_prefix = value.tensor_known_shape_prefix;
-                            type = seed(type, &arm);
-                            branch.tensors[*arm.binder] = type;
-                            if (const auto plan = checked_.shape_plans.find(&arm.type); plan != checked_.shape_plans.end())
-                                for (const auto& variable : plan->second.variables)
-                                    branch.scalars[variable.name] = tensor_extent(type, variable.axis);
+                    auto type = value;
+                    if (const auto found = checked_.case_types.find(&arm); found != checked_.case_types.end())
+                        type = found->second;
+                    if (type.kind == TypeKind::Tensor) {
+                        const auto plan = checked_.shape_plans.find(&arm.type);
+                        if (value.kind == TypeKind::Tensor) {
+                            type.tensor_known_shape_prefix = value.tensor_known_shape_prefix;
+                            if (plan != checked_.shape_plans.end() && plan->second.ellipsis &&
+                                pattern_rank_matches(value.length, plan->second.axes.size(), plan->second.ellipsis))
+                                type.length = value.length;
                         }
+                        type = seed(type, &arm);
+                        if (arm.binder) branch.tensors[*arm.binder] = type;
+                        if (plan != checked_.shape_plans.end())
+                            for (const auto& variable : plan->second.variables)
+                                branch.scalars[variable.name] = pattern_extent(type, variable.axis,
+                                    plan->second.axes.size(), plan->second.ellipsis);
                     }
                     if (block(arm.body, branch)) continuing.push_back(std::move(branch));
                 }
@@ -1133,7 +1192,7 @@ private:
             if (!parameter.type.dimension_expressions.empty())
                 environment.array_contracts[parameter.name] = capture_array_contract(parameter.type, environment);
         if (signature->second.result.kind == TypeKind::Array)
-            environment.result_contract = capture_array_contract(declaration.return_type, environment);
+            environment.result_contract.extents = capture_array_contract(declaration.return_type, environment);
         for (const auto& parameter : declaration.parameters)
             capture_callable_shape(parameter.name, parameter.type, environment);
         block(declaration.body, environment);

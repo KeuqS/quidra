@@ -564,7 +564,10 @@ void AssignmentLowering::lower_plain_assignment(
                 auto address=builder_.fresh();builder_.emit(FieldReferenceAddress{address,object,it->second.index});builder_.emit(StoreAddress{address,v,t});
             } else builder_.emit(FieldSet{object,it->second.index,v,t});
         } else if(scope_.is_source_reference(name->name)) {
-            builder_.emit(StoreReference{scope_.source_reference(name->name),v,t});
+            const auto reference = scope_.source_reference(name->name);
+            if (const auto* captured = shapes_.tensor_extents(reference))
+                shape_constraints_.emit_shaped_constraint(v, t.kind, *captured, s.span, n.value.get());
+            builder_.emit(StoreReference{reference,v,t});
         } else {
             const auto local_name=scope_.source_local(name->name);
             if(const auto* found=shapes_.tensor_extents(local_name)){

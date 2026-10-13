@@ -364,6 +364,30 @@ static void brace_shapes() {
                        "print(\"{first<tensor<real32>{2}>(xs):int=3}\")\n");
         require(p.statements.size() == 2, "braced type arguments in interpolations");
     }
+    {
+        auto p = parse("tensor<real32>{...} any\n"
+                       "tensor<real32>{3, ...} head\n"
+                       "tensor<real32>{..., nat C} tail\n"
+                       "tensor<real32>{nat N, ..., N} ends\n");
+        const auto type = [&](std::size_t i) -> const TypeName& {
+            return std::get<BindingStmt>(p.statements.at(i)->data).declared_type;
+        };
+        require(type(0).tensor_shape_ellipsis == 0 && type(0).shape_axes.empty() &&
+                    type(0).tensor_shape_prefix.empty() && !type(0).tensor_rank,
+                "bare ellipsis stores a boundary and no placeholder axis");
+        require(type(1).tensor_shape_ellipsis == 1 &&
+                    type(1).tensor_shape_prefix == std::vector<long long>{3} &&
+                    !type(1).tensor_rank,
+                "leading ellipsis pattern does not infer exact rank");
+        require(type(2).tensor_shape_ellipsis == 0 && type(2).shape_axes.size() == 1 &&
+                    type(2).shape_axes[0].kind == ShapeAxisKind::Declare &&
+                    type(2).shape_axes[0].name == "C",
+                "trailing axes keep their declarations");
+        require(type(3).tensor_shape_ellipsis == 1 && type(3).shape_axes.size() == 2 &&
+                    type(3).tensor_shape_expressions.size() == 2 &&
+                    type(3).shape_axes[1].kind == ShapeAxisKind::Bare,
+                "ellipsis boundary separates explicit head and tail axes");
+    }
     reject_code("tensor{2, 3} x = f()\n", "TENSOR_TYPE");
     reject_code("tensor<real32>{int N} x = f()\n", "SHAPE_VARIABLE");
     reject_code("int x = {3}\n", "PARSE_ERROR");
@@ -371,6 +395,11 @@ static void brace_shapes() {
     reject("tensor<real32>{} x\n");
     reject("tensor<real32>{3,} x\n");
     reject("tensor<real32>{3, , _} x\n");
+    reject("tensor<real32>{..., ...} x\n");
+    reject("tensor<real32>{..} x\n");
+    reject("tensor<real32>{....} x\n");
+    reject("tensor<real32>{... 3} x\n");
+    reject("tensor<real32>{...,} x\n");
 }
 
 static void local_declarations() {

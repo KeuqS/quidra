@@ -135,7 +135,7 @@ void put(std::string& out, const ShapeExtent& extent) {
 
 void put(std::string& out, const Type& type) {
     // Type gains a field -> this binding stops compiling.
-    const auto& [kind, first, cases, parameters, length, shape_prefix, known_shape_prefix,
+    const auto& [kind, first, cases, parameters, length, shape_prefix, shape_ellipsis, known_shape_prefix,
                  shape_key, class_name, union_name, case_names] = type;
     out += "T{";
     put(out, kind);
@@ -162,6 +162,10 @@ void put(std::string& out, const Type& type) {
     if (!shape_key.empty()) {
         out += ", key=";
         put(out, shape_key);
+    }
+    if (shape_ellipsis) {
+        out += ", ellipsis=";
+        put(out, *shape_ellipsis);
     }
     out += '}';
 }
@@ -217,6 +221,10 @@ void put(std::string& out, const ir::ShapedConstraintCheck& node) {
         put(out, node.shape_variables);
         out += ", subject=";
         put(out, node.subject);
+    }
+    if (node.ellipsis) {
+        out += ", ellipsis=";
+        put(out, *node.ellipsis);
     }
     out += '}';
 }

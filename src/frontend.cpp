@@ -15,6 +15,7 @@
 #include "quidra/project.hpp"
 #include "quidra/toml_subset.hpp"
 #include "quidra/standard_classes.hpp"
+#include "quidra/types.hpp"
 
 #include "nesting_budget.hpp"
 #include "shape_relations.hpp"
@@ -3042,6 +3043,7 @@ TypeName clone_type(const TypeName& source) {
     out.dimension_expressions = source.dimension_expressions;
     out.span = source.span;
     out.tensor_shape_prefix = source.tensor_shape_prefix;
+    out.tensor_shape_ellipsis = source.tensor_shape_ellipsis;
     out.tensor_shape_expressions = source.tensor_shape_expressions;
     out.tensor_rank = source.tensor_rank;
     out.tensor_known_shape_prefix = source.tensor_known_shape_prefix;
@@ -3114,7 +3116,8 @@ void count_extent_names(const Expr& expression, std::unordered_map<std::string, 
 // its name. So {nat K, K} is <$0,$0>, {nat A, nat B} and {_, _} are <_,_>,
 // and a migrated {nat(n), 2} keeps the key <n,2> of today's <n, 2>.
 std::string brace_shape_key(const std::vector<ShapeAxis>& axes,
-                            const std::unordered_map<std::string, std::string>* shared = nullptr) {
+                            const std::unordered_map<std::string, std::string>* shared = nullptr,
+                            std::optional<std::size_t> ellipsis = {}) {
     std::unordered_map<std::string, int> counts;
     for (const auto& axis : axes) {
         if (axis.kind == ShapeAxisKind::Declare || axis.kind == ShapeAxisKind::DeclareEqual)
@@ -3148,8 +3151,15 @@ std::string brace_shape_key(const std::vector<ShapeAxis>& axes,
     }
     if (shared) rename = *shared;
     std::string out = "<";
-    for (std::size_t i = 0; i < axes.size(); ++i) {
-        if (i) out += ",";
+    bool first_axis = true;
+    for (std::size_t i = 0; i <= axes.size(); ++i) {
+        if (ellipsis == i) {
+            if (!first_axis) out += ",";
+            out += "...";
+            first_axis = false;
+        }
+        if (i == axes.size()) break;
+        if (!first_axis) out += ",";
         const auto& axis = axes[i];
         switch (axis.kind) {
             case ShapeAxisKind::Discard: out += "_"; break;
@@ -3164,6 +3174,7 @@ std::string brace_shape_key(const std::vector<ShapeAxis>& axes,
                 out += axis.value ? canonical_extent_expression(*axis.value, &rename) : "_";
                 break;
         }
+        first_axis = false;
     }
     return out + ">";
 }
@@ -3237,12 +3248,19 @@ std::string canonical_type(const TypeName& type,
         }
         out += ")";
     }
-    if (type.brace_shape) {
-        out += brace_shape_key(type.shape_axes, shapes);
+    if (type.brace_shape && !(type.tensor_shape_ellipsis && type.shape_axes.empty())) {
+        out += brace_shape_key(type.shape_axes, shapes, type.tensor_shape_ellipsis);
     } else if (!type.tensor_shape_prefix.empty()) {
         out += "<";
-        for (std::size_t i = 0; i < type.tensor_shape_prefix.size(); ++i) {
-            if (i) out += ",";
+        bool first_axis = true;
+        for (std::size_t i = 0; i <= type.tensor_shape_prefix.size(); ++i) {
+            if (type.tensor_shape_ellipsis == i) {
+                if (!first_axis) out += ",";
+                out += "...";
+                first_axis = false;
+            }
+            if (i == type.tensor_shape_prefix.size()) break;
+            if (!first_axis) out += ",";
             if (i < type.tensor_shape_expressions.size() &&
                 type.tensor_shape_expressions[i]) {
                 out += canonical_extent_expression(*type.tensor_shape_expressions[i], shapes);
@@ -3250,6 +3268,7 @@ std::string canonical_type(const TypeName& type,
                 const auto extent = type.tensor_shape_prefix[i];
                 out += extent < 0 ? "_" : std::to_string(extent);
             }
+            first_axis = false;
         }
         out += ">";
     }
@@ -3854,7 +3873,8 @@ private:
 
     bool generic_more_specific(
         const FunctionDecl& left, const FunctionDecl& right) const {
-        if (left.type_parameters.size() != right.type_parameters.size()) return false;
+        if (left.type_parameters.size() != right.type_parameters.size() ||
+            generic_call_shape(left) != generic_call_shape(right)) return false;
         bool strict = false;
         for (std::size_t i = 0; i < left.type_parameters.size(); ++i) {
             const auto a = function_constraint(left, i);
@@ -3869,6 +3889,19 @@ private:
     bool generic_domains_disjoint(
         const FunctionDecl& left, const FunctionDecl& right) const {
         if (left.type_parameters.size() != right.type_parameters.size()) return false;
+        if (left.parameters.size() != right.parameters.size()) return false;
+        // A tensor and an array are distinct outer value domains regardless of
+        // their element types. This admits container implementations in one
+        // specialization family without introducing ordinary overloads.
+        for (std::size_t i = 0; i < left.parameters.size(); ++i) {
+            const auto& a = left.parameters[i].type;
+            const auto& b = right.parameters[i].type;
+            const bool a_tensor = a.name == "tensor" && a.dimensions.empty();
+            const bool b_tensor = b.name == "tensor" && b.dimensions.empty();
+            if ((a_tensor && !b.dimensions.empty()) ||
+                (b_tensor && !a.dimensions.empty())) return true;
+        }
+        if (generic_call_shape(left) != generic_call_shape(right)) return false;
         for (std::size_t i = 0; i < left.type_parameters.size(); ++i) {
             if (constraints_disjoint(
                     function_constraint(left, i), function_constraint(right, i))) {
@@ -3955,20 +3988,25 @@ private:
                 family[1]->span);
         }
 
-        const auto generic_shape = generic_call_shape(*generics.front());
-        for (const auto* function : generics) {
-            if (generic_call_shape(*function) != generic_shape ||
-                function->type_parameters.size() != generics.front()->type_parameters.size()) {
-                frontend_error(
-                    "DUPLICATE_NAME",
-                    "Generic specializations of '" + name +
-                        "' must keep one generic call shape; ordinary overloads are not supported.",
-                    function->span);
+        for (std::size_t i = 0; i < generics.size(); ++i) {
+            for (std::size_t j = i + 1; j < generics.size(); ++j) {
+                if (generics[i]->type_parameters.size() != generics[j]->type_parameters.size() ||
+                    (generic_call_shape(*generics[i]) != generic_call_shape(*generics[j]) &&
+                     !generic_domains_disjoint(*generics[i], *generics[j]))) {
+                    frontend_error(
+                        "DUPLICATE_NAME",
+                        "Generic specializations of '" + name +
+                            "' must keep one generic call shape or have disjoint tensor/array domains; ordinary overloads are not supported.",
+                        generics[j]->span);
+                }
             }
         }
 
         for (const auto* function : concretes) {
-            if (!concrete_matches_generic_pattern(*generics.front(), *function) &&
+            if (!std::any_of(generics.begin(), generics.end(),
+                    [&](const FunctionDecl* generic) {
+                        return concrete_matches_generic_pattern(*generic, *function);
+                    }) &&
                 !std::all_of(generics.begin(), generics.end(),
                     [&](const FunctionDecl* generic) {
                         return concrete_outside_generic_primitive_domain(*generic, *function);
@@ -4472,6 +4510,22 @@ private:
                     }
                     base->tensor_rank = rank;
                 }
+                if (base->tensor_shape_ellipsis) {
+                    // Leading constraints are usable flow facts. A dynamic
+                    // middle has no fixed position to project trailing axes
+                    // through, so indexing does not retain that source shape.
+                    const auto leading = *base->tensor_shape_ellipsis;
+                    if (base->tensor_known_shape_prefix.size() < leading)
+                        base->tensor_known_shape_prefix.resize(leading);
+                    for (std::size_t axis = 0; axis < leading; ++axis)
+                        if (base->tensor_shape_prefix[axis] >= 0)
+                            base->tensor_known_shape_prefix[axis] = base->tensor_shape_prefix[axis];
+                    base->tensor_shape_prefix.clear();
+                    base->tensor_shape_expressions.clear();
+                    base->tensor_shape_ellipsis.reset();
+                    base->shape_axes.clear();
+                    base->brace_shape = false;
+                }
                 const auto project_prefix = [&](auto& prefix) {
                     std::size_t axis = 0;
                     for (const auto& item : index->items) {
@@ -4525,6 +4579,10 @@ private:
                 if (call->method == "reshape" && call->args.size() == 1) {
                     auto result = clone_type(*receiver);
                     result.tensor_shape_prefix.clear();
+                    result.tensor_shape_ellipsis.reset();
+                    result.tensor_shape_expressions.clear();
+                    result.shape_axes.clear();
+                    result.brace_shape = false;
                     result.tensor_rank.reset();
                     result.tensor_known_shape_prefix.clear();
                     const auto shape =
@@ -4544,6 +4602,10 @@ private:
                     // selection, so discard extent facts rather than returning
                     // an unknown type or inventing a permuted shape.
                     result.tensor_shape_prefix.clear();
+                    result.tensor_shape_ellipsis.reset();
+                    result.tensor_shape_expressions.clear();
+                    result.shape_axes.clear();
+                    result.brace_shape = false;
                     result.tensor_known_shape_prefix.clear();
                     result.span = expression.span;
                     return result;
@@ -4551,6 +4613,10 @@ private:
                 if (call->method == "gather" && call->args.size() == 2) {
                     auto result = clone_type(*receiver);
                     result.tensor_shape_prefix.clear();
+                    result.tensor_shape_ellipsis.reset();
+                    result.tensor_shape_expressions.clear();
+                    result.shape_axes.clear();
+                    result.brace_shape = false;
                     result.tensor_rank.reset();
                     result.tensor_known_shape_prefix.clear();
                     const auto shape =
@@ -4566,6 +4632,10 @@ private:
                 if (call->method == "scatter" && call->args.size() == 2) {
                     auto result = clone_type(*receiver);
                     result.tensor_shape_prefix.clear();
+                    result.tensor_shape_ellipsis.reset();
+                    result.tensor_shape_expressions.clear();
+                    result.shape_axes.clear();
+                    result.brace_shape = false;
                     result.tensor_rank.reset();
                     result.tensor_known_shape_prefix.clear();
                     const auto shape =
@@ -4686,23 +4756,12 @@ private:
         }
         if (pattern.name == "tensor" &&
             !pattern.tensor_shape_prefix.empty()) {
-            const auto rank = pattern.tensor_shape_prefix.size();
-            if (actual.tensor_rank &&
-                static_cast<std::size_t>(*actual.tensor_rank) != rank) {
-                return false;
-            }
-            for (std::size_t axis = 0; axis < rank; ++axis) {
-                const auto required = pattern.tensor_shape_prefix[axis];
-                if (required < 0) continue;
-                std::optional<long long> actual_extent;
-                if (axis < actual.tensor_known_shape_prefix.size()) {
-                    actual_extent = actual.tensor_known_shape_prefix[axis].known();
-                } else if (axis < actual.tensor_shape_prefix.size() &&
-                           actual.tensor_shape_prefix[axis] >= 0) {
-                    actual_extent = actual.tensor_shape_prefix[axis];
-                }
-                if (actual_extent && *actual_extent != required) return false;
-            }
+            const auto shape_type = [](const TypeName& name) {
+                return Type::tensor(Type::simple(TypeKind::Invalid),
+                    name.tensor_rank.value_or(-1), name.tensor_shape_prefix,
+                    name.tensor_known_shape_prefix, name.tensor_shape_ellipsis);
+            };
+            if (!tensor_satisfies_shape_prefix(shape_type(actual), shape_type(pattern))) return false;
         }
         for (std::size_t i = 0; i < pattern.dimensions.size(); ++i) {
             const auto required = pattern.dimensions[i];
@@ -5002,9 +5061,65 @@ private:
         throw std::logic_error("Generic specialization selection lost its candidate.");
     }
 
+    enum class ContainerDomain { Array, Tensor };
+
+    std::optional<ContainerDomain> expression_container_domain(
+        const Expr& expression, const std::string& current_class) const {
+        const auto actual = infer_expression_type(expression, current_class);
+        if (actual && !actual->dimensions.empty()) return ContainerDomain::Array;
+        if (actual && actual->name == "tensor") return ContainerDomain::Tensor;
+        // The outer domain can be known while an element still needs contextual
+        // typing from the explicit type argument. Every conditional branch must
+        // agree; an unknown or mixed branch remains unknown.
+        if (std::holds_alternative<ArrayExpr>(expression.data) ||
+            std::holds_alternative<ArrayComprehensionExpr>(expression.data))
+            return ContainerDomain::Array;
+        if (const auto* call = std::get_if<CallExpr>(&expression.data);
+            call && (call->callee == "tensor" || call->callee == "$std.tensor.zeros" ||
+                     call->callee == "$std.tensor.ones")) return ContainerDomain::Tensor;
+        if (const auto* conditional = std::get_if<IfExpr>(&expression.data)) {
+            const auto domain = expression_container_domain(*conditional->otherwise, current_class);
+            if (!domain) return std::nullopt;
+            for (const auto& value : conditional->values)
+                if (expression_container_domain(*value, current_class) != domain) return std::nullopt;
+            return domain;
+        }
+        return std::nullopt;
+    }
+
+    void filter_explicit_container_domains(
+        std::vector<const FunctionDecl*>& candidates,
+        const std::vector<CallArg>& args,
+        const std::string& current_class) const {
+        if (candidates.empty()) return;
+        const auto shape = generic_call_shape(*candidates.front());
+        const bool different_domains = std::any_of(candidates.begin(), candidates.end(),
+            [&](const FunctionDecl* function) { return generic_call_shape(*function) != shape; });
+        if (different_domains) {
+            std::vector<std::optional<ContainerDomain>> domains;
+            for (const auto& argument : args) {
+                domains.push_back(expression_container_domain(*argument.value, current_class));
+            }
+            std::erase_if(candidates, [&](const FunctionDecl* function) {
+                const auto targets = bind_family_arguments(*function, args);
+                if (!targets) return false; // The ordinary call checker diagnoses this.
+                for (std::size_t i = 0; i < args.size(); ++i) {
+                    const auto& pattern = function->parameters[(*targets)[i]].type;
+                    if ((domains[i] == ContainerDomain::Array && pattern.name == "tensor" &&
+                         pattern.dimensions.empty()) ||
+                        (domains[i] == ContainerDomain::Tensor && !pattern.dimensions.empty()))
+                        return true;
+                }
+                return false;
+            });
+        }
+    }
+
     std::string resolve_function_family_explicit(
         const std::string& name,
         const std::vector<TypeName>& source_arguments,
+        const std::vector<CallArg>& args,
+        const std::string& current_class,
         SourceSpan span) {
         std::vector<TypeName> arguments;
         for (const auto& argument : source_arguments) {
@@ -5023,6 +5138,12 @@ private:
                 "GENERIC_CONSTRAINT",
                 "Explicit type arguments do not match any generic specialization of '" +
                     name + "'.",
+                span);
+        }
+        filter_explicit_container_domains(candidates, args, current_class);
+        if (candidates.empty()) {
+            frontend_error("SPECIALIZATION_NO_MATCH",
+                "No specialization of '" + name + "' matches the statically known argument types.",
                 span);
         }
         const auto* chosen = most_specific_generic(candidates, span, name);
@@ -5324,13 +5445,13 @@ private:
                            class_has_method_specialization_family(
                                current_class, copy.callee)) {
                     copy.callee = resolve_method_family_explicit(
-                        current_class, copy.callee, type_arguments, source.span);
+                        current_class, copy.callee, type_arguments, copy.args, current_class, source.span);
                 } else if (current_class.size() && class_has_generic_method(current_class, copy.callee)) {
                     request_method_for_class(current_class, copy.callee, type_arguments, source.span);
                     copy.callee = method_name(copy.callee, type_arguments);
                 } else if (specialization_families_.contains(copy.callee)) {
                     copy.callee = resolve_function_family_explicit(
-                        copy.callee, type_arguments, source.span);
+                        copy.callee, type_arguments, copy.args, current_class, source.span);
                 } else if (function_templates_.contains(copy.callee)) {
                     copy.callee = instantiate_function(copy.callee, type_arguments);
                 } else {
@@ -5472,7 +5593,7 @@ private:
                         receiver_type->name, copy.method)) {
                     copy.method = resolve_method_family_explicit(
                         receiver_type->name, copy.method,
-                        type_arguments, source.span);
+                        type_arguments, copy.args, current_class, source.span);
                 } else {
                     request_method_for_class(
                         receiver_type->name, copy.method,
@@ -6143,6 +6264,8 @@ private:
         const std::string& class_name,
         const std::string& name,
         const std::vector<TypeName>& source_arguments,
+        const std::vector<CallArg>& args,
+        const std::string& current_class,
         SourceSpan span) {
         std::vector<TypeName> arguments;
         for (const auto& argument : source_arguments) {
@@ -6167,6 +6290,12 @@ private:
                 span);
         }
 
+        filter_explicit_container_domains(candidates, args, current_class);
+        if (candidates.empty()) {
+            frontend_error("SPECIALIZATION_NO_MATCH",
+                "No specialization of method '" + name + "' matches the statically known argument types.",
+                span);
+        }
         const auto* chosen = most_specific_generic(candidates, span, name);
         for (auto& member : family) {
             if (&member.signature == chosen) {

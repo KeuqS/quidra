@@ -29,6 +29,7 @@ struct ShapedConstraintCheck {
     // value is stored in: a failure names both (SHAPE_MISMATCH).
     std::vector<std::string> shape_variables{};
     std::string subject{};
+    std::optional<std::size_t> ellipsis{};
 };
 struct ExtentEqualCheck {
     ValueId actual;

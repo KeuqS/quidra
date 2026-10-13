@@ -189,6 +189,9 @@ struct ShapeAxisPlan {
 struct ShapePlan {
     std::vector<ShapeAxisPlan> axes;
     std::vector<ShapeVariable> variables;
+    // Explicit axes before this boundary align with the head; the rest
+    // align with the tail. The omitted middle contains zero or more axes.
+    std::optional<std::size_t> ellipsis{};
     // The axes whose expression is evaluated after the initializer (a
     // `nat N = EXPR` or an unnamed expression over the shape's own
     // variables), in dependency order, left to right among independent ones.
@@ -209,6 +212,7 @@ struct SignatureShapePart {
     std::size_t offset{};
     std::size_t size{};
     std::string subject;
+    std::optional<std::size_t> ellipsis{};
 };
 
 struct SignatureShapeUnit {

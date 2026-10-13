@@ -113,7 +113,7 @@ void FunctionLowering::begin_function(Function out, bool signature_layout) {
             else extents.push_back(std::nullopt);
         }
         builder_.emit(ShapedConstraintCheck{
-            parameter,p.type.kind,std::move(extents),0,0,{},{}});
+            parameter,p.type.kind,std::move(extents),0,0,{},{},p.type.tensor_shape_ellipsis});
     }
 }
 

@@ -17,18 +17,22 @@ using namespace llvm_text;
 using namespace llvm_text::types;
 
 void CheckEmitter::emit(const ir::ShapedConstraintCheck& n,const ir::Instruction&){
-    builder_.call(runtime_abi::tensor::rank_check,{{ptr,symbols_.value(n.value)},{i64,n.extents.size()},{i64,sites_.line(n.line)},{i64,sites_.column(n.column)}});
+    const auto rank = static_cast<long long>(n.extents.size());
+    builder_.call(runtime_abi::tensor::rank_check,{{ptr,symbols_.value(n.value)},{i64,n.ellipsis ? -rank - 1 : rank},{i64,sites_.line(n.line)},{i64,sites_.column(n.column)}});
     for(std::size_t axis=0;axis<n.extents.size();++axis){
         if(!n.extents[axis]) continue;
+        const auto runtime_axis = n.ellipsis && axis >= *n.ellipsis
+            ? -static_cast<long long>(n.extents.size() - axis)
+            : static_cast<long long>(axis);
         // An axis that a shape variable fixes names the variable and the
         // binding when it fails (L17).
         if(axis<n.shape_variables.size()&&!n.shape_variables[axis].empty()){
             const auto variable=pool_.intern(n.shape_variables[axis]);
             const auto subject=pool_.intern(n.subject);
-            builder_.call(runtime_abi::shape_variable_support::check,{{ptr,symbols_.value(n.value)},{i64,axis},{i64,symbols_.value(*n.extents[axis])},{ptr,"@"+variable},{ptr,"@"+subject},{i64,sites_.line(n.line)},{i64,sites_.column(n.column)}});
+            builder_.call(runtime_abi::shape_variable_support::check,{{ptr,symbols_.value(n.value)},{i64,runtime_axis},{i64,symbols_.value(*n.extents[axis])},{ptr,"@"+variable},{ptr,"@"+subject},{i64,sites_.line(n.line)},{i64,sites_.column(n.column)}});
             continue;
         }
-        builder_.call(runtime_abi::tensor::extent_check,{{ptr,symbols_.value(n.value)},{i64,axis},{i64,symbols_.value(*n.extents[axis])},{i64,sites_.line(n.line)},{i64,sites_.column(n.column)}});
+        builder_.call(runtime_abi::tensor::extent_check,{{ptr,symbols_.value(n.value)},{i64,runtime_axis},{i64,symbols_.value(*n.extents[axis])},{i64,sites_.line(n.line)},{i64,sites_.column(n.column)}});
     }
 }
 

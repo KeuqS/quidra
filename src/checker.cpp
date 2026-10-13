@@ -544,7 +544,7 @@ void weaken_loop_tensor_facts(
         const auto it = variables.find(name);
         if (it == variables.end() ||
             it->second.kind != TypeKind::Tensor) continue;
-        it->second.length = it->second.tensor_shape_prefix.empty()
+        it->second.length = it->second.tensor_shape_ellipsis || it->second.tensor_shape_prefix.empty()
             ? -1
             : static_cast<long long>(it->second.tensor_shape_prefix.size());
         it->second.tensor_known_shape_prefix.clear();
@@ -682,7 +682,11 @@ std::optional<long long> broadcast_result_extent(
 void apply_broadcast_shape(const Type& left, const Type& right, Type& result) {
     for (std::size_t axis = 0; axis < result.tensor_shape_prefix.size(); ++axis) {
         if (result.tensor_shape_prefix[axis] != 1) continue;
-        const auto extent = broadcast_result_extent(1, tensor_known_extent(right, axis));
+        const auto physical = result.tensor_shape_ellipsis && axis >= *result.tensor_shape_ellipsis && result.length < 0
+            ? std::optional<std::size_t>{}
+            : std::optional<std::size_t>{tensor_pattern_axis(result, axis, result.length)};
+        const auto extent = broadcast_result_extent(1,
+            physical ? tensor_known_extent(right, *physical) : std::nullopt);
         result.tensor_shape_prefix[axis] = extent ? *extent : -1;
     }
     result.tensor_known_shape_prefix.clear();
@@ -3039,11 +3043,11 @@ Type Checker::resolve_type(const TypeName& source, bool auto_ok) {
         } else if (!is_tensor_numeric(element) && element.kind != TypeKind::Bool) {
             error("INVALID_TYPE", "tensor element type must be a fixed-width native numeric type or bool.", source.arguments.front().span);
         }
-        const auto rank = !source.tensor_shape_prefix.empty()
+        const auto rank = source.tensor_shape_ellipsis ? -1 : !source.tensor_shape_prefix.empty()
             ? static_cast<long long>(source.tensor_shape_prefix.size())
             : source.tensor_rank.value_or(-1);
         type = Type::tensor(element, rank, source.tensor_shape_prefix,
-                            source.tensor_known_shape_prefix);
+                            source.tensor_known_shape_prefix, source.tensor_shape_ellipsis);
     } else if (source.name == "func") {
         if (source.arguments.size() != 1) {
             error("GENERIC_ARITY", "func requires exactly one result type.", source.span);
@@ -3563,8 +3567,15 @@ Type Checker::check_index_expr(const Expr& expression, const IndexExpr& node_val
                 }
             }
         }
-        auto shape_prefix = base.tensor_shape_prefix;
+        auto shape_prefix = base.tensor_shape_ellipsis ? std::vector<long long>{} : base.tensor_shape_prefix;
         auto known_shape_prefix = base.tensor_known_shape_prefix;
+        if (base.tensor_shape_ellipsis) {
+            const auto leading = *base.tensor_shape_ellipsis;
+            if (known_shape_prefix.size() < leading) known_shape_prefix.resize(leading);
+            for (std::size_t axis = 0; axis < leading; ++axis)
+                if (known_shape_prefix[axis].kind == ShapeExtent::Kind::Unknown)
+                    known_shape_prefix[axis] = base.declared_extent(axis);
+        }
         std::size_t axis = 0;
         for (const auto& item : node->items) {
             if (!item.slice) {
@@ -5810,7 +5821,7 @@ Type Checker::check_builtin_call_expr(const Expr& expression,
                                   expression.span);
                         }
                         if (!expected || expected->kind != TypeKind::Tensor ||
-                            expected->tensor_shape_prefix.empty()) {
+                            (expected->tensor_shape_prefix.empty() || expected->tensor_shape_ellipsis)) {
                             error("ARGUMENT_MISMATCH",
                                   "Contextual tensor.zeros()/tensor.ones() requires an exact-rank expected tensor shape.",
                                   expression.span);
@@ -5871,23 +5882,26 @@ Type Checker::check_builtin_call_expr(const Expr& expression,
                         !expected->tensor_shape_prefix.empty()) {
                         if (const auto* literal =
                                 std::get_if<ArrayExpr>(&node->args[*shape_index].value->data)) {
-                            if (literal->elements.size() !=
-                                expected->tensor_shape_prefix.size()) {
+                            if (expected->tensor_shape_ellipsis
+                                    ? literal->elements.size() < expected->tensor_shape_prefix.size()
+                                    : literal->elements.size() != expected->tensor_shape_prefix.size()) {
                                 error("TYPE_MISMATCH",
                                       "Tensor shape argument contradicts the expected tensor rank.",
                                       node->args[*shape_index].span);
                             } else {
                                 for (std::size_t axis = 0;
-                                     axis < literal->elements.size(); ++axis) {
+                                     axis < expected->tensor_shape_prefix.size(); ++axis) {
+                                    const auto actual_axis = tensor_pattern_axis(*expected, axis,
+                                        static_cast<long long>(literal->elements.size()));
                                     const auto required =
                                         expected->tensor_shape_prefix[axis];
                                     if (required < 0) continue;
                                     const auto extent = constant_eval::integer(
-                                        *literal->elements[axis], &const_integer_values_);
+                                        *literal->elements[actual_axis], &const_integer_values_);
                                     if (extent && *extent != required) {
                                         error("TYPE_MISMATCH",
                                               "Tensor shape argument contradicts the expected tensor shape.",
-                                              literal->elements[axis]->span);
+                                              literal->elements[actual_axis]->span);
                                     }
                                 }
                             }
@@ -6196,7 +6210,7 @@ Type Checker::check_call_expr(const Expr& expression,
                         const auto converted =
                             Type::tensor(*target, current.length,
                                          current.tensor_shape_prefix,
-                                         current.tensor_known_shape_prefix);
+                                         current.tensor_known_shape_prefix, current.tensor_shape_ellipsis);
                         if (numeric_conversion_policy(*current.first, *target) ==
                             NumericConversionPolicy::ExplicitRangeCheck) {
                             return Type::union_of({converted, error_type});
@@ -7774,7 +7788,7 @@ Type Checker::check_expr(const Expr& expression, const Type* expected) {
                 }
                 type = Type::tensor(simple(TypeKind::Bool), tensor_type.length,
                                     tensor_type.tensor_shape_prefix,
-                                    tensor_type.tensor_known_shape_prefix);
+                                    tensor_type.tensor_known_shape_prefix, tensor_type.tensor_shape_ellipsis);
             } else {
                 if (!is_tensor_numeric(element)) {
                     error("TYPE_MISMATCH",
@@ -8508,8 +8522,10 @@ void Checker::check_binding_stmt(const Stmt& statement, const BindingStmt& node)
             const auto raw = node.value ? raw_types_.find(node.value.get()) : raw_types_.end();
             shape_plan->rank_unknown =
                 raw == raw_types_.end() || raw->second.kind != TypeKind::Tensor ||
-                raw->second.length !=
-                    static_cast<long long>(node.declared_type.shape_axes.size());
+                raw->second.length < 0 ||
+                (shape_plan->ellipsis
+                    ? raw->second.length < static_cast<long long>(shape_plan->axes.size())
+                    : raw->second.length != static_cast<long long>(shape_plan->axes.size()));
             // A repeat whose extents are both known (`{nat K, K}` over a
             // [2, 3] value) contradicts at compile time.
             if (!shape_plan->rank_unknown) {
@@ -8518,8 +8534,10 @@ void Checker::check_binding_stmt(const Stmt& statement, const BindingStmt& node)
                     if (current.check != ShapeAxisCheck::Variable) continue;
                     const auto& variable = shape_plan->variables[current.variable_index];
                     if (variable.value) continue;
-                    const auto bound = tensor_known_extent(raw->second, variable.axis);
-                    const auto extent = tensor_known_extent(raw->second, axis);
+                    const auto bound_axis = tensor_pattern_axis(type, variable.axis, raw->second.length);
+                    const auto physical_axis = tensor_pattern_axis(type, axis, raw->second.length);
+                    const auto bound = tensor_known_extent(raw->second, bound_axis);
+                    const auto extent = tensor_known_extent(raw->second, physical_axis);
                     if (bound && extent && *bound != *extent) {
                         error("TENSOR_SHAPE",
                               "Shape variable '" + variable.name + "' is " +
@@ -8766,7 +8784,7 @@ void Checker::check_assign_stmt(const Stmt& statement, const AssignStmt& node) {
             }
             // A later store into a binding with a brace shape is checked
             // against its declared extents, so its shape variables are kept.
-            if (const auto found = shape_binding_plans_.find(name->name);
+            if (const auto found = shape_binding_plans_.find(reference_root(name->name));
                 found != shape_binding_plans_.end() && variables_.contains(name->name)) {
                 for (auto& variable : found->second->variables) variable.read = true;
             }
@@ -8853,7 +8871,7 @@ void Checker::check_assign_stmt(const Stmt& statement, const AssignStmt& node) {
                 expr_types_[node.target_expr()] = raw_types_[node.target_expr()] = type;
                 auto expected = type;
                 if (expected.kind == TypeKind::Tensor) {
-                    if (expected.tensor_shape_prefix.empty()) expected.length = -1;
+                    if (expected.tensor_shape_ellipsis || expected.tensor_shape_prefix.empty()) expected.length = -1;
                     expected.tensor_known_shape_prefix.clear();
                 }
                 check_expr(*node.value, &expected);
@@ -10161,9 +10179,12 @@ void Checker::check_match_stmt(const Stmt& statement, const MatchStmt& node_valu
         if (brace_case) {
             auto shaped = requested_case_type;
             case_plan = &check_brace_shape(match_case.type, shaped, true);
-            case_plan->rank_unknown =
+            case_plan->rank_unknown = !(case_plan->ellipsis && case_plan->axes.empty()) && (
                 case_type.kind != TypeKind::Tensor ||
-                case_type.length != static_cast<long long>(match_case.type.shape_axes.size());
+                case_type.length < 0 ||
+                (case_plan->ellipsis
+                    ? case_type.length < static_cast<long long>(case_plan->axes.size())
+                    : case_type.length != static_cast<long long>(case_plan->axes.size())));
         }
 
         if (match_case.binder) {
@@ -10197,6 +10218,12 @@ void Checker::check_match_stmt(const Stmt& statement, const MatchStmt& node_valu
                     (axis.check == ShapeAxisCheck::Value && !axis.constant)) {
                     equality = true;
                 }
+            }
+            for (std::size_t axis = 0; axis < case_plan->axes.size(); ++axis) {
+                const auto expected = case_plan->axes[axis].constant;
+                if (!expected || case_plan->rank_unknown) continue;
+                const auto physical = tensor_pattern_axis(requested_case_type, axis, case_type.length);
+                if (tensor_known_extent(case_type, physical) != expected) equality = true;
             }
             case_plan->conditional = equality || case_plan->rank_unknown;
             if (!case_plan->conditional) seen.insert(tag);

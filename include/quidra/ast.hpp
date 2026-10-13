@@ -3,6 +3,7 @@
 #include "quidra/diagnostic.hpp"
 #include "quidra/compiler_extension.hpp"
 #include "quidra/slice_form.hpp"
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <map>
@@ -47,11 +48,14 @@ struct TypeName {
     // evaluated once when the binding is created and then captured.
     std::vector<std::shared_ptr<Expr>> dimension_expressions;
     SourceSpan span{};
-    // tensor_shape_prefix stores a source-visible exact shape pattern for
-    // tensor values. Nonnegative entries are fixed extents and -1 is
+    // tensor_shape_prefix stores the explicit axes of a source shape pattern
+    // for tensor values. Nonnegative entries are fixed extents and -1 is
     // the '_' wildcard. tensor_rank and tensor_known_shape_prefix also carry
     // compiler-internal flow refinements.
     std::vector<long long> tensor_shape_prefix;
+    // The boundary between explicit leading and trailing axes when `...`
+    // accepts any number of intervening axes. No placeholder axis is stored.
+    std::optional<std::size_t> tensor_shape_ellipsis{};
     // Null means '_' for the corresponding axis. Non-null expressions are
     // evaluated once when a binding is created.
     std::vector<std::shared_ptr<Expr>> tensor_shape_expressions;

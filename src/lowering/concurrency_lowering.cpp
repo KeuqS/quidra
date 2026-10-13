@@ -49,10 +49,13 @@ void ConcurrencyLowering::lower_parallel(const Stmt& statement,const ParallelStm
                 if(found==checked_.shape_plans.end())throw std::logic_error("parallel brace shape lacks checked plan");
                 const auto& shape_plan=found->second;
                 ShapeConstraintLowering::BraceShape shape;
+                shape.extents.ellipsis = shape_plan.ellipsis;
                 shape.extents.resize(shape_plan.axes.size());
                 shape.variables.resize(shape_plan.variables.size());
                 for(std::size_t axis=0;axis<shape_plan.axes.size();++axis) {
-                    if(shape_plan.axes[axis].check==ShapeAxisCheck::None)continue;
+                    const bool reads_extent = std::any_of(shape_plan.variables.begin(), shape_plan.variables.end(),
+                        [&](const auto& variable) { return variable.axis == axis && variable.read; });
+                    if(shape_plan.axes[axis].check==ShapeAxisCheck::None && !reads_extent)continue;
                     const auto extent=builder_.hidden("parallel.extent");
                     parent.scope_.local_type(extent)=Type::simple(TypeKind::Int64);
                     builder_.emit(DeclareLocal{extent,Type::simple(TypeKind::Int64),{},0,0});

@@ -171,7 +171,7 @@ std::string instruction_text(const Instruction& i){ std::ostringstream out; std:
     }
     if constexpr(std::is_same_v<T,ArrayNumericCast>)out<<"%"<<n.out<<" = array.numeric_cast %"<<n.array<<" : "<<type_name(n.source_type)<<" -> "<<type_name(n.target_type);
     if constexpr(std::is_same_v<T,TensorCast>)out<<"%"<<n.out<<" = tensor.numeric_cast %"<<n.tensor<<" : "<<type_name(n.source_type)<<" -> "<<type_name(n.target_type);
-    if constexpr(std::is_same_v<T,ShapedConstraintCheck>)out<<"shape.constraint %"<<n.value<<" rank="<<n.extents.size();
+    if constexpr(std::is_same_v<T,ShapedConstraintCheck>){out<<"shape.constraint %"<<n.value<<" rank"<<(n.ellipsis ? ">=" : "=")<<n.extents.size();if(n.ellipsis)out<<" ellipsis="<<*n.ellipsis;}
     if constexpr(std::is_same_v<T,ExtentEqualCheck>)out<<(n.for_collection_lengths?"for.length.check %":"extent.check %")<<n.actual<<", %"<<n.expected;
     if constexpr(std::is_same_v<T,ParseNumber>)out<<"%"<<n.out<<" = parse %"<<n.text<<" : "<<type_name(n.target_type)<<" -> "<<type_name(n.result_type);
     if constexpr(std::is_same_v<T,ParseNumberDirect>)out<<"%"<<n.value_out<<", %"<<n.ok_out<<", %"<<n.error_out<<" = parse.direct %"<<n.text<<" : "<<type_name(n.target_type);

@@ -79,8 +79,30 @@ void StatementLowering::lower_binding(const Stmt& s, const BindingStmt& n) {
     if(n.reference){
         const auto ir_name=hoisted?scope_.source_reference(n.name):scope_.bind_source_reference(builder_,n.name,t);
         if(!hoisted) builder_.emit(DeclareReference{ir_name,t,n.is_const});
+        const ShapePlan* plan = nullptr;
+        std::optional<ShapeConstraintLowering::BraceShape> shape;
+        if (t.kind == TypeKind::Tensor && n.declared_type.brace_shape) {
+            if (const auto found = checked_.shape_plans.find(&n.declared_type);
+                found != checked_.shape_plans.end()) {
+                plan = &found->second;
+                shape = shape_constraints_.capture_brace_shape(*plan, s.span);
+            }
+        }
         auto address=n.value ? lowerer_.lower_address(*n.value, !n.is_const) : 0;
         builder_.emit(BindReference{ir_name,address});
+        if (shape && n.value) {
+            const auto value = builder_.fresh();
+            builder_.emit(LoadReference{value, ir_name, t});
+            shape_constraints_.finish_brace_shape(*plan, *shape, value, t.kind, n.name, s.span);
+            shapes_.constrain_tensor(ir_name, shape->extents);
+        } else if (t.kind == TypeKind::Tensor && n.value) {
+            if (const auto* source = std::get_if<NameExpr>(&n.value->data)) {
+                const auto source_name = scope_.is_source_reference(source->name)
+                    ? scope_.source_reference(source->name) : scope_.source_local(source->name);
+                if (const auto* captured = shapes_.tensor_extents(source_name))
+                    shapes_.constrain_tensor(ir_name, *captured);
+            }
+        }
         return;
     }
     const auto ir_name=hoisted?scope_.source_local(n.name):scope_.bind_source_local(builder_,n.name,t);

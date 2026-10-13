@@ -111,6 +111,7 @@ jobs:
   windows-x86_64:
     needs: prepare-release
     runs-on: windows-latest
+    timeout-minutes: 150
     env:
       VCPKG_BINARY_SOURCES: "clear;files,${{ github.workspace }}/.vcpkg-binary-cache,readwrite"
     steps:
@@ -135,13 +136,22 @@ jobs:
               -not (Test-Path "C:\Program Files\LLVM\bin\lli.exe")) {
             choco install llvm -y --no-progress
           }
+      # Windows CI only passes with the partitioned, bounded-memory
+      # frontend; use that same validated Release build for published assets.
+      # The ordinary local Windows Release configuration remains unchanged.
       - name: Configure
         shell: pwsh
         run: >
           cmake -S . -B build -A x64
+          -DQUIDRA_WARNINGS_AS_ERRORS=ON
+          -DQUIDRA_MSVC_CI_FAST_FRONTEND=ON
           -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
-      - name: Build
-        run: cmake --build build --config Release --parallel ${{ runner.os == 'macOS' && 3 || 4 }}
+      - name: Build compiler core
+        run: cmake --build build --config Release --target quidra_core --parallel 2
+      - name: Build CLI
+        run: cmake --build build --config Release --target quidra --parallel 2
+      - name: Build remaining test targets
+        run: cmake --build build --config Release --parallel 1
       - name: Test
         run: ctest --test-dir build -C Release --output-on-failure
       - name: Native smoke test

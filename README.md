@@ -18,6 +18,12 @@ fact unambiguously.
 - Playground: <https://quidra-lang.github.io/playground/>
 - Playground source: <https://github.com/quidra-lang/playground>
 
+> **Contributors welcome!** Help build Quidra's compiler, LLVM backend,
+> developer tooling, mathematical/ML libraries, documentation, and tests.
+> Newcomers are welcome too. Read the [contribution guide](CONTRIBUTING.md)
+> and explore [good first issues](https://github.com/quidra-lang/quidra/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22)
+> or [all open issues](https://github.com/quidra-lang/quidra/issues).
+
 The name **Quidra** is inspired by the Latin *quidditas* — the “whatness” or
 essence of a thing.
 

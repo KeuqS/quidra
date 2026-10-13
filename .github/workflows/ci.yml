@@ -420,7 +420,7 @@ jobs:
           print(state.weight.has_grad())
           print(NL)
           tensor<real32> gradient = state.weight.grad
-          state.weight.clear_grad()
+          .state.weight.clear_grad()
           state.weight = state.weight.untrack() - gradient * real32(0.1)
           print(state.weight[0].item() < before and not state.weight.has_grad())
           print(NL)

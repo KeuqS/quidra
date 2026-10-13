@@ -218,6 +218,11 @@ NativeStep native_source_compile_step(
     std::vector<std::string> arguments;
     arguments.emplace_back(optimize ? "-O2" : "-O0");
     const bool cuda = cuda_native_source(source);
+#ifdef _WIN32
+    // Native C/C++ objects must use the same DLL CRT as quidra_runtime.lib.
+    // nvcc has its own host-compiler runtime selection.
+    if (!cuda) arguments.emplace_back("-fms-runtime-lib=dll");
+#endif
     if (cuda) {
         arguments.emplace_back("-std=c++20");
 #ifndef _WIN32
@@ -405,8 +410,15 @@ NativeLinkRecipe native_link_recipe(
     std::vector<NativeText> arguments{
         (debug || !optimize) ? L"-O0" : L"-O3",
         L"-fms-runtime-lib=dll",
-        // Let clang choose the matching MSVC CRT startup library; excluding
-        // libcmt explicitly left mainCRTStartup unresolved on hosted Windows.
+        // The MSVC-built runtime archive uses /MD. Clang's LLVM-IR link does
+        // not always select the matching CRT startup archive on its own.
+        L"-Xlinker",
+        L"/NODEFAULTLIB:libcmt",
+        L"-Xlinker",
+        L"/DEFAULTLIB:msvcrt",
+        // Link build/run recipes reproducibly even when invoked separately.
+        L"-Xlinker",
+        L"/Brepro",
         L"-Wno-override-module",
     };
     arguments.insert(arguments.end(), program.begin(), program.end());
@@ -415,9 +427,7 @@ NativeLinkRecipe native_link_recipe(
         L"none",
         runtime_library().native(),
     });
-    if (const auto include = native_extension_include_directory()) {
-        arguments.emplace_back(L"-I" + include->native());
-    }
+    // Headers are needed by native compile steps, not by this link step.
     for (const auto& flag : pkg_compile_flags)
         arguments.emplace_back(platform::native_text(flag));
     for (const auto& input : link_inputs) arguments.push_back(input.native());

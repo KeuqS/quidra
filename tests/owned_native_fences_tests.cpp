@@ -94,12 +94,16 @@ int main(int argc,char** argv) {
         auto submit=reserved_fences.submission(9);
         auto reserved=reserved_fences.reserve(submit,owner,reserved_api.event());
         auto failed=owner->enqueue(9,100);
+        windows_stage("no-alloc reservation prepared");
         parallel::DeferredFailure failure;
         failure.message="a preallocated diagnostic larger than the small string buffer";
         reject_allocations=true;
         reserved_fences.publish(submit,reserved);
+        windows_stage("no-alloc reservation published");
         reserved_fences.drain_or_fail(9,reserved_fences.boundary(9),[](const std::string&) {std::abort();});
+        windows_stage("no-alloc reservation drained");
         const auto& view=failed.complete_view(std::move(failure));
+        windows_stage("no-alloc deferred outcome completed");
         assert(owner->idle()&&view.message.size()>32&&owner->first_failure_view()==&view);
         reject_allocations=false;
         assert(reserved_api.waits==1&&reserved_api.releases==1);

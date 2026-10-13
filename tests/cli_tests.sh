@@ -4954,17 +4954,40 @@ assert "3" in text
 PY
 
 python3 - "$QUIDRA" <<'PY'
-import errno, os, pty, signal, sys, time
+import errno, os, pty, select, signal, sys, time
 binary=sys.argv[1]
 pid, fd=pty.fork()
 if pid == 0:
     os.execl(binary, binary)
-os.write(fd, b"int interrupted(int x)\n")
-time.sleep(0.2)
-os.kill(pid, signal.SIGINT)
-time.sleep(0.2)
-os.write(fd, b"int(1) + 2\n:exit\n")
 chunks=[]
+
+# Synchronize with the actual REPL prompts: instrumented startup can take
+# longer than 200 ms, so sleeping before SIGINT may kill the uninitialized
+# process rather than cancel the incomplete submission.
+def wait_for(prompt):
+    seen=b""
+    deadline=time.monotonic() + 30
+    while prompt not in seen:
+        remaining=deadline - time.monotonic()
+        assert remaining > 0, (prompt, b"".join(chunks).decode(errors="replace"))
+        ready, _, _=select.select([fd], [], [], remaining)
+        assert ready, (prompt, b"".join(chunks).decode(errors="replace"))
+        try:
+            data=os.read(fd, 4096)
+        except OSError as e:
+            if e.errno == errno.EIO:
+                raise AssertionError((prompt, b"".join(chunks).decode(errors="replace"))) from e
+            raise
+        assert data, (prompt, b"".join(chunks).decode(errors="replace"))
+        chunks.append(data)
+        seen += data
+
+wait_for(b">>> ")
+os.write(fd, b"int interrupted(int x)\n")
+wait_for(b"... ")
+os.kill(pid, signal.SIGINT)
+wait_for(b">>> ")
+os.write(fd, b"int(1) + 2\n:exit\n")
 while True:
     try:
         data=os.read(fd, 4096)

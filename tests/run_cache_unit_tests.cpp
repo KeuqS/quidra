@@ -950,7 +950,7 @@ void eviction() {
     // Another process scanning: this one skips.
     {
         fs::create_directories(store->layout().run());
-        platform::LockedFile held(store->layout().run() / "evict.lock",
+        platform::LockedFile held(store->layout().root / "evict.lock",
                                   platform::LockOpenMode::open_always, false);
         scan = scan_run_cache(*store, none, fixed(now, 1));
         check(!scan.scanned, "a scan skips while another holds the lock");
@@ -991,13 +991,15 @@ void cleaning() {
     // Another holder of the lock delays the clean by the timeout only.
     fs::create_directories(store->layout().run());
     auto held = std::make_unique<platform::LockedFile>(
-        store->layout().run() / "evict.lock", platform::LockOpenMode::open_always, false);
+        store->layout().root / "evict.lock", platform::LockOpenMode::open_always, false);
     const auto clean = clean_run_cache(*store, std::chrono::milliseconds(100));
     held.reset();
     check(clean.removed.entries == 3 && clean.removed.bytes == before.bytes,
           "clean reports every entry of every version");
     check(clean.files_left == 0, "nothing is left in use");
     check(!fs::exists(store->layout().run()), "run/ is gone");
+    check(fs::exists(store->layout().root / "evict.lock"),
+          "the shared eviction lock survives cleaning outside run/");
     check(!fs::exists(store->layout().root / "compiler-id"), "the build id memos are gone");
     check(!fs::exists(store->layout().staging() / "dead"), "dead staging is gone");
     check(fs::exists(live->directory()), "live staging is kept");

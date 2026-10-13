@@ -115,11 +115,15 @@ void remove_empty_directories(const RunCacheStore& store) {
 }
 
 std::unique_ptr<platform::LockedFile> take_lock(const RunCacheStore& store, bool try_only) {
-    const auto run = platform::open_private_subdirectory(store.layout().root, "run");
-    if (!run.path) return nullptr;
+    // Keep the shared eviction lock outside run/. Windows cannot move a
+    // directory containing an open lock file, even when FILE_SHARE_DELETE
+    // is enabled. The root persists across clean, so all writers still use
+    // one stable lock inode/handle while run/ is moved to trash/.
+    const auto root = platform::open_private_root(store.layout().root);
+    if (!root.path) return nullptr;
     try {
         auto lock = std::make_unique<platform::LockedFile>(
-            *run.path / std::string(lock_file), platform::LockOpenMode::open_always, try_only);
+            *root.path / std::string(lock_file), platform::LockOpenMode::open_always, try_only);
         if (!lock->locked()) return nullptr;
         return lock;
     } catch (const std::exception&) {

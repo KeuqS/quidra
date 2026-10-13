@@ -12,7 +12,8 @@
 // holds: the run/last-scan stamp is missing or older than an hour; a random
 // one-in-16 draw succeeds (which bounds the growth during many builds with
 // no shared counter); or the new entry is larger than a tenth of the limit.
-// A scan takes run/evict.lock without waiting (another process scanning
+// A scan takes evict.lock in the stable private cache root, outside run/,
+// without waiting (another process scanning
 // means this one need not), sums the entries, and when the total exceeds
 // the limit moves the least recently used entries to trash/ until it is at
 // most 80 % of the limit, never an entry used in the last minute. It then
@@ -21,7 +22,7 @@
 // directories, and stamps run/last-scan. A reader whose entry disappears
 // between its checks and its use sees a miss.
 //
-// clean_run_cache() is `quidra cache clean`: it takes run/evict.lock
+// clean_run_cache() is `quidra cache clean`: it takes root/evict.lock
 // (waiting up to 10 seconds, then going on without it), renames run/ into
 // trash/ and deletes it with the rest of the trash, the compiler build id
 // memos (compiler-id/) and every staging directory whose lease no process

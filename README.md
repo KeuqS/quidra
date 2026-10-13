@@ -24,6 +24,7 @@ fact unambiguously.
 > Read the [contribution guide](CONTRIBUTING.md)
 > and explore [good first issues](https://github.com/quidra-lang/quidra/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22)
 > or [all open issues](https://github.com/quidra-lang/quidra/issues).
+> New to Quidra? Start with the [10-minute getting-started guide](docs/getting-started.md).
 
 The name **Quidra** is inspired by the Latin *quidditas* — the “whatness” or
 essence of a thing.

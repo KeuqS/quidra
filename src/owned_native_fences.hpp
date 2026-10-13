@@ -42,6 +42,7 @@ class OwnedNativeFences {
         std::optional<runtime::ReportSite> site;
         std::string unattributed_message{"native GPU completion could not be proved after a runtime failure"};
         parallel::DeferredFailure abandoned;
+        bool draining{};
         Pending() {abandoned.message="native GPU fence was abandoned before its owner drained";}
         ~Pending() {
             if(fence.release) {
@@ -166,18 +167,21 @@ private:
     std::shared_ptr<Device> drain_records(int index,std::uint64_t covered) {
         auto submission=this->submission(index);
         auto device=submission.state_;
-        Queue local;
-        {
-            std::lock_guard guard(device->pending_mutex);
-            // Package reservations can publish later than a newer marker.
-            // Coverage is determined by serial, not by publication order.
-            for(auto it=device->pending.begin();it!=device->pending.end();) {
-                const auto current=it++;
-                if((*current)->serial<=covered)local.splice(local.end(),device->pending,current);
+        // Process a queued node in place. A stack-local std::list may allocate
+        // its empty sentinel on MSVC, which is forbidden after GPU submission.
+        // Marking the node also keeps recursive drains from processing it twice.
+        for(;;) {
+            Queue::iterator current;
+            {
+                std::lock_guard guard(device->pending_mutex);
+                current=device->pending.begin();
+                // Package reservations can publish out of serial order.
+                while(current!=device->pending.end() &&
+                      ((*current)->serial>covered || (*current)->draining))++current;
+                if(current==device->pending.end())break;
+                (*current)->draining=true;
             }
-        }
-        while(!local.empty()) {
-            auto& entry=*local.front();
+            auto& entry=*(*current);
             NativeFenceResult result;
             try {result=entry.fence.wait();}
             catch(...) {result.status=NativeFenceStatus::unattributed_failure;}
@@ -197,7 +201,7 @@ private:
                 // Keep the reservation/ticket intact until the immediate
                 // unknown-context fatal policy, without allocating a link.
                 std::lock_guard guard(device->pending_mutex);
-                device->unattributed.splice(device->unattributed.end(),local,local.begin());
+                device->unattributed.splice(device->unattributed.end(),device->pending,current);
             }else {
                 parallel::DeferredFailure failure;
                 if(result.status==NativeFenceStatus::owned_failure) {
@@ -209,7 +213,9 @@ private:
                     }
                 }
                 failure.raw_site=entry.site;
-                entry.ticket.complete(std::move(failure));local.pop_front();
+                entry.ticket.complete(std::move(failure));
+                std::lock_guard guard(device->pending_mutex);
+                device->pending.erase(current);
             }
         }
         return device;
